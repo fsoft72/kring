@@ -176,6 +176,17 @@ pub fn retire_files_batch(
 
 /// Fails unless the manifest lists `path` as encrypted with the given sha256.
 fn verify_backup(backup: &BackupInfo, path: &Path, digest: &str) -> Result<()> {
+    verify_backup_entry(backup, path, digest, true)
+}
+
+/// Fails unless the manifest lists `path` with the given sha256 and, when
+/// `require_encrypted` is set, marks it as encrypted.
+pub(super) fn verify_backup_entry(
+    backup: &BackupInfo,
+    path: &Path,
+    digest: &str,
+    require_encrypted: bool,
+) -> Result<()> {
     let Some(entry) = backup
         .files
         .iter()
@@ -185,16 +196,16 @@ fn verify_backup(backup: &BackupInfo, path: &Path, digest: &str) -> Result<()> {
             "Backup does not list the file with the expected checksum, file kept",
         ));
     };
-    if !entry.encrypted {
+    if require_encrypted && !entry.encrypted {
         return Err(invalid("Backup not encrypted, file kept"));
     }
     Ok(())
 }
 
 /// Fails unless `info.path` is a non-symlink `*.keyring` file directly in `keyrings_dir`.
-fn check_location(info: &KeyringFileInfo, keyrings_dir: &Path) -> Result<()> {
+pub(super) fn check_location(info: &KeyringFileInfo, keyrings_dir: &Path) -> Result<()> {
     if info.path.extension().is_none_or(|e| e != KEYRING_EXTENSION) {
-        return Err(invalid("Only .keyring files can be retired"));
+        return Err(invalid("Only .keyring files are supported"));
     }
     let meta = std::fs::symlink_metadata(&info.path).map_err(|e| meta_err(&info.path, e))?;
     if !meta.file_type().is_file() {
@@ -221,7 +232,7 @@ fn meta_err(path: &Path, e: std::io::Error) -> KringError {
 }
 
 /// Fails unless the file on disk still has the size and mtime recorded at scan time.
-fn check_unchanged(info: &KeyringFileInfo) -> Result<()> {
+pub(super) fn check_unchanged(info: &KeyringFileInfo) -> Result<()> {
     let meta = std::fs::metadata(&info.path).map_err(|e| meta_err(&info.path, e))?;
     let modified = meta
         .modified()
@@ -235,7 +246,7 @@ fn check_unchanged(info: &KeyringFileInfo) -> Result<()> {
 }
 
 /// Builds an `InvalidInput` error.
-fn invalid(msg: &str) -> KringError {
+pub(super) fn invalid(msg: &str) -> KringError {
     KringError::InvalidInput(msg.to_string())
 }
 
