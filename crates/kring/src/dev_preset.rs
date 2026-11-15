@@ -17,7 +17,7 @@ use crate::views::backups::{BackupView, path_exists, restore_dialog};
 use crate::views::collection::{display_name, export_dialog};
 use crate::views::consolidate::{default_target, needs_passphrases};
 use crate::views::dialogs::DialogKind;
-use crate::views::file_detail::retire_dialog;
+use crate::views::file_detail::{delete_dialog, retire_dialog};
 use crate::views::file_items::displayed_file_items;
 use crate::views::item_list::displayed_items;
 use crate::views::transfer::default_choices;
@@ -34,7 +34,8 @@ const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
 /// `transfer-preview` (checks every item of the selected keyring and plans
 /// copying them into the other keyring of [`TRANSFER_PAIR`]; with
 /// [`VAR_REVEAL`] both sides of the first conflict are revealed); in
-/// the files area `import`, `retire` or `open` (password of a binary file);
+/// the files area `import`, `retire`, `delete-file`, `delete-file-no-backup`
+/// (backup unchecked) or `open` (password of a binary file);
 /// in the backups area `restore` (confirmation) or `restore-now` (restores
 /// every file of the selected backup without a passphrase); in the
 /// consolidate area `consolidate-preview` (plans a consolidation into the
@@ -222,6 +223,14 @@ impl DevPreset {
                 &state.collections,
             ))),
             Some("retire") => Some(Action::Open(retire_dialog(state, info))),
+            Some("delete-file") => Some(Action::Open(delete_dialog(info))),
+            Some("delete-file-no-backup") => {
+                let mut kind = delete_dialog(info);
+                if let DialogKind::DeleteFile { backup, .. } = &mut kind {
+                    *backup = false;
+                }
+                Some(Action::Open(kind))
+            }
             Some("open") => Some(Action::Send(Command::OpenFile {
                 name: info.name.clone(),
                 password: None,
@@ -537,6 +546,28 @@ mod tests {
         assert_eq!(p.take_file_card(&s), Some((1, true)));
         assert!(p.take_file_card(&s).is_none());
         assert_eq!(DevPreset::default().take_area(), None);
+    }
+
+    /// The delete presets open the delete dialog, with the backup checked or not.
+    #[test]
+    fn delete_file_presets() {
+        for (dialog, expected) in [("delete-file", true), ("delete-file-no-backup", false)] {
+            let mut p = DevPreset {
+                dialog: Some(dialog.into()),
+                ..DevPreset::default()
+            };
+            let mut s = AppState::default();
+            s.apply(Event::Files(vec![file("t")]));
+            s.select_file("t".into());
+            let actions = p.take_file_actions(&s);
+            assert!(
+                matches!(
+                    &actions[..],
+                    [Action::Open(DialogKind::DeleteFile { backup, .. })] if *backup == expected
+                ),
+                "{dialog}"
+            );
+        }
     }
 
     /// The backups area is entered; the backup is selected once listed, then

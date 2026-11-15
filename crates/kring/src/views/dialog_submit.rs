@@ -26,6 +26,31 @@ pub const MSG_RELATIVE_PATH: &str = "Enter an absolute path (or one starting wit
 pub const MSG_NO_ARCHIVE_PASSPHRASE: &str = "Enter the passphrase of the archive";
 /// Error of an empty backup passphrase.
 const MSG_NO_BACKUP_PASSPHRASE: &str = "Enter the passphrase of the backup";
+/// Why Delete is disabled while the typed name does not match (no backup).
+pub const MSG_TYPE_NAME: &str = "Type the file name to confirm";
+
+/// Returns true when `typed` is exactly the file name `name` (no trimming, case sensitive).
+pub fn delete_confirm_ok(typed: &str, name: &str) -> bool {
+    typed == name
+}
+
+/// Returns why the main button of a delete dialog is disabled: without a
+/// backup the exact file name must be typed. `None` for other dialogs.
+pub fn delete_dialog_blocked(kind: &DialogKind) -> Option<&'static str> {
+    let DialogKind::DeleteFile {
+        name,
+        backup,
+        typed,
+        ..
+    } = kind
+    else {
+        return None;
+    };
+    if *backup || delete_confirm_ok(typed, name) {
+        return None;
+    }
+    Some(MSG_TYPE_NAME)
+}
 
 /// Parses a path typed by the user: strips surrounding whitespace and quotes
 /// (ported from Paranoid's `clean_path`).
@@ -81,6 +106,11 @@ pub fn with_backup_passphrase(cmd: Command, passphrase: SecretValue) -> Command 
         },
         Command::DeleteCollection { collection, .. } => Command::DeleteCollection {
             collection,
+            backup_passphrase: Some(passphrase),
+        },
+        Command::DeleteFile { name, backup, .. } => Command::DeleteFile {
+            name,
+            backup,
             backup_passphrase: Some(passphrase),
         },
         Command::RestoreBackup { dir, files, .. } => Command::RestoreBackup {
@@ -245,6 +275,27 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             name: name.clone(),
             backup_passphrase: _new_password(passphrase, confirm)?,
         },
+        DialogKind::DeleteFile {
+            name,
+            plaintext,
+            backup,
+            passphrase,
+            confirm,
+            ..
+        } => {
+            if let Some(reason) = delete_dialog_blocked(kind) {
+                return Err(reason.into());
+            }
+            let backup_passphrase = match (*backup, *plaintext) {
+                (true, true) => Some(_new_password(passphrase, confirm)?),
+                _ => None,
+            };
+            Command::DeleteFile {
+                name: name.clone(),
+                backup: *backup,
+                backup_passphrase,
+            }
+        }
         DialogKind::RestoreBackup {
             dir,
             files,
@@ -637,6 +688,135 @@ mod tests {
                 assert_eq!(sent, choices);
                 assert_eq!(backup_passphrase.unwrap().as_text(), Some("bp"));
                 assert_eq!(orphan_files_passphrase.unwrap().as_text(), Some("orphan"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Sets the backup flag, typed name and passphrases of a delete dialog.
+    fn fill_delete(kind: &mut DialogKind, backup_on: bool, name: &str, pass: (&str, &str)) {
+        let DialogKind::DeleteFile {
+            backup,
+            typed,
+            passphrase,
+            confirm,
+            ..
+        } = kind
+        else {
+            panic!("expected DeleteFile");
+        };
+        *backup = backup_on;
+        *typed = name.to_string();
+        *passphrase = buf(pass.0);
+        *confirm = buf(pass.1);
+    }
+
+    /// The typed confirmation must equal the file name exactly.
+    #[test]
+    fn delete_confirm_requires_exact_name() {
+        assert!(delete_confirm_ok("Default_keyring_3", "Default_keyring_3"));
+        assert!(!delete_confirm_ok("", "Default_keyring_3"));
+        assert!(!delete_confirm_ok("default_keyring_3", "Default_keyring_3"));
+        assert!(!delete_confirm_ok(
+            " Default_keyring_3",
+            "Default_keyring_3"
+        ));
+        assert!(!delete_confirm_ok(
+            "Default_keyring_3.keyring",
+            "Default_keyring_3"
+        ));
+    }
+
+    /// The backup checkbox starts checked; a binary file needs no passphrase.
+    #[test]
+    fn delete_binary_with_backup() {
+        let kind = DialogKind::delete_file("b".into(), false);
+        assert!(matches!(kind, DialogKind::DeleteFile { backup: true, .. }));
+        match command_for(&kind).unwrap() {
+            Command::DeleteFile {
+                name,
+                backup,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, "b");
+                assert!(backup);
+                assert!(backup_passphrase.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// A plaintext file backed up needs a confirmed new passphrase.
+    #[test]
+    fn delete_plaintext_with_backup_needs_passphrase() {
+        let mut kind = DialogKind::delete_file("p".into(), true);
+        assert!(command_for(&kind).is_err(), "empty passphrase rejected");
+        fill_delete(&mut kind, true, "", ("pp", "pq"));
+        assert!(command_for(&kind).is_err(), "mismatch rejected");
+        fill_delete(&mut kind, true, "", ("pp", "pp"));
+        match command_for(&kind).unwrap() {
+            Command::DeleteFile {
+                name,
+                backup,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, "p");
+                assert!(backup);
+                assert_eq!(backup_passphrase.unwrap().as_text(), Some("pp"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Without a backup the exact file name must be typed; no passphrase is sent.
+    #[test]
+    fn delete_without_backup_needs_typed_name() {
+        let mut kind = DialogKind::delete_file("p".into(), true);
+        fill_delete(&mut kind, false, "P", ("pp", "pp"));
+        assert!(command_for(&kind).is_err(), "wrong name rejected");
+        assert_eq!(delete_dialog_blocked(&kind), Some(MSG_TYPE_NAME));
+        fill_delete(&mut kind, false, "p", ("pp", "pp"));
+        assert_eq!(delete_dialog_blocked(&kind), None);
+        match command_for(&kind).unwrap() {
+            Command::DeleteFile {
+                name,
+                backup,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, "p");
+                assert!(!backup);
+                assert!(backup_passphrase.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        fill_delete(&mut kind, true, "", ("", ""));
+        assert_eq!(
+            delete_dialog_blocked(&kind),
+            None,
+            "backup on: never blocked"
+        );
+    }
+
+    /// The passphrase resend of a delete keeps the name and the backup flag.
+    #[test]
+    fn with_backup_passphrase_sets_delete_file() {
+        let cmd = with_backup_passphrase(
+            Command::DeleteFile {
+                name: "p".into(),
+                backup: true,
+                backup_passphrase: None,
+            },
+            SecretValue::from_text("x"),
+        );
+        match cmd {
+            Command::DeleteFile {
+                name,
+                backup,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, "p");
+                assert!(backup);
+                assert_eq!(backup_passphrase.unwrap().as_text(), Some("x"));
             }
             other => panic!("unexpected {other:?}"),
         }

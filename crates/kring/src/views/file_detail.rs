@@ -2,7 +2,9 @@
 
 use eframe::egui::{self, RichText};
 use kring_core::keyring_file::textual::{ParseWarning, WarningKind};
-use kring_core::keyring_file::{KeyringFileInfo, KeyringFormat, RetireMode, retire_mode};
+use kring_core::keyring_file::{
+    KeyringFileInfo, KeyringFormat, MSG_DELETE_LIVE, RetireMode, retire_mode,
+};
 use kring_core::model::{CollectionId, CollectionInfo};
 
 use crate::app_state::AppState;
@@ -152,6 +154,16 @@ pub fn retire_dialog(state: &AppState, info: &KeyringFileInfo) -> DialogKind {
     DialogKind::retire_file(info.name.clone(), retire_dialog_text(&mode, info))
 }
 
+/// Returns why Delete is disabled: a live file is deleted from Secrets instead.
+pub fn delete_blocked(live: bool) -> Option<&'static str> {
+    live.then_some(MSG_DELETE_LIVE)
+}
+
+/// Returns the delete dialog of `info` (backup checked by default).
+pub fn delete_dialog(info: &KeyringFileInfo) -> DialogKind {
+    DialogKind::delete_file(info.name.clone(), info.plaintext)
+}
+
 /// Returns why Retire is disabled: a live keyring needs a provider allowing writes.
 fn _retire_blocked(live: bool, gates: Gates) -> Option<&'static str> {
     if !live {
@@ -160,7 +172,7 @@ fn _retire_blocked(live: bool, gates: Gates) -> Option<&'static str> {
     gates.write
 }
 
-/// Renders the right-aligned header actions (Import, Retire).
+/// Renders the right-aligned header actions (Import, Retire, Delete).
 fn _actions(
     ui: &mut egui::Ui,
     state: &AppState,
@@ -169,6 +181,9 @@ fn _actions(
     gates: Gates,
 ) -> Option<Action> {
     let mut action = None;
+    if danger_button(ui, "Delete file", delete_blocked(live)) {
+        action = Some(Action::Open(delete_dialog(info)));
+    }
     if info.plaintext && danger_button(ui, "Retire file", _retire_blocked(live, gates)) {
         action = Some(Action::Open(retire_dialog(state, info)));
     }
@@ -532,5 +547,35 @@ mod tests {
                 "The backup is encrypted with the passphrase below.",
             ]
         );
+    }
+
+    /// Delete is refused for a live file; the dialog knows whether the file is plaintext.
+    #[test]
+    fn delete_gate_and_dialog() {
+        assert_eq!(delete_blocked(true), Some(MSG_DELETE_LIVE));
+        assert_eq!(delete_blocked(false), None);
+        let f = textual("Default_keyring_3", 1, true);
+        match delete_dialog(&f) {
+            DialogKind::DeleteFile {
+                name,
+                plaintext,
+                backup,
+                ..
+            } => {
+                assert_eq!(name, "Default_keyring_3");
+                assert!(plaintext && backup);
+            }
+            _ => panic!("expected DeleteFile"),
+        }
+        let mut b = textual("b", 0, true);
+        b.format = KeyringFormat::BinaryV0;
+        b.plaintext = false;
+        assert!(matches!(
+            delete_dialog(&b),
+            DialogKind::DeleteFile {
+                plaintext: false,
+                ..
+            }
+        ));
     }
 }

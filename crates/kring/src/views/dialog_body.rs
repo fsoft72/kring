@@ -12,6 +12,7 @@ use crate::ui::password_field::{
 };
 use crate::ui::theme;
 use crate::ui::widgets::{field_label, input, semibold};
+use crate::views::dialog_submit::delete_dialog_blocked;
 use crate::views::dialogs::RestorePassphrase;
 use crate::views::dialogs::{DialogKind, ImportTarget};
 use crate::views::item_detail::attribute_rows;
@@ -39,6 +40,11 @@ const MSG_CONSOLIDATE_BACKUP: &str = "A backup of all keyring files is taken fir
 /// Passphrase request of the retired orphan files.
 const MSG_CONSOLIDATE_ORPHANS: &str = "The empty plaintext files are retired with one \
      encrypted backup, choose its passphrase.";
+/// Warning of a delete without backup.
+const MSG_DELETE_NO_BACKUP: &str = "Permanent deletion: no backup will be made";
+/// Passphrase request of the backup of a plaintext file before deleting it.
+const MSG_DELETE_PLAINTEXT: &str =
+    "This file is not encrypted on disk: its backup is encrypted, choose a passphrase";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -48,6 +54,8 @@ pub struct MainAction {
     pub text: &'static str,
     /// True for destructive actions (danger button instead of primary).
     pub danger: bool,
+    /// Why the button is disabled (shown as its tooltip), `None` when enabled.
+    pub blocked: Option<&'static str>,
 }
 
 /// Non-destructive main action.
@@ -55,12 +63,17 @@ fn _primary(text: &'static str) -> MainAction {
     MainAction {
         text,
         danger: false,
+        blocked: None,
     }
 }
 
 /// Destructive main action (danger button).
 fn _danger(text: &'static str) -> MainAction {
-    MainAction { text, danger: true }
+    MainAction {
+        text,
+        danger: true,
+        blocked: None,
+    }
 }
 
 /// Adds the dialog title.
@@ -266,6 +279,14 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _danger("Retire")
         }
+        DialogKind::DeleteFile { .. } => {
+            let blocked = delete_dialog_blocked(kind);
+            _delete_file(ui, kind);
+            MainAction {
+                blocked,
+                .._danger("Delete")
+            }
+        }
         DialogKind::RestoreBackup {
             destinations,
             mode,
@@ -417,4 +438,43 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _primary("Continue")
         }
     }
+}
+
+/// Renders the delete confirmation of a keyring file: the backup checkbox,
+/// then either the backup passphrase (plaintext file) or the red warning and
+/// the typed name confirmation (no backup).
+fn _delete_file(ui: &mut egui::Ui, kind: &mut DialogKind) {
+    let DialogKind::DeleteFile {
+        name,
+        plaintext,
+        backup,
+        typed,
+        passphrase,
+        confirm,
+    } = kind
+    else {
+        return;
+    };
+    _title(ui, &format!("Delete {name}"));
+    _text(
+        ui,
+        &format!("\"{name}.keyring\" is not loaded by gnome-keyring and is deleted from disk."),
+    );
+    ui.checkbox(
+        backup,
+        RichText::new("Back up the file before deleting").color(theme::TEXT),
+    );
+    if *backup {
+        if *plaintext {
+            ui.label(RichText::new(MSG_DELETE_PLAINTEXT).color(theme::TERTIARY));
+            _password_field(ui, "Backup passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+        }
+        return;
+    }
+    ui.label(RichText::new(MSG_DELETE_NO_BACKUP).color(theme::ERROR));
+    ui.add_space(4.0);
+    // Not a `field_label`: it uppercases, and the name must be typed with its exact case.
+    _text(ui, &format!("Type {name} to confirm"));
+    ui.add(input(typed).desired_width(f32::INFINITY));
 }

@@ -129,6 +129,18 @@ pub enum DialogKind {
         passphrase: Zeroizing<String>,
         confirm: Zeroizing<String>,
     },
+    /// Confirm deleting a keyring file the daemon does not serve.
+    DeleteFile {
+        name: String,
+        /// The file is not encrypted on disk: its backup needs a passphrase.
+        plaintext: bool,
+        /// Back up the file first (checked by default).
+        backup: bool,
+        /// Typed file name, required when `backup` is off.
+        typed: String,
+        passphrase: Zeroizing<String>,
+        confirm: Zeroizing<String>,
+    },
     /// Confirm restoring files of a backup, listing what gets overwritten.
     RestoreBackup {
         dir: PathBuf,
@@ -278,6 +290,18 @@ impl DialogKind {
         Self::RetireFile {
             name,
             lines,
+            passphrase: new_buffer(),
+            confirm: new_buffer(),
+        }
+    }
+
+    /// Delete confirmation of file `name`, with the backup checkbox checked.
+    pub fn delete_file(name: String, plaintext: bool) -> Self {
+        Self::DeleteFile {
+            name,
+            plaintext,
+            backup: true,
+            typed: String::new(),
             passphrase: new_buffer(),
             confirm: new_buffer(),
         }
@@ -454,9 +478,9 @@ impl Dialog {
             ui.add_space(8.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 submit = if main.danger {
-                    danger_button(ui, main.text, None)
+                    danger_button(ui, main.text, main.blocked)
                 } else {
-                    primary_button(ui, main.text, None)
+                    primary_button(ui, main.text, main.blocked)
                 };
                 cancel = secondary_button(ui, "Cancel", None);
             });
