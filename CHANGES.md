@@ -7,3 +7,4 @@
 - Added implementation plan 1 (foundation + Secret Service) in `docs/superpowers/plans/`.
 - Scaffolded Cargo workspace (`kring-core`, `kring`), empty eframe window, and
   `scripts/check-no-gui-toolkits.sh` guard against GTK/Qt/GNOME crates.
+- Added `kring-core` model types (`SecretValue` zeroized and redacted), `KringError`, and input validation.
