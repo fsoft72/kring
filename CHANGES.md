@@ -8,3 +8,4 @@
 - Scaffolded Cargo workspace (`kring-core`, `kring`), empty eframe window, and
   `scripts/check-no-gui-toolkits.sh` guard against GTK/Qt/GNOME crates.
 - Added `kring-core` model types (`SecretValue` zeroized and redacted), `KringError`, and input validation.
+- Added `SecretStore`/`MasterPasswordStore` traits and in-memory `FakeStore` (feature `fake`).

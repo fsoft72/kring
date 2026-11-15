@@ -9,3 +9,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 async-trait = "0.1"
 thiserror = "2"
 zeroize = "1.9"
+
+[features]
+fake = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
