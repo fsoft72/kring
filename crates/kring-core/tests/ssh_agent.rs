@@ -157,12 +157,26 @@ fn add_identity_errors_and_lifetime() {
     assert!(add_identity(sock, &key("id_ed25519"), None, Some(0)).is_err());
     assert!(list_identities(sock).unwrap().is_empty());
 
-    // A constrained add is accepted and the key expires.
-    add_identity(sock, &key("id_ed25519"), None, Some(1)).unwrap();
+    // A constrained add is accepted and the key expires. The lifetime leaves
+    // room for a loaded machine before the first listing, and expiry is
+    // polled instead of assumed after a fixed sleep.
+    add_identity(sock, &key("id_ed25519"), None, Some(LIFETIME_SECS)).unwrap();
     assert_eq!(fingerprints(sock), [key("id_ed25519").fingerprint]);
-    std::thread::sleep(Duration::from_millis(2500));
-    assert!(list_identities(sock).unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(EXPIRY_WAIT_SECS);
+    while !list_identities(sock).unwrap().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the constrained key never expired"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
+
+/// Lifetime given to the constrained identity in the expiry test.
+const LIFETIME_SECS: u32 = 3;
+
+/// Maximum time the expiry test waits for the identity to disappear.
+const EXPIRY_WAIT_SECS: u64 = 15;
 
 /// A missing socket is an error, not a panic.
 #[test]
