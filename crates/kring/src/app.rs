@@ -11,11 +11,14 @@ use crate::copy_flow::SecretCopier;
 #[cfg(debug_assertions)]
 use crate::dev_preset::DevPreset;
 use crate::ui::theme;
-use crate::ui::toasts::{ToastKind, Toasts, kind_for_status};
+use crate::ui::toasts::{ToastKind, Toasts, kind_for_status, user_message};
 use crate::views::dialogs::{Dialog, DialogKind, Outcome};
+use crate::views::file_items::FileView;
 use crate::views::item_detail::AttrEditor;
 use crate::views::rail::WorkerActivity;
-use crate::views::{Action, Gates, banners, collection, rail, sidebar};
+use crate::views::{
+    Action, Area, Gates, banners, collection, file_detail, files_list, rail, sidebar, switch_area,
+};
 use crate::worker::{Command, Event, WorkerHandle};
 
 /// Repaint interval while a copied secret waits to be cleared.
@@ -49,6 +52,12 @@ pub struct KringApp {
     filter: String,
     /// Keyring search text.
     keyring_filter: String,
+    /// Area selected in the rail.
+    area: Area,
+    /// Keyring file search text.
+    files_filter: String,
+    /// Card state of the selected keyring file (expanded card, shown secrets).
+    file_view: FileView,
     toasts: Toasts,
     /// Screenshot preset (debug builds, isolated session only).
     #[cfg(debug_assertions)]
@@ -68,6 +77,9 @@ impl KringApp {
             editor: AttrEditor::default(),
             filter: String::new(),
             keyring_filter: String::new(),
+            area: Area::default(),
+            files_filter: String::new(),
+            file_view: FileView::default(),
             toasts: Toasts::default(),
             #[cfg(debug_assertions)]
             dev: DevPreset::default(),
@@ -109,12 +121,13 @@ impl KringApp {
             self.toasts.push(kind_for_status(&status), status, now);
         }
         for e in errors {
-            self.toasts.push(ToastKind::Error, e, now);
+            self.toasts.push(ToastKind::Error, user_message(&e), now);
         }
     }
 
     /// Sends a command to the worker.
     fn _send(&mut self, cmd: Command) {
+        self.state.track_file_command(&cmd);
         if self.worker.tx.send(cmd).is_err() {
             self.worker_stopped = true;
             return;
@@ -147,6 +160,28 @@ impl KringApp {
                 }
             }
             Action::Open(kind) => self.dialog = Some(Dialog::new(kind)),
+            Action::SwitchArea(to) => {
+                let cmd = switch_area(&mut self.state, self.area, to);
+                self.area = to;
+                if let Some(cmd) = cmd {
+                    self._send(cmd);
+                }
+            }
+            Action::SelectFile(name) => {
+                self.copier.cancel();
+                let cmd = file_detail::select_command(&self.state, &name);
+                self.state.select_file(name);
+                if let Some(cmd) = cmd {
+                    self._send(cmd);
+                }
+            }
+            Action::CopyFileSecret(index) => {
+                let Some(secret) = self.state.file_items.get(index).map(|i| i.secret.clone())
+                else {
+                    return;
+                };
+                self.copier.copy_value(&secret, &mut self.state);
+            }
         }
     }
 
@@ -180,8 +215,25 @@ impl KringApp {
     /// Runs the dev preset actions whose data has arrived.
     #[cfg(debug_assertions)]
     fn _apply_dev_preset(&mut self) {
-        for action in self.dev.take_actions(&self.state, &self.filter) {
+        if let Some(area) = self.dev.take_area() {
+            self._handle(Action::SwitchArea(area));
+        }
+        let actions = match self.area {
+            Area::Secrets => self.dev.take_actions(&self.state, &self.filter),
+            Area::Files => self.dev.take_file_actions(&self.state),
+        };
+        for action in actions {
             self._handle(action);
+        }
+        if self.area != Area::Files {
+            return;
+        }
+        if let Some((index, reveal)) = self.dev.take_file_card(&self.state) {
+            self.file_view.sync(&self.state);
+            self.file_view.toggle_expanded(index);
+            if reveal {
+                self.file_view.toggle_revealed(index);
+            }
         }
     }
 
@@ -194,6 +246,17 @@ impl KringApp {
             return;
         };
         self.dialog = Some(Dialog::new(DialogKind::passphrase(cmd)));
+    }
+
+    /// Opens the password dialog when the selected binary file asked for one.
+    fn _open_file_password_dialog(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some((name, action)) = self.state.take_password_request() else {
+            return;
+        };
+        self.dialog = Some(Dialog::new(DialogKind::file_password(name, action)));
     }
 
     /// Shows the open dialog and handles its outcome.
@@ -224,7 +287,11 @@ impl KringApp {
                     .stroke(egui::Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER))
                     .inner_margin(egui::Margin::symmetric(8, 10)),
             )
-            .show(ui, |ui| rail::show(ui, activity));
+            .show(ui, |ui| {
+                if let Some(area) = rail::show(ui, activity, self.area) {
+                    action = Some(Action::SwitchArea(area));
+                }
+            });
         egui::Panel::left("kring-keyrings")
             .resizable(true)
             .default_size(LIST_WIDTH)
@@ -236,7 +303,13 @@ impl KringApp {
                     .inner_margin(egui::Margin::same(12)),
             )
             .show(ui, |ui| {
-                action = sidebar::show(ui, &self.state, &mut self.keyring_filter, gates);
+                let found = match self.area {
+                    Area::Secrets => {
+                        sidebar::show(ui, &self.state, &mut self.keyring_filter, gates)
+                    }
+                    Area::Files => files_list::show(ui, &self.state, &mut self.files_filter),
+                };
+                action = found.or(action.take());
             });
         let frame = egui::Frame::new()
             .fill(theme::DEEP_DARK)
@@ -247,8 +320,12 @@ impl KringApp {
             let col = egui::Rect::from_min_size(full.min, egui::vec2(width, full.height()));
             ui.scope_builder(egui::UiBuilder::new().max_rect(col), |ui| {
                 banners::show(ui, &self.state, self.worker_stopped);
-                let found =
-                    collection::show(ui, &self.state, &mut self.filter, &mut self.editor, gates);
+                let found = match self.area {
+                    Area::Secrets => {
+                        collection::show(ui, &self.state, &mut self.filter, &mut self.editor, gates)
+                    }
+                    Area::Files => file_detail::show(ui, &self.state, &mut self.file_view, gates),
+                };
                 action = found.or(action.take());
             });
         });
@@ -270,6 +347,7 @@ impl eframe::App for KringApp {
             ctx.request_repaint_after(CLIPBOARD_REPAINT);
         }
         self._open_passphrase_dialog();
+        self._open_file_password_dialog();
         let gates = Gates::from_provider(self.state.provider.as_ref());
         let action = self._panels(ui, gates);
         self._dialog(&ctx);

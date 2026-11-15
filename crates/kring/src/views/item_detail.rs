@@ -118,7 +118,7 @@ fn _secret_row(ui: &mut egui::Ui, state: &AppState, item: &ItemInfo) -> Option<A
     field_label(ui, "Secret");
     ui.horizontal(|ui| {
         let width = ui.available_width() - 2.0 * SECRET_BUTTONS_ROOM;
-        _value_box(ui, view.as_ref(), width);
+        value_box(ui, view.as_ref(), width);
         if view.is_some() {
             if ico_button(ui, Ico::EyeOff, "Hide", None, false) {
                 action = Some(Action::HideSecret);
@@ -138,7 +138,7 @@ fn _secret_row(ui: &mut egui::Ui, state: &AppState, item: &ItemInfo) -> Option<A
 }
 
 /// Sunken box showing the masked, revealed or binary secret in monospace.
-fn _value_box(ui: &mut egui::Ui, view: Option<&SecretView>, width: f32) {
+pub fn value_box(ui: &mut egui::Ui, view: Option<&SecretView>, width: f32) {
     egui::Frame::new()
         .fill(theme::INPUT_FILL)
         .stroke(egui::Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER))
@@ -220,7 +220,7 @@ pub fn show(
     gates: Gates,
 ) -> Option<Action> {
     ui.add_space(6.0);
-    _divider(ui);
+    divider(ui);
     ui.add_space(6.0);
     if item.locked || c.locked {
         return _locked_body(ui, c, gates);
@@ -239,7 +239,7 @@ pub fn show(
 }
 
 /// Hairline separator in FIELD_ROW_BORDER across the available width.
-fn _divider(ui: &mut egui::Ui) {
+pub fn divider(ui: &mut egui::Ui) {
     let (r, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().rect_filled(r, 0.0, theme::FIELD_ROW_BORDER);

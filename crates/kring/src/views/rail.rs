@@ -4,6 +4,7 @@ use eframe::egui::{self, Align2, CornerRadius, FontId, Sense, Ui};
 
 use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
+use crate::views::Area;
 
 /// Side of a rail tile.
 const TILE_SIZE: f32 = 44.0;
@@ -13,9 +14,13 @@ const BRAND_SIZE: f32 = 36.0;
 const BRAND_RADIUS: u8 = 8;
 /// Opacity of the glyphs of areas not implemented yet.
 const SOON_ALPHA: f32 = 0.4;
+/// Areas that are implemented, with their glyph and tooltip.
+const AREAS: [(Area, Ico, &str); 2] = [
+    (Area::Secrets, Ico::Key, "Secrets"),
+    (Area::Files, Ico::Folder, "Offline files"),
+];
 /// Areas that are not implemented yet, with their glyph.
-const FUTURE_AREAS: [(Ico, &str); 5] = [
-    (Ico::Folder, "Offline files"),
+const FUTURE_AREAS: [(Ico, &str); 4] = [
     (Ico::Wallet, "KWallet"),
     (Ico::Terminal, "SSH keys"),
     (Ico::Shield, "GPG keys"),
@@ -70,8 +75,8 @@ fn _brand(ui: &mut Ui) {
 }
 
 /// Rail tile: glyph with an accent bar on the left edge when active. Future
-/// areas are dimmed and only show a tooltip.
-fn _tile(ui: &mut Ui, ico: Ico, tip: &str, active: bool, enabled: bool) {
+/// areas are dimmed and only show a tooltip. Returns true when clicked.
+fn _tile(ui: &mut Ui, ico: Ico, tip: &str, active: bool, enabled: bool) -> bool {
     let sense = if enabled {
         Sense::click()
     } else {
@@ -97,6 +102,12 @@ fn _tile(ui: &mut Ui, ico: Ico, tip: &str, active: bool, enabled: bool) {
         (false, true) => theme::LABEL,
     };
     glyphs::paint(ui.painter(), rect.shrink(2.0), ico, color);
+    if enabled {
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+    } else {
+        false
+    }
 }
 
 /// Small dot with the worker state as tooltip; pulses while busy.
@@ -115,13 +126,19 @@ fn _worker_dot(ui: &mut Ui, activity: WorkerActivity) {
     resp.on_hover_text(activity.tooltip());
 }
 
-/// Renders the rail content (the panel frame is set by the caller).
-pub fn show(ui: &mut Ui, activity: WorkerActivity) {
+/// Renders the rail content (the panel frame is set by the caller); returns
+/// the area whose tile was clicked.
+pub fn show(ui: &mut Ui, activity: WorkerActivity, current: Area) -> Option<Area> {
+    let mut clicked = None;
     ui.spacing_mut().item_spacing.y = 6.0;
     ui.vertical_centered(|ui| {
         _brand(ui);
         ui.add_space(14.0);
-        _tile(ui, Ico::Key, "Secrets", true, true);
+        for (area, ico, tip) in AREAS {
+            if _tile(ui, ico, tip, area == current, true) {
+                clicked = Some(area);
+            }
+        }
         for (ico, area) in FUTURE_AREAS {
             _tile(ui, ico, &format!("{area} - coming soon"), false, false);
         }
@@ -129,6 +146,7 @@ pub fn show(ui: &mut Ui, activity: WorkerActivity) {
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
         _worker_dot(ui, activity);
     });
+    clicked
 }
 
 #[cfg(test)]

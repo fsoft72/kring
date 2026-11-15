@@ -10,10 +10,12 @@ use kring_core::dev_guard::{IT_RUNTIME_VAR, violation_from};
 use kring_core::model::CollectionId;
 
 use crate::app_state::AppState;
-use crate::views::Action;
 use crate::views::collection::display_name;
 use crate::views::dialogs::DialogKind;
+use crate::views::file_detail::retire_dialog;
+use crate::views::file_items::displayed_file_items;
 use crate::views::item_list::displayed_items;
+use crate::views::{Action, Area};
 use crate::worker::Command;
 
 /// Keyring (display name) to select first.
@@ -22,8 +24,15 @@ const VAR_SELECT: &str = "KRING_DEV_SELECT";
 const VAR_EXPAND: &str = "KRING_DEV_EXPAND";
 /// Any non-empty value reveals the expanded item's secret.
 const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
-/// Dialog to open: `new-keyring` or `unlock`.
+/// Dialog to open: `new-keyring` or `unlock`; in the files area `import`,
+/// `retire` or `open` (password of a binary file).
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
+/// Area to show first: `files` selects the Offline files area.
+const VAR_AREA: &str = "KRING_DEV_AREA";
+/// Keyring file (name without `.keyring`) to select in the files area.
+const VAR_FILE: &str = "KRING_DEV_FILE";
+/// Value of [`VAR_AREA`] selecting the Offline files area.
+const AREA_FILES: &str = "files";
 
 /// Initial state requested for screenshots.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -34,8 +43,13 @@ pub struct DevPreset {
     pub expand: Option<usize>,
     /// Reveal the expanded item's secret.
     pub reveal: bool,
-    /// Dialog to open at start: `new-keyring` or `unlock`.
+    /// Dialog to open at start: `new-keyring` or `unlock`; `import`, `retire`
+    /// or `open` in the files area.
     pub dialog: Option<String>,
+    /// Area to show first (`files`).
+    pub area: Option<String>,
+    /// Keyring file to select in the files area.
+    pub file: Option<String>,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -55,6 +69,8 @@ pub fn preset_from(
         expand: var(VAR_EXPAND).and_then(|v| v.parse().ok()),
         reveal: var(VAR_REVEAL).is_some(),
         dialog: var(VAR_DIALOG),
+        area: var(VAR_AREA),
+        file: var(VAR_FILE),
     }
 }
 
@@ -81,6 +97,58 @@ impl DevPreset {
             .iter()
             .find(|c| display_name(c) == wanted)
             .map(|c| c.id.clone())
+    }
+
+    /// Area to switch to at start; returned once.
+    pub fn take_area(&mut self) -> Option<Area> {
+        let area = self.area.take()?;
+        (area == AREA_FILES).then_some(Area::Files)
+    }
+
+    /// Files area actions due now (select file, dialog); each fires once when its data exists.
+    pub fn take_file_actions(&mut self, state: &AppState) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(name) = self.file.as_deref() {
+            if !state.files.iter().any(|f| f.name == name) {
+                return out;
+            }
+            out.push(Action::SelectFile(name.to_string()));
+            self.file = None;
+            return out;
+        }
+        let Some(info) = state
+            .selected_file
+            .as_ref()
+            .and_then(|n| state.files.iter().find(|f| &f.name == n))
+        else {
+            return out;
+        };
+        let action = match self.dialog.as_deref() {
+            Some("import") => Some(Action::Open(DialogKind::import_file(
+                info.name.clone(),
+                &state.collections,
+            ))),
+            Some("retire") => Some(Action::Open(retire_dialog(state, info))),
+            Some("open") => Some(Action::Send(Command::OpenFile {
+                name: info.name.clone(),
+                password: None,
+            })),
+            _ => None,
+        };
+        if let Some(action) = action {
+            self.dialog = None;
+            out.push(action);
+        }
+        out
+    }
+
+    /// Files area card to expand, as `(index into file_items, reveal)`; returned
+    /// once, after the items of the selected file arrived.
+    pub fn take_file_card(&mut self, state: &AppState) -> Option<(usize, bool)> {
+        let wanted = self.expand?;
+        let index = *displayed_file_items(&state.file_items, "").get(wanted)?;
+        self.expand = None;
+        Some((index, self.reveal))
     }
 
     /// Actions due now (expand, reveal, dialog); each fires once when its data exists.
@@ -132,6 +200,8 @@ mod tests {
             VAR_EXPAND => Some("1".into()),
             VAR_REVEAL => Some("1".into()),
             VAR_DIALOG => Some("unlock".into()),
+            VAR_AREA => Some("files".into()),
+            VAR_FILE => Some("textual_two_items".into()),
             _ => None,
         }
     }
@@ -147,6 +217,8 @@ mod tests {
                 expand: Some(1),
                 reveal: true,
                 dialog: Some("unlock".into()),
+                area: Some("files".into()),
+                file: Some("textual_two_items".into()),
             }
         );
     }
@@ -170,6 +242,68 @@ mod tests {
             empty
         );
         assert_eq!(preset_from(Some(RUN), Some(RUN), None, vars), empty);
+    }
+
+    /// Builds a textual file info.
+    fn file(name: &str) -> kring_core::keyring_file::KeyringFileInfo {
+        kring_core::keyring_file::KeyringFileInfo {
+            path: format!("/k/{name}.keyring").into(),
+            name: name.into(),
+            format: kring_core::keyring_file::KeyringFormat::Textual,
+            size: 1,
+            modified: 0,
+            display_name: None,
+            item_count: Some(2),
+            daemon_readable: Some(true),
+            plaintext: true,
+            error: None,
+        }
+    }
+
+    /// The files area is entered once; the file is selected once it is listed,
+    /// then the dialog opens; the card follows the displayed order.
+    #[test]
+    fn files_area_preset() {
+        use kring_core::keyring_file::textual::OfflineItem;
+        use kring_core::model::SecretValue;
+        let mut p = DevPreset {
+            area: Some("files".into()),
+            file: Some("t".into()),
+            dialog: Some("retire".into()),
+            expand: Some(0),
+            reveal: true,
+            ..DevPreset::default()
+        };
+        assert_eq!(p.take_area(), Some(Area::Files));
+        assert_eq!(p.take_area(), None);
+        let mut s = AppState::default();
+        assert!(p.take_file_actions(&s).is_empty());
+        s.apply(Event::Files(vec![file("t")]));
+        let actions = p.take_file_actions(&s);
+        assert!(matches!(&actions[..], [Action::SelectFile(n)] if n == "t"));
+        s.select_file("t".into());
+        let actions = p.take_file_actions(&s);
+        assert!(matches!(
+            &actions[..],
+            [Action::Open(DialogKind::RetireFile { .. })]
+        ));
+        assert!(p.take_file_actions(&s).is_empty());
+        assert!(p.take_file_card(&s).is_none());
+        let item = |label: &str| OfflineItem {
+            label: label.into(),
+            attributes: Default::default(),
+            secret: SecretValue::from_text("s"),
+            created: 0,
+            modified: 0,
+        };
+        s.apply(Event::FileItems {
+            name: "t".into(),
+            items: vec![item("zeta"), item("alpha")],
+            warnings: vec![],
+        });
+        assert_eq!(p.take_file_card(&s), Some((1, true)));
+        assert!(p.take_file_card(&s).is_none());
+        assert_eq!(DevPreset::default().take_area(), None);
     }
 
     /// The expand index follows the displayed (label-sorted) order, once.

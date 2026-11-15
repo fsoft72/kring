@@ -1,14 +1,17 @@
 //! Modal dialogs: password prompts, forms and confirmations.
 
 use eframe::egui;
-use kring_core::model::{Attributes, CollectionId, ItemId};
+use kring_core::model::{Attributes, CollectionId, CollectionInfo, ItemId};
 use zeroize::Zeroizing;
 
+use crate::app_state::FileAction;
 use crate::ui::password_field::{forget_fields, new_buffer};
 use crate::ui::theme;
 use crate::ui::widgets::{danger_button, primary_button, secondary_button};
+use crate::views::collection::display_name;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_submit::command_for;
+use crate::views::file_detail::default_import_target;
 use crate::worker::Command;
 
 /// Id of the (single) open modal.
@@ -19,6 +22,17 @@ const DIALOG_WIDTH: f32 = FIELD_WIDTH;
 const DIALOG_MARGIN: i8 = 24;
 /// Opacity of the backdrop behind a dialog.
 const BACKDROP_ALPHA: u8 = 150;
+
+/// A keyring offered as import target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportTarget {
+    /// Collection object path.
+    pub id: CollectionId,
+    /// Display name.
+    pub label: String,
+    /// Locked keyrings are listed but cannot be chosen.
+    pub locked: bool,
+}
 
 /// The content of a dialog. Password buffers are zeroized when it is dropped.
 pub enum DialogKind {
@@ -77,6 +91,26 @@ pub enum DialogKind {
     },
     /// Confirm the deletion of an item.
     DeleteItem { item: ItemId, label: String },
+    /// Password of a binary keyring file, to open or import it.
+    FilePassword {
+        name: String,
+        action: FileAction,
+        password: Zeroizing<String>,
+    },
+    /// Choose the keyring receiving the items of a keyring file.
+    ImportFile {
+        name: String,
+        targets: Vec<ImportTarget>,
+        target: Option<CollectionId>,
+    },
+    /// Confirm retiring a plaintext keyring file, with the backup passphrase.
+    RetireFile {
+        name: String,
+        /// Body lines from `file_detail::retire_dialog_text`.
+        lines: Vec<String>,
+        passphrase: Zeroizing<String>,
+        confirm: Zeroizing<String>,
+    },
     /// Choose a passphrase for a backup containing plaintext keyrings.
     Passphrase {
         command: Box<Command>,
@@ -131,6 +165,42 @@ impl DialogKind {
             item,
             label,
             secret: new_buffer(),
+        }
+    }
+
+    /// Password dialog of binary file `name`, resending `action` with the password.
+    pub fn file_password(name: String, action: FileAction) -> Self {
+        Self::FilePassword {
+            name,
+            action,
+            password: new_buffer(),
+        }
+    }
+
+    /// Import dialog of file `name`: every keyring is listed, locked ones disabled.
+    pub fn import_file(name: String, collections: &[CollectionInfo]) -> Self {
+        let targets = collections
+            .iter()
+            .map(|c| ImportTarget {
+                id: c.id.clone(),
+                label: display_name(c),
+                locked: c.locked,
+            })
+            .collect();
+        Self::ImportFile {
+            name,
+            targets,
+            target: default_import_target(collections),
+        }
+    }
+
+    /// Retire confirmation of file `name` with its body lines.
+    pub fn retire_file(name: String, lines: Vec<String>) -> Self {
+        Self::RetireFile {
+            name,
+            lines,
+            passphrase: new_buffer(),
+            confirm: new_buffer(),
         }
     }
 
@@ -343,6 +413,129 @@ mod tests {
             Command::DeleteCollection {
                 backup_passphrase, ..
             } => assert_eq!(backup_passphrase.unwrap().as_text(), Some("pp")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The file password dialog resends Open or Import with the password.
+    #[test]
+    fn file_password_resends_action() {
+        let mut d = Dialog::new(DialogKind::file_password("b".into(), FileAction::Open));
+        if let DialogKind::FilePassword { password, .. } = &mut d.kind {
+            *password = buf("pw");
+        }
+        match d.submit().unwrap() {
+            Command::OpenFile { name, password } => {
+                assert_eq!(name, "b");
+                assert_eq!(password.unwrap().as_text(), Some("pw"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let target = CollectionId("/c/t".into());
+        let mut d = Dialog::new(DialogKind::file_password(
+            "b".into(),
+            FileAction::Import {
+                target: target.clone(),
+            },
+        ));
+        assert!(d.submit().is_err(), "empty password rejected");
+        if let DialogKind::FilePassword { password, .. } = &mut d.kind {
+            *password = buf("pw");
+        }
+        match d.submit().unwrap() {
+            Command::ImportFile {
+                name,
+                password,
+                target: t,
+            } => {
+                assert_eq!(name, "b");
+                assert_eq!(password.unwrap().as_text(), Some("pw"));
+                assert_eq!(t, target);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The import dialog lists every keyring, defaults to login and refuses locked targets.
+    #[test]
+    fn import_file_targets() {
+        use kring_core::model::LOGIN_COLLECTION_PATH;
+        let col = |path: &str, label: &str, locked: bool| CollectionInfo {
+            id: CollectionId(path.into()),
+            label: label.into(),
+            locked,
+            item_count: 0,
+            aliases: vec![],
+            is_login: path == LOGIN_COLLECTION_PATH,
+            created: 0,
+            modified: 0,
+        };
+        let cols = [
+            col("/c/work", "Work", true),
+            col(LOGIN_COLLECTION_PATH, "Login", false),
+        ];
+        let mut d = Dialog::new(DialogKind::import_file("t".into(), &cols));
+        let DialogKind::ImportFile {
+            targets, target, ..
+        } = &mut d.kind
+        else {
+            panic!("expected ImportFile");
+        };
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].locked && targets[0].label == "Work");
+        assert_eq!(
+            target.as_ref().map(|t| t.0.as_str()),
+            Some(LOGIN_COLLECTION_PATH)
+        );
+        *target = Some(CollectionId("/c/work".into()));
+        assert!(d.submit().is_err(), "locked target rejected");
+        if let DialogKind::ImportFile { target, .. } = &mut d.kind {
+            *target = None;
+        }
+        assert!(d.submit().is_err(), "missing target rejected");
+        if let DialogKind::ImportFile { target, .. } = &mut d.kind {
+            *target = Some(CollectionId(LOGIN_COLLECTION_PATH.into()));
+        }
+        match d.submit().unwrap() {
+            Command::ImportFile {
+                name,
+                password,
+                target,
+            } => {
+                assert_eq!(name, "t");
+                assert!(password.is_none());
+                assert_eq!(target.0, LOGIN_COLLECTION_PATH);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Retire needs a confirmed backup passphrase.
+    #[test]
+    fn retire_file_needs_confirmed_passphrase() {
+        let mut d = Dialog::new(DialogKind::retire_file("t".into(), vec!["x".into()]));
+        assert!(d.submit().is_err(), "empty passphrase rejected");
+        if let DialogKind::RetireFile {
+            passphrase,
+            confirm,
+            ..
+        } = &mut d.kind
+        {
+            *passphrase = buf("pp");
+            *confirm = buf("pq");
+        }
+        assert!(d.submit().is_err(), "mismatch rejected");
+        if let DialogKind::RetireFile { confirm, .. } = &mut d.kind {
+            *confirm = buf("pp");
+        }
+        match d.submit().unwrap() {
+            Command::RetireFile {
+                name,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, "t");
+                assert_eq!(backup_passphrase.as_text(), Some("pp"));
+            }
             other => panic!("unexpected {other:?}"),
         }
     }

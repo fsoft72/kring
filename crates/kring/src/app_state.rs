@@ -15,6 +15,35 @@ const MAX_ERRORS: usize = 20;
 /// Alias of the default collection.
 const DEFAULT_ALIAS: &str = "default";
 
+/// File command waiting for the password of a binary keyring file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileAction {
+    /// Show the items of the file.
+    Open,
+    /// Import the items of the file into `target`.
+    Import { target: CollectionId },
+}
+
+/// Returns the toast text of a finished import, e.g. `Imported 2 items - 1 duplicate - 0 conflicts`.
+pub fn import_summary(report: &ImportReport) -> String {
+    let mut text = format!(
+        "Imported {} - {} - {}",
+        _count(report.created, "item"),
+        _count(report.duplicates, "duplicate"),
+        _count(report.conflicts.len(), "conflict"),
+    );
+    if !report.failed.is_empty() {
+        text.push_str(&format!(" - {} failed", report.failed.len()));
+    }
+    text
+}
+
+/// Formats `n noun`, adding `s` unless `n` is 1.
+fn _count(n: usize, noun: &str) -> String {
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} {noun}{plural}")
+}
+
 /// Everything the UI renders.
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -39,6 +68,8 @@ pub struct AppState {
     pub file_warnings: Vec<ParseWarning>,
     /// Binary keyring file waiting for its password.
     pub pending_file_password: Option<String>,
+    /// Command of the selected file sent without a password, resent with one when asked.
+    pub pending_file_action: Option<FileAction>,
     /// Backups, newest first.
     pub backups: Vec<BackupInfo>,
     /// Outcome of the last import.
@@ -99,12 +130,22 @@ impl AppState {
                 self.file_items = items;
                 self.file_warnings = warnings;
             }
-            Event::PasswordNeeded(name) => self.pending_file_password = Some(name),
-            Event::ImportDone(report) => self.last_import = Some(report),
+            Event::PasswordNeeded(name) => {
+                if self.selected_file.as_ref() == Some(&name) {
+                    self.pending_file_password = Some(name);
+                }
+            }
+            Event::ImportDone(report) => {
+                self.status = import_summary(&report);
+                self.last_import = Some(report);
+            }
             Event::Backups(v) => self.backups = v,
             Event::RestoreDone(report) => self.last_restore = Some(report),
             Event::Done(msg) => self.status = msg,
             Event::Error(msg) => {
+                // The failed command may be the pending file command: never resend it.
+                self.pending_file_action = None;
+                self.pending_file_password = None;
                 self.errors.push(msg);
                 let excess = self.errors.len().saturating_sub(MAX_ERRORS);
                 self.errors.drain(..excess);
@@ -152,6 +193,43 @@ impl AppState {
         self.file_items.clear();
         self.file_warnings.clear();
         self.pending_file_password = None;
+        self.pending_file_action = None;
+        self.last_import = None;
+    }
+
+    /// Remembers a file command sent without a password, so a later
+    /// [`Event::PasswordNeeded`] knows what to resend.
+    pub fn track_file_command(&mut self, cmd: &Command) {
+        let (name, action) = match cmd {
+            Command::OpenFile { name, password } => {
+                (name, password.is_none().then_some(FileAction::Open))
+            }
+            Command::ImportFile {
+                name,
+                password,
+                target,
+            } => (
+                name,
+                password.is_none().then(|| FileAction::Import {
+                    target: target.clone(),
+                }),
+            ),
+            _ => return,
+        };
+        if self.selected_file.as_ref() != Some(name) {
+            return;
+        }
+        self.pending_file_action = action;
+    }
+
+    /// Takes the password request of the selected file with the command to resend.
+    pub fn take_password_request(&mut self) -> Option<(String, FileAction)> {
+        let name = self.pending_file_password.take()?;
+        let action = self.pending_file_action.take()?;
+        if self.selected_file.as_ref() != Some(&name) {
+            return None;
+        }
+        Some((name, action))
     }
 
     /// Selects a collection and clears everything below it.
@@ -382,6 +460,112 @@ mod tests {
             pre_restore_backup: None,
         }));
         assert_eq!(s.last_restore.as_ref().map(|r| r.restored.len()), Some(1));
+    }
+
+    /// Selects file `name` and tracks `cmd` for it.
+    fn tracked(name: &str, cmd: Command) -> AppState {
+        let mut s = AppState::default();
+        s.apply(Event::Files(vec![file("a"), file("b")]));
+        s.select_file(name.into());
+        s.track_file_command(&cmd);
+        s
+    }
+
+    /// A password request opens only for the selected file with a tracked command, once.
+    #[test]
+    fn password_request_for_selected_file_only() {
+        let open = Command::OpenFile {
+            name: "a".into(),
+            password: None,
+        };
+        let mut s = tracked("a", open.clone());
+        s.apply(Event::PasswordNeeded("b".into()));
+        assert!(s.take_password_request().is_none());
+        s.apply(Event::PasswordNeeded("a".into()));
+        assert_eq!(
+            s.take_password_request(),
+            Some(("a".to_string(), FileAction::Open))
+        );
+        assert!(s.take_password_request().is_none());
+        let mut untracked = tracked("a", Command::ScanFiles);
+        untracked.apply(Event::PasswordNeeded("a".into()));
+        assert!(untracked.take_password_request().is_none());
+        let mut other = tracked("b", open);
+        other.apply(Event::PasswordNeeded("b".into()));
+        assert!(other.take_password_request().is_none());
+    }
+
+    /// An import sent without a password resends the same target.
+    #[test]
+    fn import_request_keeps_target() {
+        let target = CollectionId("/c/t".into());
+        let mut s = tracked(
+            "a",
+            Command::ImportFile {
+                name: "a".into(),
+                password: None,
+                target: target.clone(),
+            },
+        );
+        s.apply(Event::PasswordNeeded("a".into()));
+        assert_eq!(
+            s.take_password_request(),
+            Some(("a".to_string(), FileAction::Import { target }))
+        );
+    }
+
+    /// A command with a password, an error or a file change drops the pending action.
+    #[test]
+    fn pending_action_cleared() {
+        let open = Command::OpenFile {
+            name: "a".into(),
+            password: None,
+        };
+        let mut s = tracked("a", open.clone());
+        s.track_file_command(&Command::OpenFile {
+            name: "a".into(),
+            password: Some(SecretValue::from_text("pw")),
+        });
+        assert!(s.pending_file_action.is_none());
+        let mut s = tracked("a", open.clone());
+        s.apply(Event::Error("invalid input: Wrong password".into()));
+        assert!(s.pending_file_action.is_none());
+        let mut s = tracked("a", open.clone());
+        s.select_file("b".into());
+        assert!(s.pending_file_action.is_none());
+        let mut s = tracked("a", open);
+        s.apply(Event::PasswordNeeded("a".into()));
+        s.close_file();
+        assert!(s.pending_file_action.is_none() && s.take_password_request().is_none());
+    }
+
+    /// A finished import becomes a status message; closing the file drops the report.
+    #[test]
+    fn import_done_status_and_reset() {
+        let report = ImportReport {
+            created: 2,
+            duplicates: 1,
+            conflicts: vec!["x".into()],
+            failed: vec![],
+        };
+        assert_eq!(
+            import_summary(&report),
+            "Imported 2 items - 1 duplicate - 1 conflict"
+        );
+        let failed = ImportReport {
+            created: 1,
+            failed: vec![("y".into(), "e".into())],
+            ..Default::default()
+        };
+        assert_eq!(
+            import_summary(&failed),
+            "Imported 1 item - 0 duplicates - 0 conflicts - 1 failed"
+        );
+        let mut s = tracked("a", Command::ScanFiles);
+        s.apply(Event::ImportDone(report));
+        assert_eq!(s.status, "Imported 2 items - 1 duplicate - 1 conflict");
+        s.close_file();
+        assert!(s.last_import.is_none());
     }
 
     /// Errors are capped at the last 20.

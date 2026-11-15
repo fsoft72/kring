@@ -594,3 +594,23 @@ fn rejects_path_traversal_names() {
     assert!(e.expect_error().ends_with("Invalid keyring file name"));
     assert!(e.keyring(TEXTUAL).exists());
 }
+
+/// Without a provider, store-backed offline commands report Plan 1's exact message.
+#[test]
+fn import_without_provider_reports_plain_message() {
+    let (_dir, _keyrings, config) = dirs(&[(TEXTUAL, MAIN)]);
+    let h = spawn::<FakeStore>(None, None, config, || {});
+    for _ in 0..2 {
+        recv(&h);
+    }
+    h.tx.send(Command::ImportFile {
+        name: MAIN.into(),
+        password: None,
+        target: CollectionId("/c/x".into()),
+    })
+    .unwrap();
+    match recv(&h) {
+        Event::Error(m) => assert_eq!(m, crate::worker::MSG_NO_PROVIDER),
+        other => panic!("expected Error, got {other:?}"),
+    }
+}

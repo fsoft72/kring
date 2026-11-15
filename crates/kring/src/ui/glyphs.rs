@@ -52,6 +52,8 @@ pub enum Ico {
     Shield,
     /// Tools area.
     Sliders,
+    /// Rescan or reload.
+    Refresh,
 }
 
 /// Maps 16-unit grid coordinates to screen positions inside an icon box.
@@ -92,6 +94,7 @@ pub fn paint(p: &Painter, rect: Rect, ico: Ico, color: Color32) {
         Ico::Eye | Ico::EyeOff => _eye(p, &g, st, ico == Ico::EyeOff),
         Ico::Lock | Ico::Unlock => _lock(p, &g, st, ico == Ico::Unlock),
         Ico::Star => _star(p, &g, st),
+        Ico::Refresh => _refresh(p, &g, st),
         Ico::Trash => _trash(p, &g, st),
         Ico::ChevronRight => _poly(
             p,
@@ -245,6 +248,14 @@ fn _lock(p: &Painter, g: &Grid, st: Stroke, open: bool) {
     }
     _poly(p, shackle, st);
     p.circle_filled(g.pt(8.0, 10.5), 1.1 * g.unit, st.color);
+}
+
+/// Circular arrow: an arc open at three o'clock with an arrow head at its end.
+fn _refresh(p: &Painter, g: &Grid, st: Stroke) {
+    let pi = std::f32::consts::PI;
+    _poly(p, g.arc((8.0, 8.0), (5.5, 5.5), 0.15 * pi, 1.85 * pi), st);
+    let head = vec![g.pt(13.4, 1.9), g.pt(12.9, 5.5), g.pt(9.6, 3.9)];
+    _poly(p, head, st);
 }
 
 /// Five-pointed star outline.

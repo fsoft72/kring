@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use kring_core::model::ItemId;
+use kring_core::model::{ItemId, SecretValue};
 
 use crate::app_state::AppState;
 use crate::clipboard::{CLIPBOARD_CLEAR_AFTER, ClipboardBackend, ClipboardGuard};
@@ -57,17 +57,8 @@ impl<C: ClipboardBackend> SecretCopier<C> {
         state.hide_secret();
     }
 
-    /// Clears the clipboard when due; returns true while a clear is still pending.
-    pub fn tick(&mut self, now: Instant) -> bool {
-        self.clipboard.tick(now);
-        self.clipboard.has_pending()
-    }
-
-    /// Copies the revealed secret (text only) and reports the outcome in the state.
-    fn _copy_revealed(&mut self, state: &mut AppState) {
-        let Some((_, secret)) = &state.revealed else {
-            return;
-        };
+    /// Copies a secret already in memory (offline file items) and reports the outcome.
+    pub fn copy_value(&mut self, secret: &SecretValue, state: &mut AppState) {
         let SecretView::Text(text) = secret_display(secret) else {
             return state.apply(Event::Error(MSG_BINARY.into()));
         };
@@ -78,6 +69,21 @@ impl<C: ClipboardBackend> SecretCopier<C> {
             }
             Err(e) => state.apply(Event::Error(e)),
         }
+    }
+
+    /// Clears the clipboard when due; returns true while a clear is still pending.
+    pub fn tick(&mut self, now: Instant) -> bool {
+        self.clipboard.tick(now);
+        self.clipboard.has_pending()
+    }
+
+    /// Copies the revealed secret (text only) and reports the outcome in the state.
+    fn _copy_revealed(&mut self, state: &mut AppState) {
+        let Some((id, secret)) = state.revealed.take() else {
+            return;
+        };
+        self.copy_value(&secret, state);
+        state.revealed = Some((id, secret));
     }
 }
 
@@ -161,6 +167,20 @@ mod tests {
         c.finish(&mut s);
         assert_eq!(fake.text.borrow().as_deref(), Some("pw"));
         assert!(s.revealed.is_none());
+    }
+
+    /// An in-memory secret is copied directly; binary ones are refused.
+    #[test]
+    fn copies_value_directly() {
+        let fake = Fake::default();
+        let mut c = SecretCopier::new(fake.clone());
+        let mut s = AppState::default();
+        c.copy_value(&SecretValue::from_text("offline"), &mut s);
+        assert_eq!(fake.text.borrow().as_deref(), Some("offline"));
+        assert!(s.status.starts_with("Copied"));
+        c.copy_value(&SecretValue::new(vec![0xff], "x"), &mut s);
+        assert_eq!(fake.text.borrow().as_deref(), Some("offline"));
+        assert_eq!(s.errors.last().map(String::as_str), Some(MSG_BINARY));
     }
 
     /// Binary secrets are not copied and report an error.

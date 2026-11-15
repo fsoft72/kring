@@ -1,14 +1,16 @@
 //! Field layout of each dialog kind.
 
 use eframe::egui::{self, RichText};
+use kring_core::model::CollectionId;
 use zeroize::Zeroizing;
 
+use crate::app_state::FileAction;
 use crate::ui::password_field::{
     FIELD_CONFIRM, FIELD_OLD, FIELD_PASSWORD, FIELD_SECRET, password_field,
 };
 use crate::ui::theme;
 use crate::ui::widgets::{field_label, input, semibold};
-use crate::views::dialogs::DialogKind;
+use crate::views::dialogs::{DialogKind, ImportTarget};
 use crate::views::item_detail::attribute_rows;
 
 /// Width of dialog content.
@@ -63,6 +65,32 @@ fn _text_field(ui: &mut egui::Ui, label: &str, text: &mut String) {
 fn _password_field(ui: &mut egui::Ui, label: &str, field: &str, buffer: &mut Zeroizing<String>) {
     field_label(ui, label);
     password_field(ui, field, buffer, "");
+}
+
+/// Combo of import targets; locked keyrings are shown disabled with "(locked)".
+fn _target_combo(ui: &mut egui::Ui, targets: &[ImportTarget], target: &mut Option<CollectionId>) {
+    let selected = targets
+        .iter()
+        .find(|t| Some(&t.id) == target.as_ref())
+        .map_or_else(|| "Choose a keyring".to_string(), |t| t.label.clone());
+    egui::ComboBox::from_id_salt("kring-import-target")
+        .selected_text(selected)
+        .width(FIELD_WIDTH)
+        .show_ui(ui, |ui| {
+            for t in targets {
+                let text = if t.locked {
+                    format!("{} (locked)", t.label)
+                } else {
+                    t.label.clone()
+                };
+                let checked = Some(&t.id) == target.as_ref();
+                ui.add_enabled_ui(!t.locked, |ui| {
+                    if ui.selectable_label(checked, text).clicked() {
+                        *target = Some(t.id.clone());
+                    }
+                });
+            }
+        });
 }
 
 /// Renders the fields of a dialog and returns its main action.
@@ -159,6 +187,53 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _text(ui, &format!("Delete the item \"{label}\"?"));
             _muted(ui, "A backup of the keyring files is created first.");
             _danger("Delete")
+        }
+        DialogKind::FilePassword {
+            name,
+            action,
+            password,
+        } => {
+            let verb = match action {
+                FileAction::Open => "Open",
+                FileAction::Import { .. } => "Import",
+            };
+            _title(ui, &format!("{verb} \"{name}.keyring\""));
+            _muted(
+                ui,
+                "This keyring file is encrypted. The password is used once and not kept.",
+            );
+            _password_field(ui, "Keyring password", FIELD_PASSWORD, password);
+            _primary(verb)
+        }
+        DialogKind::ImportFile {
+            name,
+            targets,
+            target,
+        } => {
+            _title(ui, &format!("Import \"{name}.keyring\""));
+            _text(ui, "Copy the items of this file into a keyring.");
+            field_label(ui, "Target keyring");
+            _target_combo(ui, targets, target);
+            _muted(
+                ui,
+                "Identical items are skipped. Items whose attributes exist with another \
+                 secret are listed as conflicts and never overwritten.",
+            );
+            _primary("Import")
+        }
+        DialogKind::RetireFile {
+            name,
+            lines,
+            passphrase,
+            confirm,
+        } => {
+            _title(ui, &format!("Retire \"{name}.keyring\""));
+            for line in lines.iter() {
+                _text(ui, line);
+            }
+            _password_field(ui, "Backup passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _danger("Retire")
         }
         DialogKind::Passphrase {
             passphrase,

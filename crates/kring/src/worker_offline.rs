@@ -64,6 +64,9 @@ pub(crate) async fn handle<S, N>(
     S: SecretStore + MasterPasswordStore,
     N: Fn(),
 {
+    if store.is_none() && needs_store(&cmd) {
+        return out.error(MSG_NO_PROVIDER);
+    }
     if let Err(e) = run(out, store, provider, config, &cmd).await {
         out.error(e.to_string());
     }
@@ -141,6 +144,16 @@ where
             "Store command sent to the offline path".into(),
         )),
     }
+}
+
+/// Returns true for offline commands that cannot run without a store.
+fn needs_store(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::ImportFile { .. }
+            | Command::ImportArchive { .. }
+            | Command::ExportCollection { .. }
+    )
 }
 
 /// Returns the store, or an error when no provider is running.

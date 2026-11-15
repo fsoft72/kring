@@ -19,6 +19,8 @@ const TOAST_WIDTH: f32 = 360.0;
 const TOAST_OFFSET: f32 = 16.0;
 /// Status prefixes reported as information rather than success.
 const INFO_PREFIXES: [&str; 2] = ["Copied", "Backup"];
+/// `KringError` category prefixes hidden from the user (the inner message stays).
+const ERROR_PREFIXES: [&str; 2] = ["invalid input: ", "unsupported: "];
 
 /// Severity of a toast; selects the colour of its bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +54,15 @@ pub fn kind_for_status(status: &str) -> ToastKind {
         return ToastKind::Info;
     }
     ToastKind::Ok
+}
+
+/// Returns the user-facing part of an error message: the inner message
+/// without a `KringError` category prefix such as `invalid input: `.
+pub fn user_message(raw: &str) -> &str {
+    ERROR_PREFIXES
+        .iter()
+        .find_map(|p| raw.strip_prefix(p))
+        .unwrap_or(raw)
 }
 
 impl Toasts {
@@ -136,6 +147,28 @@ mod tests {
         );
         assert_eq!(kind_for_status("Backup created: /x"), ToastKind::Info);
         assert_eq!(kind_for_status("Collection renamed"), ToastKind::Ok);
+    }
+
+    /// Category prefixes are stripped once; other messages are unchanged.
+    #[test]
+    fn user_message_strips_category() {
+        assert_eq!(
+            user_message("invalid input: Wrong password for a.keyring"),
+            "Wrong password for a.keyring"
+        );
+        assert_eq!(
+            user_message("unsupported: Not supported on this provider"),
+            "Not supported on this provider"
+        );
+        assert_eq!(
+            user_message("No Secret Service provider running"),
+            "No Secret Service provider running"
+        );
+        assert_eq!(user_message("locked: /c/a"), "locked: /c/a");
+        assert_eq!(
+            user_message("Backup failed: invalid input: x"),
+            "Backup failed: invalid input: x"
+        );
     }
 
     /// Errors outlive other toasts; expired toasts are dropped.

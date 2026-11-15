@@ -4,8 +4,16 @@ use kring_core::model::{ItemUpdate, NewItem, SecretValue};
 use kring_core::validate;
 use zeroize::Zeroizing;
 
+use crate::app_state::FileAction;
 use crate::views::dialogs::DialogKind;
 use crate::worker::Command;
+
+/// Error of an import without a target keyring.
+const MSG_NO_TARGET: &str = "Choose a keyring to import into";
+/// Error of an import into a locked keyring.
+const MSG_TARGET_LOCKED: &str = "The chosen keyring is locked, unlock it first";
+/// Error of an empty file password.
+const MSG_NO_PASSWORD: &str = "Enter the password of the keyring file";
 
 /// Rejects a blank item label.
 fn _item_label(label: &str) -> Result<(), String> {
@@ -134,6 +142,54 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
         DialogKind::DeleteItem { item, .. } => Command::DeleteItem {
             item: item.clone(),
             backup_passphrase: None,
+        },
+        DialogKind::FilePassword {
+            name,
+            action,
+            password,
+        } => {
+            if password.is_empty() {
+                return Err(MSG_NO_PASSWORD.into());
+            }
+            let password = Some(_secret(password));
+            match action {
+                FileAction::Open => Command::OpenFile {
+                    name: name.clone(),
+                    password,
+                },
+                FileAction::Import { target } => Command::ImportFile {
+                    name: name.clone(),
+                    password,
+                    target: target.clone(),
+                },
+            }
+        }
+        DialogKind::ImportFile {
+            name,
+            targets,
+            target,
+        } => {
+            let Some(target) = target else {
+                return Err(MSG_NO_TARGET.into());
+            };
+            let usable = targets.iter().any(|t| &t.id == target && !t.locked);
+            if !usable {
+                return Err(MSG_TARGET_LOCKED.into());
+            }
+            Command::ImportFile {
+                name: name.clone(),
+                password: None,
+                target: target.clone(),
+            }
+        }
+        DialogKind::RetireFile {
+            name,
+            passphrase,
+            confirm,
+            ..
+        } => Command::RetireFile {
+            name: name.clone(),
+            backup_passphrase: _new_password(passphrase, confirm)?,
         },
         DialogKind::Passphrase {
             command,

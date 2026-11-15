@@ -31,7 +31,7 @@ pub fn keyring_matches(c: &CollectionInfo, filter: &str) -> bool {
 }
 
 /// Paints the row background: selected tint plus accent bar, or hover tint.
-fn _row_background(ui: &Ui, rect: egui::Rect, selected: bool, hovered: bool) {
+pub fn row_background(ui: &Ui, rect: egui::Rect, selected: bool, hovered: bool) {
     let r = CornerRadius::same(theme::RADIUS_CARD);
     if selected {
         ui.painter().rect_filled(rect, r, theme::INPUT_FILL_BLUE);
@@ -51,7 +51,7 @@ fn _row(ui: &mut Ui, c: &CollectionInfo, selected: bool) -> bool {
     let size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    _row_background(ui, rect, selected, resp.hovered());
+    row_background(ui, rect, selected, resp.hovered());
     let inner = rect.shrink2(egui::vec2(ROW_PADDING, 0.0));
     let builder = UiBuilder::new()
         .max_rect(inner)

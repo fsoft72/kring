@@ -6,6 +6,9 @@ pub mod collection;
 pub mod dialog_body;
 pub mod dialog_submit;
 pub mod dialogs;
+pub mod file_detail;
+pub mod file_items;
+pub mod files_list;
 pub mod item_detail;
 pub mod item_list;
 pub mod rail;
@@ -14,6 +17,7 @@ pub mod sidebar;
 use kring_core::model::{CollectionId, ItemId};
 use kring_core::provider::ProviderInfo;
 
+use crate::app_state::AppState;
 use crate::worker::Command;
 use dialogs::DialogKind;
 
@@ -40,6 +44,36 @@ pub enum Action {
     CopySecret,
     /// Open a modal dialog.
     Open(DialogKind),
+    /// Switch to another area of the rail.
+    SwitchArea(Area),
+    /// Select a keyring file (textual files are opened right away).
+    SelectFile(String),
+    /// Copy the secret of `state.file_items[index]` to the clipboard.
+    CopyFileSecret(usize),
+}
+
+/// Area of the window selected in the nav rail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Area {
+    /// Secret Service keyrings and their items.
+    #[default]
+    Secrets,
+    /// Keyring files on disk, read offline.
+    Files,
+}
+
+/// Switches from area `from` to `to`; returns the command to send on entry.
+///
+/// Leaving the Offline files area closes the selected file, dropping its
+/// secrets; entering it rescans the keyrings directory.
+pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Option<Command> {
+    if from == to {
+        return None;
+    }
+    if from == Area::Files {
+        state.close_file();
+    }
+    (to == Area::Files).then_some(Command::ScanFiles)
 }
 
 /// Why groups of actions are disabled; `None` means allowed.
@@ -117,6 +151,19 @@ mod tests {
         let g = Gates::from_provider(Some(&provider(ProviderKind::GnomeKeyring, false)));
         assert_eq!(g.write, None);
         assert_eq!(g.write_and_master(), Some(MSG_NEEDS_GNOME_KEYRING));
+    }
+
+    /// Leaving the files area closes the file; entering it rescans; staying does nothing.
+    #[test]
+    fn switch_area_closes_file_and_rescans() {
+        let mut s = AppState::default();
+        s.select_file("a".into());
+        assert!(switch_area(&mut s, Area::Files, Area::Files).is_none());
+        assert_eq!(s.selected_file.as_deref(), Some("a"));
+        assert!(switch_area(&mut s, Area::Files, Area::Secrets).is_none());
+        assert!(s.selected_file.is_none());
+        let cmd = switch_area(&mut s, Area::Secrets, Area::Files);
+        assert!(matches!(cmd, Some(Command::ScanFiles)));
     }
 
     /// No provider blocks everything.

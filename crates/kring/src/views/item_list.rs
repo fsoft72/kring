@@ -4,7 +4,7 @@ use eframe::egui::{
     self, Align, CornerRadius, FontId, Layout, Sense, Stroke, StrokeKind, Ui,
     text::{LayoutJob, TextFormat, TextWrapping},
 };
-use kring_core::model::{CollectionInfo, ItemInfo};
+use kring_core::model::{Attributes, CollectionInfo, ItemInfo};
 
 use crate::app_state::AppState;
 use crate::ui::glyphs::{self, Ico};
@@ -18,7 +18,7 @@ use crate::views::{Action, Gates};
 /// Height of the clickable header row of a card.
 const CARD_HEADER_HEIGHT: f32 = 24.0;
 /// Vertical gap between cards.
-const CARD_GAP: f32 = 8.0;
+pub const CARD_GAP: f32 = 8.0;
 /// Horizontal gap between parts of a card header.
 const HEADER_GAP: f32 = 12.0;
 /// Side of the chevron and lock glyph boxes.
@@ -71,14 +71,21 @@ fn _one_line(
 
 /// Paints the header row of a card: lock, label, attribute summary, date and
 /// chevron. Returns true when clicked.
-fn _card_header(ui: &mut Ui, item: &ItemInfo, expanded: bool) -> bool {
+pub fn card_header(
+    ui: &mut Ui,
+    label: &str,
+    attributes: &Attributes,
+    modified: u64,
+    locked: bool,
+    expanded: bool,
+) -> bool {
     let size = egui::vec2(ui.available_width(), CARD_HEADER_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     let p = ui.painter().clone();
     let mid = rect.center().y;
     let mut x = rect.left();
-    if item.locked {
+    if locked {
         let r = egui::Rect::from_min_size(
             egui::pos2(x, mid - GLYPH_BOX / 2.0),
             egui::vec2(GLYPH_BOX, GLYPH_BOX),
@@ -102,7 +109,7 @@ fn _card_header(ui: &mut Ui, item: &ItemInfo, expanded: bool) -> bool {
     };
     glyphs::paint(&p, chev_rect, chevron, chev_color);
     let date = p.layout_no_wrap(
-        format_date(item.modified),
+        format_date(modified),
         FontId::proportional(12.0),
         theme::MUTED,
     );
@@ -115,7 +122,7 @@ fn _card_header(ui: &mut Ui, item: &ItemInfo, expanded: bool) -> bool {
     let label_max = (date_x - x) * 0.5;
     let label = _one_line(
         ui,
-        item.label.clone(),
+        label.to_string(),
         FontId::new(14.0, theme::semibold()),
         theme::TEXT,
         label_max,
@@ -128,7 +135,7 @@ fn _card_header(ui: &mut Ui, item: &ItemInfo, expanded: bool) -> bool {
     );
     x += label_w + HEADER_GAP;
     let summary_max = date_x - HEADER_GAP - x;
-    let summary = attributes_summary(&item.attributes);
+    let summary = attributes_summary(attributes);
     let summary = _one_line(
         ui,
         summary,
@@ -158,7 +165,14 @@ fn _card(
     let frame = card_frame().inner_margin(egui::Margin::symmetric(16, 10));
     let resp = frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
-        if _card_header(ui, item, expanded) {
+        if card_header(
+            ui,
+            &item.label,
+            &item.attributes,
+            item.modified,
+            item.locked,
+            expanded,
+        ) {
             action = Some(if expanded {
                 Action::DeselectItem
             } else {
@@ -170,7 +184,12 @@ fn _card(
             action = body.or(action.take());
         }
     });
-    let rect = resp.response.rect;
+    card_border(ui, resp.response.rect, expanded);
+    action
+}
+
+/// Paints the card border: PRIMARY when expanded, dimmed PRIMARY on hover.
+pub fn card_border(ui: &Ui, rect: egui::Rect, expanded: bool) {
     let border = if expanded {
         Some(theme::PRIMARY)
     } else if ui.rect_contains_pointer(rect) {
@@ -183,7 +202,6 @@ fn _card(
         ui.painter()
             .rect_stroke(rect, r, Stroke::new(1.0_f32, color), StrokeKind::Inside);
     }
-    action
 }
 
 /// Items matching `filter` in card order. The bus lists items in no stable

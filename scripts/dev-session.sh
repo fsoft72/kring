@@ -9,6 +9,10 @@
 #   login      3 items (default alias), password `test`
 #   Work       2 items, locked, password `work`
 #   Default_1  empty, password `d1`
+# and, before the daemon starts, the synthetic fixtures of
+# crates/kring-core/tests/fixtures/keyrings are copied into the TEMP keyrings
+# dir (never from the real one), so the Offline files area has binary,
+# plaintext, unreadable (multi-line secret), empty and garbage files.
 # The temp dir is deleted on exit unless KRING_DEV_KEEP=1.
 set -u
 
@@ -62,6 +66,23 @@ export XDG_RUNTIME_DIR="$TMP_ROOT/run"
 export KRING_IT_RUNTIME="$XDG_RUNTIME_DIR"
 unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK DBUS_SESSION_BUS_ADDRESS
 echo "dev-session: temp root $TMP_ROOT (backups in $XDG_DATA_HOME/kring/backups)" >&2
+
+# Seed the temp keyrings dir with the synthetic fixtures (repo files only).
+FIXTURES_DIR="$REPO_ROOT/crates/kring-core/tests/fixtures/keyrings"
+TEMP_KEYRINGS="$XDG_DATA_HOME/keyrings"
+case "$TEMP_KEYRINGS" in
+  "$TMP_ROOT"/*) ;;
+  *) echo "dev-session: refusing to seed outside $TMP_ROOT" >&2; exit 1 ;;
+esac
+if [ "$TEMP_KEYRINGS" = "$REAL_KEYRINGS" ]; then
+  echo "dev-session: refusing to seed the real keyrings dir" >&2
+  exit 1
+fi
+mkdir -p "$TEMP_KEYRINGS"
+chmod 700 "$TEMP_KEYRINGS"
+for f in "$FIXTURES_DIR"/*.keyring; do
+  install -m 600 "$f" "$TEMP_KEYRINGS/"
+done
 
 cd "$REPO_ROOT" || exit 1
 dbus-run-session -- bash -c '
