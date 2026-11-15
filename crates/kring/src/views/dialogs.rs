@@ -17,7 +17,7 @@ use crate::views::collection::{display_name, display_names};
 use crate::views::consolidate::PassphraseNeeds;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_remember::{
-    asks_passphrase, cleared, fill_passphrases, passphrase_of, remember_row, remembered_row,
+    cleared, fill_passphrases, offers_remember, passphrase_of, remember_row, remembered_row,
     reopens_when_wrong, uses_remembered,
 };
 use crate::views::dialog_ssh::SshDialog;
@@ -665,7 +665,7 @@ impl Dialog {
                 if remembered_row(ui) {
                     self.remembered = None;
                 }
-            } else if asks_passphrase(&self.kind) {
+            } else if offers_remember(&self.kind) {
                 remember_row(ui, &mut self.remember);
             }
             if let Some(err) = &self.error {

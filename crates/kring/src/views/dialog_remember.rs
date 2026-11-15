@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 use crate::session_secret::{MSG_REMEMBER, MSG_REMEMBER_WARNING};
 use crate::ui::theme;
 use crate::ui::widgets::secondary_button;
+use crate::views::dialog_ssh::SshDialog;
 use crate::views::dialogs::{DialogKind, RestorePassphrase, WalletTarget};
 use crate::worker::Command;
 
@@ -212,6 +213,18 @@ pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
     }
 }
 
+/// Returns true when the dialog offers the "Remember for this session"
+/// checkbox: it asks a passphrase whose value is actually stored on submit.
+/// Changing an SSH key passphrase stores nothing (see [`passphrase_of`]),
+/// so no checkbox is shown there even though the remembered value can still
+/// fill the old passphrase.
+pub fn offers_remember(kind: &DialogKind) -> bool {
+    if matches!(kind, DialogKind::Ssh(SshDialog::ChangePassphrase { .. })) {
+        return false;
+    }
+    asks_passphrase(kind)
+}
+
 /// Renders the "Remember for this session" checkbox and its TERTIARY warning.
 pub fn remember_row(ui: &mut egui::Ui, remember: &mut bool) {
     ui.add_space(4.0);
@@ -382,6 +395,18 @@ mod tests {
             Some(PASS)
         );
         assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+    }
+
+    /// The SSH change-passphrase dialog stores nothing, so it offers no
+    /// "Remember" checkbox; other passphrase dialogs still do.
+    #[test]
+    fn change_ssh_passphrase_offers_no_remember() {
+        let key = crate::views::dialog_ssh::tests::key("id", Some(true));
+        let change = DialogKind::Ssh(SshDialog::change_passphrase(&key));
+        assert!(asks_passphrase(&change));
+        assert!(!offers_remember(&change));
+        let add = DialogKind::Ssh(SshDialog::agent_add(&key));
+        assert!(offers_remember(&add));
     }
 
     /// The value to remember comes from the passphrase fields of the command.
