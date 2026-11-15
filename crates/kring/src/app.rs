@@ -18,7 +18,7 @@ use crate::ui::theme;
 use crate::ui::toasts::{ToastKind, Toasts, kind_for_status, user_message};
 use crate::views::backups::{self, BackupView};
 use crate::views::consolidate::{self, ConsolidateView, PassphraseNeeds};
-use crate::views::dialogs::{Dialog, DialogKind, Outcome};
+use crate::views::dialogs::{Dialog, DialogKind, Outcome, WalletTarget};
 use crate::views::file_items::FileView;
 use crate::views::item_detail::AttrEditor;
 use crate::views::progress;
@@ -225,7 +225,7 @@ impl KringApp {
     fn _send(&mut self, cmd: Command) {
         let id = self.next_seq;
         self.state.track_file_command(&cmd);
-        self.state.track_wallet_command(&cmd);
+        self.state.track_wallet_command(&cmd, id);
         self.state.track_transfer_command(&cmd);
         self.state.track_operation(&cmd, id);
         self.consolidate_view.remember(&cmd);
@@ -514,6 +514,42 @@ impl KringApp {
         transfer::show(ctx, &self.state, &mut self.transfer_view, gates)
     }
 
+    /// Continues the import after the keyring of the open wallet was
+    /// created: sent right away into it when a passphrase is remembered for
+    /// the session, otherwise the import dialog reopens with it preselected.
+    fn _continue_wallet_import(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(name) = self.state.take_wallet_created() else {
+            return;
+        };
+        let Some(info) = self.state.wallets.iter().find(|w| w.name == name) else {
+            return;
+        };
+        let gates = Gates::from_provider(self.state.provider.as_ref());
+        let Some(kind) = wallet_detail::import_dialog(&self.state, info, gates) else {
+            return;
+        };
+        let direct = match &kind {
+            DialogKind::ImportWallet {
+                name,
+                password,
+                target: Some(WalletTarget::Keyring(target)),
+                ..
+            } if self.state.session.is_remembered() => Some(Command::PlanWalletImport {
+                name: name.clone(),
+                password: password.clone(),
+                target: target.clone(),
+            }),
+            _ => None,
+        };
+        match direct {
+            Some(cmd) => self._send(cmd),
+            None => self.dialog = Some(Dialog::new(kind)),
+        }
+    }
+
     /// Opens the password dialog when the selected binary file asked for one.
     fn _open_file_password_dialog(&mut self) {
         if self.dialog.is_some() {
@@ -522,7 +558,8 @@ impl KringApp {
         let Some((name, action)) = self.state.take_password_request() else {
             return;
         };
-        self.dialog = Some(Dialog::new(DialogKind::file_password(name, action)));
+        let kind = DialogKind::file_password(name, action);
+        self.dialog = Some(Dialog::with_remembered(kind, self.state.session.value()));
     }
 
     /// Shows the open dialog and handles its outcome.
@@ -675,6 +712,7 @@ impl eframe::App for KringApp {
         }
         self._open_passphrase_dialog();
         self._open_file_password_dialog();
+        self._continue_wallet_import();
         self._open_apply_passphrase_dialog();
         self.state.drop_stuck_operation(self.dialog.is_some());
         let gates = Gates::from_provider(self.state.provider.as_ref())

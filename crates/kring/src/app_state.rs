@@ -185,6 +185,10 @@ pub struct AppState {
     wallet_password: Option<SecretValue>,
     /// Open request `(wallet, password)` waiting for its entries.
     pending_wallet_open: Option<(String, SecretValue)>,
+    /// `CreateWalletCollection` in flight: `(wallet, command number)`.
+    wallet_create: Option<(String, u64)>,
+    /// Wallet whose keyring was just created: its import continues.
+    wallet_created: Option<String>,
     /// Backups, newest first.
     pub backups: Vec<BackupInfo>,
     /// Outcome of the last import.
@@ -256,7 +260,12 @@ impl AppState {
             op.observe(&event, self.running);
         }
         match event {
-            Event::CommandFinished(id) => self.running = id + 1,
+            Event::CommandFinished(id) => {
+                self.running = id + 1;
+                if self.wallet_create.as_ref().is_some_and(|(_, c)| *c == id) {
+                    self.wallet_create = None;
+                }
+            }
             Event::Provider(p) => {
                 self.provider = Some(p);
                 self.provider_unavailable = false;
@@ -412,7 +421,13 @@ impl AppState {
                     orphan_files,
                 });
             }
-            Event::Done(msg) => self.status = msg,
+            Event::Done(msg) => {
+                let created = self.wallet_create.take_if(|(_, c)| *c == self.running);
+                if let Some((name, _)) = created {
+                    self.wallet_created = Some(name);
+                }
+                self.status = msg;
+            }
             Event::Error(msg) => {
                 self.consolidation_progress = None;
                 self.transfer_applying = false;
@@ -499,16 +514,32 @@ impl AppState {
         self._sync_wallet_reveal();
     }
 
-    /// Remembers the password of a sent [`Command::OpenWallet`] for the
-    /// selected wallet; it is kept once the entries arrive.
-    pub fn track_wallet_command(&mut self, cmd: &Command) {
-        let Command::OpenWallet { name, password } = cmd else {
-            return;
-        };
-        if self.selected_wallet.as_ref() != Some(name) {
-            return;
+    /// Records a sent wallet command (command number `id`): the password
+    /// of an [`Command::OpenWallet`] for the selected wallet, kept once the
+    /// entries arrive; a [`Command::CreateWalletCollection`], whose `Done`
+    /// continues the import (see [`Self::take_wallet_created`]).
+    pub fn track_wallet_command(&mut self, cmd: &Command, id: u64) {
+        match cmd {
+            Command::OpenWallet { name, password } => {
+                if self.selected_wallet.as_ref() != Some(name) {
+                    return;
+                }
+                self.pending_wallet_open = Some((name.clone(), password.clone()));
+            }
+            Command::CreateWalletCollection { name, .. } => {
+                self.wallet_create = Some((name.clone(), id));
+                self.wallet_created = None;
+            }
+            _ => {}
         }
-        self.pending_wallet_open = Some((name.clone(), password.clone()));
+    }
+
+    /// Returns (once) the wallet whose keyring was just created, when it is
+    /// still the open wallet, so its import can continue.
+    pub fn take_wallet_created(&mut self) -> Option<String> {
+        let name = self.wallet_created.take()?;
+        let open = self.selected_wallet.as_ref() == Some(&name) && self.wallet_password.is_some();
+        open.then_some(name)
     }
 
     /// Returns the password of the open wallet (for its import).
@@ -1912,23 +1943,62 @@ mod tests {
         let mut s = AppState::default();
         s.apply(Event::Wallets(vec![wallet("a"), wallet("b")]));
         s.select_wallet("a".into());
-        s.track_wallet_command(&open("a", "pw"));
+        s.track_wallet_command(&open("a", "pw"), 0);
         assert_eq!(kept(&s), None, "not before the entries");
         s.apply(wallet_items("a", &["x"]));
         assert_eq!(kept(&s).as_deref(), Some("pw"));
         s.select_wallet("b".into());
         assert_eq!(kept(&s), None);
-        s.track_wallet_command(&open("b", "pb"));
+        s.track_wallet_command(&open("b", "pb"), 0);
         s.select_wallet("a".into());
         s.apply(wallet_items("b", &["x"]));
         s.apply(wallet_items("a", &["x"]));
         assert_eq!(kept(&s), None, "request of another selection");
-        s.track_wallet_command(&open("a", "zq-wallet-pw"));
+        s.track_wallet_command(&open("a", "zq-wallet-pw"), 0);
         s.apply(wallet_items("a", &["x"]));
         assert_eq!(kept(&s).as_deref(), Some("zq-wallet-pw"));
         assert!(!format!("{s:?}").contains("zq-wallet-pw"));
         s.close_wallet();
         assert_eq!(kept(&s), None);
+    }
+
+    /// The `Done` of a wallet keyring creation (and only that command's)
+    /// continues the import of the still open wallet, once.
+    #[test]
+    fn wallet_created_continues_import() {
+        let mut s = AppState::default();
+        s.apply(Event::Wallets(vec![wallet("a")]));
+        s.select_wallet("a".into());
+        s.track_wallet_command(
+            &Command::OpenWallet {
+                name: "a".into(),
+                password: SecretValue::from_text("pw"),
+            },
+            0,
+        );
+        s.apply(wallet_items("a", &["x"]));
+        s.apply(Event::CommandFinished(0));
+        let create = Command::CreateWalletCollection {
+            name: "a".into(),
+            password: SecretValue::from_text("n"),
+        };
+        s.track_wallet_command(&create, 1);
+        s.apply(Event::Error("Cannot rescan the wallets: x".into()));
+        s.apply(Event::Done("Keyring 'a' created".into()));
+        s.apply(Event::CommandFinished(1));
+        assert_eq!(s.take_wallet_created().as_deref(), Some("a"));
+        assert_eq!(s.take_wallet_created(), None, "once");
+
+        s.track_wallet_command(&create, 2);
+        s.apply(Event::Error("A keyring named 'a' already exists".into()));
+        s.apply(Event::CommandFinished(2));
+        s.apply(Event::Done("Item deleted".into()));
+        assert_eq!(s.take_wallet_created(), None, "failed creation");
+
+        s.track_wallet_command(&create, 3);
+        s.apply(Event::Done("Keyring 'a' created".into()));
+        s.close_wallet();
+        assert_eq!(s.take_wallet_created(), None, "wallet closed");
     }
 
     /// The offline side of a wallet import preview is revealable only while

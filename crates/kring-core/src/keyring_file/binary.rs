@@ -15,6 +15,9 @@ use super::textual::OfflineItem;
 use crate::error::{KringError, Result};
 use crate::model::{Attributes, SecretValue};
 
+/// Start of the error of a wrong binary keyring password (`<prefix><file name>`).
+pub const MSG_WRONG_PASSWORD_PREFIX: &str = "Wrong password for ";
+
 /// Reads and decrypts every item of a binary v0 keyring file.
 ///
 /// A file that does not start with the binary magic yields
@@ -84,7 +87,7 @@ fn _display_name(path: &Path) -> String {
 fn _map_error(name: &str, error: Oo7Error) -> KringError {
     match error {
         Oo7Error::ChecksumMismatch | Oo7Error::MacError | Oo7Error::IncorrectSecret => {
-            KringError::InvalidInput(format!("Wrong password for {name}"))
+            KringError::InvalidInput(format!("{MSG_WRONG_PASSWORD_PREFIX}{name}"))
         }
         other => KringError::InvalidInput(format!("Cannot read {name}: {other}")),
     }

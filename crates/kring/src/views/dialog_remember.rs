@@ -22,6 +22,8 @@ const MSG_TYPE_ANOTHER: &str = "Type another";
 pub fn asks_passphrase(kind: &DialogKind) -> bool {
     match kind {
         DialogKind::Unlock { .. }
+        | DialogKind::FilePassword { .. }
+        | DialogKind::WalletPassword { .. }
         | DialogKind::RetireFile { .. }
         | DialogKind::ExportCollection { .. }
         | DialogKind::ImportArchive { .. }
@@ -41,6 +43,23 @@ pub fn asks_passphrase(kind: &DialogKind) -> bool {
 /// after that failed).
 pub fn uses_remembered(kind: &DialogKind) -> bool {
     !matches!(kind, DialogKind::Unlock { .. }) && asks_passphrase(kind)
+}
+
+/// Returns true for the password dialogs that reopen (fields empty, "Wrong
+/// passphrase, try again") after a wrong password, even when typed: the
+/// binary keyring file and KWallet wallet passwords.
+pub fn reopens_when_wrong(kind: &DialogKind) -> bool {
+    matches!(
+        kind,
+        DialogKind::FilePassword { .. } | DialogKind::WalletPassword { .. }
+    )
+}
+
+/// Returns a copy of `kind` with every passphrase field emptied.
+pub fn cleared(kind: &DialogKind) -> DialogKind {
+    let mut kind = kind.clone();
+    fill_passphrases(&mut kind, &SecretValue::from_text(""));
+    kind
 }
 
 /// Replaces `buffer` with `text`.
@@ -95,7 +114,15 @@ pub fn fill_passphrases(kind: &mut DialogKind, secret: &SecretValue) {
             _set(passphrase, text);
             _set(confirm, text);
         }
-        DialogKind::ImportArchive { passphrase, .. } => _set(passphrase, text),
+        DialogKind::ImportArchive { passphrase, .. }
+        | DialogKind::FilePassword {
+            password: passphrase,
+            ..
+        }
+        | DialogKind::WalletPassword {
+            password: passphrase,
+            ..
+        } => _set(passphrase, text),
         DialogKind::ConsolidatePassphrases {
             backup,
             backup_confirm,
@@ -115,8 +142,11 @@ pub fn fill_passphrases(kind: &mut DialogKind, secret: &SecretValue) {
 /// from a passphrase dialog, the value to remember.
 pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
     match cmd {
-        Command::Unlock { password, .. } | Command::CreateWalletCollection { password, .. } => {
-            Some(password)
+        Command::Unlock { password, .. }
+        | Command::CreateWalletCollection { password, .. }
+        | Command::OpenWallet { password, .. } => Some(password),
+        Command::OpenFile { password, .. } | Command::ImportFile { password, .. } => {
+            password.as_ref()
         }
         Command::RetireFile {
             backup_passphrase, ..
@@ -257,7 +287,28 @@ mod tests {
             target: CollectionId("/c/a".into()),
         };
         assert!(passphrase_of(&import).is_none());
-        assert!(!asks_passphrase(&DialogKind::wallet_password("w".into())));
+    }
+
+    /// The wallet and keyring file password dialogs take the remembered
+    /// value, offer remembering what was typed and reopen when wrong.
+    #[test]
+    fn password_dialogs_remember() {
+        use crate::app_state::FileAction;
+        let kinds = [
+            DialogKind::wallet_password("w".into()),
+            DialogKind::file_password("f".into(), FileAction::Open),
+        ];
+        for mut kind in kinds {
+            assert!(uses_remembered(&kind) && reopens_when_wrong(&kind));
+            fill_passphrases(&mut kind, &SecretValue::from_text(PASS));
+            let cmd = command_for(&kind).unwrap();
+            assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+            assert!(command_for(&cleared(&kind)).is_err(), "fields emptied");
+        }
+        assert!(!reopens_when_wrong(&DialogKind::retire_file(
+            "p".into(),
+            vec![]
+        )));
     }
 
     /// A filled new-backup dialog submits without a typed confirmation.

@@ -44,8 +44,8 @@ const MSG_CONSOLIDATE_ORPHANS: &str = "The empty plaintext files are retired wit
 /// Warning of a delete without backup.
 const MSG_DELETE_NO_BACKUP: &str = "Permanent deletion: no backup will be made";
 /// Note of the wallet import dialog when the keyring is created first.
-const MSG_CREATE_THEN_IMPORT: &str = "The keyring is created and unlocked; then choose \
-     Import into... again to copy the entries into it.";
+const MSG_CREATE_THEN_IMPORT: &str = "The keyring is created and unlocked, then the import \
+     continues into it.";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -364,9 +364,9 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
             _title(ui, &format!("{verb} \"{name}.keyring\""));
             _muted(
                 ui,
-                "This keyring file is encrypted. The password is used once and not kept.",
+                "This keyring file is encrypted. Its password is not kept unless you remember it below.",
             );
-            _password_field(ui, false, "Keyring password", FIELD_PASSWORD, password);
+            _password_field(ui, hide, "Keyring password", FIELD_PASSWORD, password);
             _primary(verb)
         }
         DialogKind::ImportFile {
@@ -388,7 +388,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
                 "kring decrypts the wallet file itself, KWallet is not used. The password \
                  stays in memory until the wallet is closed.",
             );
-            _password_field(ui, false, "Wallet password", FIELD_PASSWORD, password);
+            _password_field(ui, hide, "Wallet password", FIELD_PASSWORD, password);
             _primary("Open")
         }
         DialogKind::ImportWallet { .. } => _import_wallet(ui, kind, hide),

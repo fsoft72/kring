@@ -17,7 +17,8 @@ use crate::views::collection::{display_name, display_names};
 use crate::views::consolidate::PassphraseNeeds;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_remember::{
-    asks_passphrase, fill_passphrases, passphrase_of, remember_row, remembered_row, uses_remembered,
+    asks_passphrase, cleared, fill_passphrases, passphrase_of, remember_row, remembered_row,
+    reopens_when_wrong, uses_remembered,
 };
 use crate::views::dialog_submit::command_for;
 use crate::views::file_detail::default_import_target;
@@ -345,28 +346,28 @@ impl DialogKind {
 
     /// Import dialog of wallet `name` opened with `password`: every keyring
     /// is listed (locked ones disabled). The keyring labelled like the
-    /// wallet (`suggested`) is preselected; without one, creating it is
-    /// offered and preselected unless `create_blocked`, else the default
-    /// import target is.
+    /// wallet (`keyring`) is preselected when unlocked, else the default
+    /// import target (first unlocked) is. Without such a keyring, creating
+    /// it is offered and preselected unless `create_blocked`.
     pub fn import_wallet(
         name: String,
         password: SecretValue,
         collections: &[CollectionInfo],
-        suggested: Option<&CollectionId>,
+        keyring: Option<&CollectionInfo>,
         create_blocked: Option<&'static str>,
     ) -> Self {
-        let suggested = suggested.filter(|id| collections.iter().any(|c| &c.id == *id));
-        let target = match (suggested, create_blocked) {
-            (Some(id), _) => Some(WalletTarget::Keyring(id.clone())),
+        let fallback = || default_import_target(collections).map(WalletTarget::Keyring);
+        let target = match (keyring, create_blocked) {
+            (Some(c), _) if !c.locked => Some(WalletTarget::Keyring(c.id.clone())),
+            (Some(_), _) | (None, Some(_)) => fallback(),
             (None, None) => Some(WalletTarget::Create),
-            (None, Some(_)) => default_import_target(collections).map(WalletTarget::Keyring),
         };
         Self::ImportWallet {
             name,
             password,
             targets: transfer_targets(collections, None),
             target,
-            offer_create: suggested.is_none(),
+            offer_create: keyring.is_none(),
             create_blocked,
             new_password: new_buffer(),
             confirm: new_buffer(),
@@ -583,9 +584,12 @@ impl Dialog {
     }
 
     /// Returns the dialog to reopen (passphrase fields empty) if the last
-    /// submit used the remembered passphrase and it proves wrong.
+    /// submit proves to carry a wrong passphrase: when it used the
+    /// remembered one, and always for the file and wallet password dialogs
+    /// (see [`reopens_when_wrong`]).
     pub fn retry_kind(&self) -> Option<DialogKind> {
-        self.used_remembered.then(|| self.kind.clone())
+        let watch = self.used_remembered || reopens_when_wrong(&self.kind);
+        watch.then(|| cleared(&self.kind))
     }
 
     /// Opens a dialog that uses `remembered` instead of its passphrase

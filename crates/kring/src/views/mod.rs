@@ -112,11 +112,11 @@ pub fn backups_commands() -> Vec<Command> {
 ///
 /// Leaving the Offline files area closes the selected file, dropping its
 /// secrets; leaving the KWallet area closes the selected wallet, dropping
-/// its entries and password; leaving the Backups area forgets the last restore; leaving the
-/// Consolidate area drops the secrets revealed in its preview. Any switch
-/// drops the report of the last import. Entering Files or Consolidate
-/// rescans the keyrings directory (orphan files); entering Backups lists
-/// the backups too; entering KWallet scans the wallets.
+/// its entries and password; leaving the Backups area forgets the last
+/// restore; leaving the Consolidate area drops the secrets revealed in its
+/// preview. Any switch drops the report of the last import. Entering Files
+/// or Consolidate rescans the keyrings directory (orphan files); entering
+/// Backups lists the backups too; entering KWallet scans the wallets.
 pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     if from == to {
         return Vec::new();
@@ -270,10 +270,13 @@ mod tests {
         use kring_core::model::SecretValue;
         let mut s = AppState::default();
         s.select_wallet("w".into());
-        s.track_wallet_command(&Command::OpenWallet {
-            name: "w".into(),
-            password: SecretValue::from_text("pw"),
-        });
+        s.track_wallet_command(
+            &Command::OpenWallet {
+                name: "w".into(),
+                password: SecretValue::from_text("pw"),
+            },
+            0,
+        );
         let item = OfflineItemView {
             label: "x".into(),
             attributes: Default::default(),
@@ -293,7 +296,8 @@ mod tests {
         assert!(matches!(&cmds[..], [Command::ScanWallets]));
         assert!(switch_area(&mut s, Area::KWallet, Area::KWallet).is_empty());
         assert_eq!(s.wallet_items.len(), 1);
-        assert!(switch_area(&mut s, Area::KWallet, Area::Files).len() == 1);
+        let cmds = switch_area(&mut s, Area::KWallet, Area::Files);
+        assert!(matches!(&cmds[..], [Command::ScanFiles]));
         assert!(s.selected_wallet.is_none() && s.wallet_items.is_empty());
         assert!(s.wallet_password().is_none());
     }

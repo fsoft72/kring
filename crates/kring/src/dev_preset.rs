@@ -1093,7 +1093,7 @@ mod tests {
             panic!("expected OpenWallet");
         };
         assert_eq!(password.as_text(), Some(DEV_WALLET_PASSWORD));
-        s.track_wallet_command(cmd);
+        s.track_wallet_command(cmd, 0);
         assert!(p.take_wallet_actions(&s, gates).is_empty(), "sent once");
         let entry = |folder: &str, label: &str| OfflineItemView {
             label: label.into(),

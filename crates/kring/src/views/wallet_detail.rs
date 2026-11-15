@@ -1,7 +1,7 @@
 //! The selected KWallet wallet: header, notes, Open / Import and its entries.
 
 use eframe::egui::{self, RichText};
-use kring_core::model::{CollectionId, CollectionInfo};
+use kring_core::model::CollectionInfo;
 use kring_core::provider::ProviderInfo;
 
 use crate::app_state::AppState;
@@ -67,50 +67,59 @@ pub fn wallet_subline(info: &WalletInfo) -> String {
     text
 }
 
-/// Returns the suggested target of `info` when it is still listed.
-fn _suggested<'a>(
+/// Returns the keyring labelled like wallet `info`: its suggested target
+/// when still listed, else any current collection with that label (so a
+/// keyring created since the last scan is never offered again).
+pub fn wallet_keyring<'a>(
     info: &WalletInfo,
     collections: &'a [CollectionInfo],
 ) -> Option<&'a CollectionInfo> {
-    let id = info.suggested_target.as_ref()?;
-    collections.iter().find(|c| &c.id == id)
+    let suggested = info.suggested_target.as_ref();
+    collections
+        .iter()
+        .find(|c| Some(&c.id) == suggested)
+        .or_else(|| collections.iter().find(|c| c.label == info.name))
 }
 
 /// Returns why Import is disabled for `info`, or `None` when allowed:
 /// a provider, a readable and open wallet with entries, and a keyring to
-/// receive them (the one labelled like the wallet, a new one when it can be
-/// created, or any unlocked one).
-pub fn import_blocked(state: &AppState, info: &WalletInfo, gates: Gates) -> Option<&'static str> {
+/// receive them (the one labelled like the wallet when unlocked, a new one
+/// when it can be created, or any unlocked one). When the wallet keyring is
+/// locked and nothing else is unlocked the reason is `Unlock '<name>' first`.
+pub fn import_blocked(state: &AppState, info: &WalletInfo, gates: Gates) -> Option<String> {
+    let fixed = |m: &str| Some(m.to_string());
     if state.provider.is_none() {
-        return Some(MSG_NO_PROVIDER);
+        return fixed(MSG_NO_PROVIDER);
     }
     if !is_readable(info) {
-        return Some(MSG_UNREADABLE);
+        return fixed(MSG_UNREADABLE);
     }
     if !state.wallet_opened || state.wallet_password().is_none() {
-        return Some(MSG_OPEN_FIRST);
+        return fixed(MSG_OPEN_FIRST);
     }
     if state.wallet_items.is_empty() {
-        return Some(MSG_NO_ENTRIES);
+        return fixed(MSG_NO_ENTRIES);
     }
-    let suggested = _suggested(info, &state.collections).is_some();
-    let can_create = !suggested && gates.master.is_none();
     let unlocked = default_import_target(&state.collections).is_some();
-    if !suggested && !can_create && !unlocked {
-        return Some(MSG_NO_TARGET);
+    match wallet_keyring(info, &state.collections) {
+        Some(c) if c.locked && !unlocked => Some(format!(
+            "Unlock '{}' first",
+            shown_name(&state.collections, c)
+        )),
+        Some(_) => None,
+        None if gates.master.is_none() || unlocked => None,
+        None => fixed(MSG_NO_TARGET),
     }
-    None
 }
 
 /// Returns the import dialog of the open wallet `info` (needs its password).
 pub fn import_dialog(state: &AppState, info: &WalletInfo, gates: Gates) -> Option<DialogKind> {
     let password = state.wallet_password()?.clone();
-    let suggested: Option<&CollectionId> = info.suggested_target.as_ref();
     Some(DialogKind::import_wallet(
         info.name.clone(),
         password,
         &state.collections,
-        suggested,
+        wallet_keyring(info, &state.collections),
         gates.master,
     ))
 }
@@ -119,7 +128,7 @@ pub fn import_dialog(state: &AppState, info: &WalletInfo, gates: Gates) -> Optio
 /// it when locked), or the info line when no keyring is labelled like the
 /// wallet (`true` = warning tint).
 pub fn target_note(info: &WalletInfo, collections: &[CollectionInfo]) -> (String, bool) {
-    let Some(c) = _suggested(info, collections) else {
+    let Some(c) = wallet_keyring(info, collections) else {
         return (wallet_keyring_info(&info.name), true);
     };
     let mut text = format!(
@@ -147,7 +156,7 @@ fn _header(ui: &mut egui::Ui, state: &AppState, info: &WalletInfo, gates: Gates)
         chips(ui, info);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let blocked = import_blocked(state, info, gates);
-            if primary_button(ui, "Import into...", blocked) {
+            if primary_button(ui, "Import into...", blocked.as_deref()) {
                 action = import_dialog(state, info, gates).map(Action::Open);
             }
         });
@@ -275,7 +284,7 @@ mod tests {
     use crate::views::dialogs::WalletTarget;
     use crate::worker::{Command, Event, OfflineItemView, WalletEntryKind};
     use kring_core::kwallet_file::WalletHeader;
-    use kring_core::model::{LOGIN_COLLECTION_PATH, SecretValue};
+    use kring_core::model::{CollectionId, LOGIN_COLLECTION_PATH, SecretValue};
     use kring_core::provider::ProviderKind;
 
     /// Builds a supported wallet named `name`, suggesting `target`.
@@ -332,10 +341,13 @@ mod tests {
         let Some(pw) = pw else {
             return s;
         };
-        s.track_wallet_command(&Command::OpenWallet {
-            name: name.clone(),
-            password: SecretValue::from_text(pw),
-        });
+        s.track_wallet_command(
+            &Command::OpenWallet {
+                name: name.clone(),
+                password: SecretValue::from_text(pw),
+            },
+            0,
+        );
         let item = OfflineItemView {
             label: "x".into(),
             attributes: Default::default(),
@@ -384,7 +396,7 @@ mod tests {
         let info = closed.wallets[0].clone();
         assert_eq!(
             import_blocked(&closed, &info, gates(true)),
-            Some(MSG_OPEN_FIRST)
+            Some(MSG_OPEN_FIRST.to_string())
         );
         assert!(import_dialog(&closed, &info, gates(true)).is_none());
         let open = state(wallet("w", None), vec![login.clone()], Some("pw"));
@@ -393,7 +405,7 @@ mod tests {
         legacy.header = legacy.header.map(|h| WalletHeader { cipher: 0, ..h });
         assert_eq!(
             import_blocked(&open, &legacy, gates(true)),
-            Some(MSG_UNREADABLE)
+            Some(MSG_UNREADABLE.to_string())
         );
         let locked = state(
             wallet("w", None),
@@ -403,13 +415,13 @@ mod tests {
         assert_eq!(import_blocked(&locked, &info, gates(true)), None, "create");
         assert_eq!(
             import_blocked(&locked, &info, gates(false)),
-            Some(MSG_NO_TARGET)
+            Some(MSG_NO_TARGET.to_string())
         );
         let mut none = AppState::default();
         none.apply(Event::Wallets(vec![info.clone()]));
         assert_eq!(
             import_blocked(&none, &info, gates(true)),
-            Some(MSG_NO_PROVIDER)
+            Some(MSG_NO_PROVIDER.to_string())
         );
     }
 
@@ -466,6 +478,54 @@ mod tests {
         };
         assert_eq!(target, Some(WalletTarget::Keyring(login.id.clone())));
         assert!(create_blocked.is_some());
+
+        // A keyring labelled like the wallet but created after the scan
+        // (no suggestion yet) is used: Create is not offered again.
+        let kde = col("/c/kdewallet", "kdewallet", false);
+        let s = state(
+            wallet("kdewallet", None),
+            vec![login.clone(), kde],
+            Some("pw"),
+        );
+        let Some(DialogKind::ImportWallet {
+            target,
+            offer_create,
+            ..
+        }) = import_dialog(&s, &s.wallets[0], gates(true))
+        else {
+            panic!("expected the wallet import dialog");
+        };
+        assert!(!offer_create);
+        assert_eq!(
+            target,
+            Some(WalletTarget::Keyring(CollectionId("/c/kdewallet".into())))
+        );
+    }
+
+    /// A locked wallet keyring is not preselected: the first unlocked
+    /// keyring is; without any, Import asks to unlock it.
+    #[test]
+    fn locked_wallet_keyring() {
+        let login = col(LOGIN_COLLECTION_PATH, "Login", false);
+        let kde = col("/c/kdewallet", "kdewallet", true);
+        let info = wallet("kdewallet", Some("/c/kdewallet"));
+        let s = state(info.clone(), vec![login.clone(), kde.clone()], Some("pw"));
+        assert_eq!(import_blocked(&s, &info, gates(true)), None);
+        let Some(DialogKind::ImportWallet {
+            target,
+            offer_create,
+            ..
+        }) = import_dialog(&s, &info, gates(true))
+        else {
+            panic!("expected the wallet import dialog");
+        };
+        assert!(!offer_create);
+        assert_eq!(target, Some(WalletTarget::Keyring(login.id.clone())));
+        let s = state(info.clone(), vec![kde], Some("pw"));
+        assert_eq!(
+            import_blocked(&s, &info, gates(true)).as_deref(),
+            Some("Unlock 'kdewallet' first")
+        );
     }
 
     /// The target note names the suggested keyring, or warns with the info line.

@@ -14,7 +14,7 @@ libraries.
 - **Copy, move and consolidate**: move items between keyrings with a conflict preview, or merge all orphan keyrings into `login` in one step (see below).
 - **Encrypted export**: export a keyring to an age passphrase-encrypted `.kring.age` file and import it back.
 - **Progress of destructive actions**: deleting an item, keyring or file, retiring a file, restoring a backup and applying a move (or a "use incoming" choice) open a "Working..." window listing the backup step and the operation, then the result (or the error). It closes only once the operation finished, and every other destructive action stays disabled meanwhile, so the same keyring cannot be deleted twice.
-- **Remember a passphrase for the session**: passphrase dialogs (unlock, backup, restore, retire, export/import archive, consolidation) offer "Remember for this session". The remembered value then answers passphrase requests by itself (once per request; the dialog opens if it is wrong), is tried first when you click Unlock, and fills new-backup passphrases without the confirmation field. A key tile in the rail shows that one is remembered; click it to forget it.
+- **Remember a passphrase for the session**: passphrase dialogs (unlock, backup, restore, retire, export/import archive, consolidation, the password of a binary keyring file or of a KWallet wallet, the new KWallet keyring) offer "Remember for this session". The remembered value then answers passphrase requests by itself (once per request; the dialog opens if it is wrong), is tried first when you click Unlock, fills the keyring file and wallet password dialogs, and fills new-backup passphrases without the confirmation field. A wrong keyring file or wallet password, typed or remembered, reopens its dialog with "Wrong passphrase, try again". A key tile in the rail shows that one is remembered; click it to forget it.
 
 ## Copy / Move and Consolidate
 
@@ -70,9 +70,12 @@ secret) are shown for review before anything is written.
 
 **Which keyring**: the `kwalletd6` shim looks for a keyring labelled like the
 wallet, so for `kdewallet` import into a keyring named `kdewallet`. If one
-exists it is preselected; otherwise the dialog offers "Create keyring
-'kdewallet'" (with its password, which can be remembered for the session), then
-choose Import into... again to fill it. Importing into `login` keeps every secret,
+exists and is unlocked it is preselected (a locked one must be unlocked first,
+or another keyring chosen); otherwise the dialog offers "Create keyring
+'kdewallet'" (with its password, which can be remembered for the session), and
+once it is created the import continues into it: directly when a passphrase is
+remembered for the session, else the dialog reopens with the new keyring
+selected. Importing into `login` keeps every secret,
 but apps using the KWallet API will not find them there.
 
 **After migrating, disable KWallet's Secret Service integration**, otherwise

@@ -35,6 +35,22 @@ pub const MSG_WRONG_TRY_AGAIN: &str = "Wrong passphrase, try again";
 /// "Wrong passphrase for backup", archive: "Wrong passphrase or corrupted archive").
 const WRONG_PASSPHRASE: &str = "Wrong passphrase";
 
+/// Returns true when a worker error says the passphrase or password was
+/// wrong: backups and archives, KWallet wallets
+/// ([`kring_core::kwallet_file::MSG_WRONG_PASSWORD`]) and binary keyring
+/// files ([`kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX`]).
+pub fn is_wrong_passphrase(msg: &str) -> bool {
+    use kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX;
+    use kring_core::kwallet_file::MSG_WRONG_PASSWORD;
+    [
+        WRONG_PASSPHRASE,
+        MSG_WRONG_PASSWORD,
+        MSG_WRONG_PASSWORD_PREFIX,
+    ]
+    .iter()
+    .any(|part| msg.contains(part))
+}
+
 /// What the remembered passphrase was used for.
 #[derive(Clone)]
 enum AutoKind {
@@ -208,9 +224,10 @@ impl SessionSecret {
         })
     }
 
-    /// Records that a dialog opened by the user was submitted with the
-    /// remembered passphrase as command number `id`; `kind` (fields empty)
-    /// reopens if the passphrase is wrong.
+    /// Records that a dialog was submitted as command number `id`, either
+    /// with the remembered passphrase or as a password dialog typed by the
+    /// user (see `Dialog::retry_kind`); `kind` (fields empty) reopens if the
+    /// passphrase is wrong.
     pub fn used_in_dialog(&mut self, kind: DialogKind, id: u64) {
         self._record(id, AutoKind::Dialog(Box::new(kind)));
     }
@@ -237,7 +254,7 @@ impl SessionSecret {
             | Event::ImportDone(_) => window.done = true,
             Event::Error(msg) => {
                 window.error = true;
-                window.wrong |= msg.contains(WRONG_PASSPHRASE);
+                window.wrong |= is_wrong_passphrase(msg);
             }
             Event::PassphraseNeeded(_) | Event::ApplyPassphrasesNeeded { .. } => {
                 window.asked = true;
@@ -316,6 +333,40 @@ mod tests {
             }
         }
         last
+    }
+
+    /// Wrong backup, archive, wallet and binary keyring passwords all count
+    /// as a wrong passphrase (shared constants); other errors do not.
+    #[test]
+    fn wrong_passphrase_messages() {
+        use kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX;
+        use kring_core::kwallet_file::MSG_WRONG_PASSWORD;
+        assert!(is_wrong_passphrase("Wrong passphrase for backup"));
+        assert!(is_wrong_passphrase(MSG_WRONG_PASSWORD));
+        let file = format!("invalid input: {MSG_WRONG_PASSWORD_PREFIX}a.keyring");
+        assert!(is_wrong_passphrase(&file));
+        assert!(!is_wrong_passphrase("No wallet named 'x'"));
+        assert!(!is_wrong_passphrase("Cannot read a.keyring: io"));
+    }
+
+    /// A wallet password dialog (typed or remembered) reopens after a wrong
+    /// wallet password, and not after a success.
+    #[test]
+    fn wallet_dialog_reopens_when_wrong() {
+        let mut s = SessionSecret::default();
+        s.used_in_dialog(DialogKind::wallet_password("w".into()), 5);
+        let wrong = Event::Error(kring_core::kwallet_file::MSG_WRONG_PASSWORD.into());
+        let follow = feed(&mut s, 5, &[wrong, Event::CommandFinished(5)]);
+        assert!(matches!(
+            follow,
+            Some(FollowUp::Dialog(k)) if matches!(*k, DialogKind::WalletPassword { .. })
+        ));
+        s.used_in_dialog(DialogKind::wallet_password("w".into()), 6);
+        let items = Event::WalletItems {
+            name: "w".into(),
+            items: vec![],
+        };
+        assert!(feed(&mut s, 6, &[items, Event::CommandFinished(6)]).is_none());
     }
 
     /// Debug shows neither the value nor its length.
