@@ -13,3 +13,4 @@
 - Added Secret Service backend (`SecretServiceBackend`, standard API via oo7, encrypted session) with D-Bus error mapping; integration tests guarded by `it_guard` (session script now exports `KRING_IT_RUNTIME`).
 - Added provider detection (`ProviderKind`, `detect`, `classify`) and PAM detection (`pam_status`), with an `it_provider` integration test.
 - Added gnome-keyring master password support (`MasterPasswordStore` for `SecretServiceBackend`: create, unlock and change password via the private interface over a dedicated encrypted session, no prompts) with the `it_master_password` integration test.
+- Added backups (`BackupManager`, age-encrypted plaintext keyrings, manifest with sha256, pruning) and `paths` helpers.

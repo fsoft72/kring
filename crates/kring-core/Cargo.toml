@@ -9,9 +9,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 async-trait = "0.1"
 thiserror = "2"
 zeroize = "1.9"
+age = { version = "0.12", default-features = false }
+sha2 = "0.11.1"
+hex = "0.4.3"
+serde_json = "1.0.154"
+time = { version = "0.3", default-features = false, features = ["formatting", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
 
 [features]
 fake = []
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
