@@ -38,7 +38,7 @@ const ATTRIBUTES_SUFFIX: &str = "_attributes.json";
 /// Bytes read to recognise a wallet header (magic + 4 version bytes).
 const HEADER_READ_LEN: u64 = 16;
 /// Parts of competitor bus names that belong to KWallet.
-const KWALLET_COMPETITOR_PARTS: [&str; 2] = ["kwalletd", "secretservicecompat"];
+const KWALLET_COMPETITOR_PARTS: [&str; 3] = ["kwalletd", "ksecretd", "secretservicecompat"];
 /// Schema the mapping gives native entries.
 const NATIVE_SCHEMA: &str = "org.kde.KWallet.Entry";
 /// Attribute with the wallet folder of a native entry.
@@ -131,15 +131,15 @@ pub(crate) async fn handle<S, N>(
     S: SecretStore + MasterPasswordStore,
     N: Fn(),
 {
-    match cmd {
+    match &cmd {
         Command::ScanWallets => {
             if let Err(e) = emit_wallets(out, store, config).await {
                 out.error(message(&e));
             }
         }
-        Command::OpenWallet { name, password } => match read_wallet(config, &name, &password) {
+        Command::OpenWallet { name, password } => match read_wallet(config, name, password) {
             Ok(wallet) => out.emit(Event::WalletItems {
-                name,
+                name: name.clone(),
                 items: wallet.views,
             }),
             Err(e) => out.error(message(&e)),
@@ -153,7 +153,7 @@ pub(crate) async fn handle<S, N>(
             let Some(store) = store else {
                 return out.error(MSG_NO_PROVIDER);
             };
-            let wallet = match read_wallet(config, &name, &password) {
+            let wallet = match read_wallet(config, name, password) {
                 Ok(wallet) => wallet,
                 Err(e) => return out.error(message(&e)),
             };
@@ -163,21 +163,18 @@ pub(crate) async fn handle<S, N>(
                 provider,
                 config,
                 plans,
-                &target,
+                target,
                 wallet.incoming,
             )
             .await;
         }
-        Command::CreateWalletCollection { .. } => {
-            if !gate(out, provider, &cmd) {
-                return;
-            }
+        Command::CreateWalletCollection { name, password } => {
             let Some(store) = store else {
                 return out.error(MSG_NO_PROVIDER);
             };
-            let Command::CreateWalletCollection { name, password } = &cmd else {
+            if !gate(out, provider, &cmd) {
                 return;
-            };
+            }
             if let Err(e) = create_collection(out, store, config, name, password).await {
                 out.error(message(&e));
             }
@@ -200,17 +197,24 @@ fn invalid(message: impl Into<String>) -> KringError {
     KringError::InvalidInput(message.into())
 }
 
+/// Returns the competitor bus names of `provider` that belong to KWallet
+/// (its kwalletd shims, ksecretd and the Secret Service compat layer).
+pub fn kwallet_competitors(provider: &ProviderInfo) -> Vec<&str> {
+    provider
+        .competitors
+        .iter()
+        .filter(|c| KWALLET_COMPETITOR_PARTS.iter().any(|part| c.contains(part)))
+        .map(String::as_str)
+        .collect()
+}
+
 /// Emits [`Event::Notice`] with [`MSG_KWALLET_COMPETITOR`] when a KWallet
 /// daemon is among the provider's competitors.
 pub(crate) fn competitor_notice<N: Fn()>(out: &Emitter<N>, provider: Option<&ProviderInfo>) {
     let Some(provider) = provider else {
         return;
     };
-    let kwallet = provider
-        .competitors
-        .iter()
-        .any(|c| KWALLET_COMPETITOR_PARTS.iter().any(|part| c.contains(part)));
-    if !kwallet {
+    if kwallet_competitors(provider).is_empty() {
         return;
     }
     out.emit(Event::Notice(MSG_KWALLET_COMPETITOR.to_string()));
@@ -285,7 +289,7 @@ pub(crate) fn scan_wallets(dir: &Path) -> Result<Vec<WalletInfo>> {
         out.push(WalletInfo {
             name: name.to_string(),
             header: _read_file_header(&path),
-            has_attributes: dir.join(format!("{name}{ATTRIBUTES_SUFFIX}")).is_file(),
+            has_attributes: _is_regular(&dir.join(format!("{name}{ATTRIBUTES_SUFFIX}"))),
             path,
             size: meta.len(),
             modified,
@@ -322,16 +326,28 @@ pub(crate) fn resolve_wallet(config: &WorkerConfig, name: &str) -> Result<Wallet
         .ok_or_else(|| invalid(format!("No wallet named '{name}'")))
 }
 
-/// Reads a file next to a wallet; a missing file is empty when `optional`.
+/// Returns true when `path` is a regular file (symlinks are not followed).
+fn _is_regular(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Reads a regular file next to a wallet (a symlink or other non-regular
+/// file is refused); a missing file is empty when `optional`.
 fn _read_beside(path: &Path, optional: bool) -> Result<Vec<u8>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(bytes),
-        Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(KringError::Io {
-            path: path.to_path_buf(),
-            message: e.to_string(),
-        }),
+    let io = |e: std::io::Error| KringError::Io {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    };
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io(e)),
+    };
+    if !meta.file_type().is_file() {
+        let file = path.file_name().unwrap_or_default().to_string_lossy();
+        return Err(invalid(format!("{file} is not a regular file")));
     }
+    std::fs::read(path).map_err(io)
 }
 
 /// Resolves and decrypts wallet `name` and maps its entries.
@@ -413,10 +429,23 @@ where
         )));
     }
     store.create_with_password(&info.name, password).await?;
-    refresh(out, store).await;
-    emit_wallets(out, Some(store), config).await?;
-    out.emit(Event::Done(format!("Keyring '{}' created", info.name)));
+    finish_create(out, store, config, &info.name).await;
     Ok(())
+}
+
+/// Reports the keyring created for wallet `name`: re-lists collections and
+/// wallets (a failed rescan is its own error) and always ends with `Done`.
+pub(crate) async fn finish_create<S: SecretStore, N: Fn()>(
+    out: &Emitter<N>,
+    store: &S,
+    config: &WorkerConfig,
+    name: &str,
+) {
+    refresh(out, store).await;
+    if let Err(e) = emit_wallets(out, Some(store), config).await {
+        out.error(format!("Cannot rescan the wallets: {}", message(&e)));
+    }
+    out.emit(Event::Done(format!("Keyring '{name}' created")));
 }
 
 #[cfg(test)]

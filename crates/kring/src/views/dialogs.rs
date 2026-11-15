@@ -69,6 +69,15 @@ pub struct ImportTarget {
     pub locked: bool,
 }
 
+/// Where the entries of a wallet are imported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WalletTarget {
+    /// An existing keyring.
+    Keyring(CollectionId),
+    /// A new keyring labelled like the wallet (created first).
+    Create,
+}
+
 /// The content of a dialog. Password buffers are zeroized when it is dropped.
 #[derive(Clone)]
 pub enum DialogKind {
@@ -220,6 +229,28 @@ pub enum DialogKind {
         kept_backup: Option<SecretValue>,
         kept_orphan_files: Option<SecretValue>,
     },
+    /// Password of a KWallet wallet, to open it.
+    WalletPassword {
+        name: String,
+        password: Zeroizing<String>,
+    },
+    /// Choose the keyring receiving the entries of an open wallet, or
+    /// create the keyring labelled like the wallet (with its password).
+    ImportWallet {
+        name: String,
+        /// Password of the open wallet (re-read by the worker for the import).
+        password: SecretValue,
+        /// Every keyring; locked ones cannot be chosen.
+        targets: Vec<ImportTarget>,
+        target: Option<WalletTarget>,
+        /// No keyring is labelled like the wallet: creating one is offered.
+        offer_create: bool,
+        /// Why the keyring cannot be created (provider gate), if so.
+        create_blocked: Option<&'static str>,
+        /// Password of the keyring to create.
+        new_password: Zeroizing<String>,
+        confirm: Zeroizing<String>,
+    },
     /// Choose a passphrase for a backup containing plaintext keyrings.
     Passphrase {
         command: Box<Command>,
@@ -301,6 +332,44 @@ impl DialogKind {
             name,
             targets,
             target: default_import_target(collections),
+        }
+    }
+
+    /// Password dialog of wallet `name`.
+    pub fn wallet_password(name: String) -> Self {
+        Self::WalletPassword {
+            name,
+            password: new_buffer(),
+        }
+    }
+
+    /// Import dialog of wallet `name` opened with `password`: every keyring
+    /// is listed (locked ones disabled). The keyring labelled like the
+    /// wallet (`suggested`) is preselected; without one, creating it is
+    /// offered and preselected unless `create_blocked`, else the default
+    /// import target is.
+    pub fn import_wallet(
+        name: String,
+        password: SecretValue,
+        collections: &[CollectionInfo],
+        suggested: Option<&CollectionId>,
+        create_blocked: Option<&'static str>,
+    ) -> Self {
+        let suggested = suggested.filter(|id| collections.iter().any(|c| &c.id == *id));
+        let target = match (suggested, create_blocked) {
+            (Some(id), _) => Some(WalletTarget::Keyring(id.clone())),
+            (None, None) => Some(WalletTarget::Create),
+            (None, Some(_)) => default_import_target(collections).map(WalletTarget::Keyring),
+        };
+        Self::ImportWallet {
+            name,
+            password,
+            targets: transfer_targets(collections, None),
+            target,
+            offer_create: suggested.is_none(),
+            create_blocked,
+            new_password: new_buffer(),
+            confirm: new_buffer(),
         }
     }
 
@@ -828,6 +897,100 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// The wallet password dialog opens the wallet; the import dialog
+    /// imports into an unlocked keyring with the kept wallet password, or
+    /// creates the wallet keyring with a confirmed new password.
+    #[test]
+    fn wallet_dialogs_submit() {
+        let mut d = Dialog::new(DialogKind::wallet_password("kdewallet".into()));
+        assert!(d.submit().is_err(), "empty password rejected");
+        if let DialogKind::WalletPassword { password, .. } = &mut d.kind {
+            *password = buf("pw");
+        }
+        let Ok(Command::OpenWallet { name, password }) = d.submit() else {
+            panic!("expected OpenWallet");
+        };
+        assert_eq!(
+            (name.as_str(), password.as_text()),
+            ("kdewallet", Some("pw"))
+        );
+
+        let col = |path: &str, label: &str, locked: bool| CollectionInfo {
+            id: CollectionId(path.into()),
+            label: label.into(),
+            locked,
+            item_count: 0,
+            aliases: vec![],
+            is_login: false,
+            created: 0,
+            modified: 0,
+        };
+        let cols = [col("/c/a", "A", false), col("/c/w", "Work", true)];
+        let kind = DialogKind::import_wallet(
+            "kdewallet".into(),
+            SecretValue::from_text("wallet-pw"),
+            &cols,
+            None,
+            None,
+        );
+        let mut d = Dialog::new(kind);
+        assert!(d.submit().is_err(), "new password needed");
+        if let DialogKind::ImportWallet {
+            new_password,
+            confirm,
+            ..
+        } = &mut d.kind
+        {
+            *new_password = buf("np");
+            *confirm = buf("np");
+        }
+        let Ok(Command::CreateWalletCollection { name, password }) = d.submit() else {
+            panic!("expected CreateWalletCollection");
+        };
+        assert_eq!(
+            (name.as_str(), password.as_text()),
+            ("kdewallet", Some("np"))
+        );
+        let set = |d: &mut Dialog, t: Option<WalletTarget>| {
+            if let DialogKind::ImportWallet { target, .. } = &mut d.kind {
+                *target = t;
+            }
+        };
+        set(
+            &mut d,
+            Some(WalletTarget::Keyring(CollectionId("/c/w".into()))),
+        );
+        assert!(d.submit().is_err(), "locked target rejected");
+        set(&mut d, None);
+        assert!(d.submit().is_err(), "missing target rejected");
+        set(
+            &mut d,
+            Some(WalletTarget::Keyring(CollectionId("/c/a".into()))),
+        );
+        let Ok(Command::PlanWalletImport {
+            name,
+            password,
+            target,
+        }) = d.submit()
+        else {
+            panic!("expected PlanWalletImport");
+        };
+        assert_eq!(name, "kdewallet");
+        assert_eq!(password.as_text(), Some("wallet-pw"));
+        assert_eq!(target.0, "/c/a");
+
+        let blocked = DialogKind::import_wallet(
+            "kdewallet".into(),
+            SecretValue::from_text("wallet-pw"),
+            &cols,
+            None,
+            Some("Requires gnome-keyring"),
+        );
+        let mut d = Dialog::new(blocked);
+        set(&mut d, Some(WalletTarget::Create));
+        assert_eq!(d.submit().unwrap_err(), "Requires gnome-keyring");
     }
 
     /// Retire needs a confirmed backup passphrase.

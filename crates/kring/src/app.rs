@@ -24,8 +24,10 @@ use crate::views::item_detail::AttrEditor;
 use crate::views::progress;
 use crate::views::rail::WorkerActivity;
 use crate::views::transfer::{self, TransferView};
+use crate::views::wallet_items::WalletView;
 use crate::views::{
     Action, Area, Gates, banners, collection, file_detail, files_list, rail, sidebar, switch_area,
+    wallet_detail, wallets_list,
 };
 use crate::worker::{Command, Event, WorkerHandle};
 
@@ -68,6 +70,10 @@ pub struct KringApp {
     files_filter: String,
     /// Card state of the selected keyring file (expanded card, shown secrets).
     file_view: FileView,
+    /// Wallet search text.
+    wallets_filter: String,
+    /// Card state of the open wallet (folders, expanded card, shown secrets).
+    wallet_view: WalletView,
     /// Selected backup and the files checked for a restore.
     backup_view: BackupView,
     /// Choices and shown offline secrets of the transfer preview.
@@ -103,6 +109,8 @@ impl KringApp {
             area: Area::default(),
             files_filter: String::new(),
             file_view: FileView::default(),
+            wallets_filter: String::new(),
+            wallet_view: WalletView::default(),
             backup_view: BackupView::default(),
             transfer_view: TransferView::default(),
             consolidate_view: ConsolidateView::default(),
@@ -217,6 +225,7 @@ impl KringApp {
     fn _send(&mut self, cmd: Command) {
         let id = self.next_seq;
         self.state.track_file_command(&cmd);
+        self.state.track_wallet_command(&cmd);
         self.state.track_transfer_command(&cmd);
         self.state.track_operation(&cmd, id);
         self.consolidate_view.remember(&cmd);
@@ -275,6 +284,17 @@ impl KringApp {
             Action::CopyFileSecret(index) => {
                 let item = self.state.file_items.get(index);
                 let Some(secret) = item.filter(|i| !i.secret_missing).map(|i| i.secret.clone())
+                else {
+                    return;
+                };
+                self.copier.copy_value(&secret, &mut self.state);
+            }
+            Action::SelectWallet(name) => {
+                self.copier.cancel();
+                self.state.select_wallet(name);
+            }
+            Action::CopyWalletSecret(index) => {
+                let Some(secret) = self.state.wallet_items.get(index).map(|i| i.secret.clone())
                 else {
                     return;
                 };
@@ -364,6 +384,10 @@ impl KringApp {
         let actions = match self.area {
             Area::Secrets => self.dev.take_actions(&self.state, &self.filter),
             Area::Files => self.dev.take_file_actions(&self.state),
+            Area::KWallet => {
+                let gates = Gates::from_provider(self.state.provider.as_ref());
+                self.dev.take_wallet_actions(&self.state, gates)
+            }
             Area::Backups => {
                 self.dev
                     .take_backup_actions(&self.state, &mut self.backup_view, &self.keyrings_dir)
@@ -373,6 +397,16 @@ impl KringApp {
         let reveal = self.dev.take_transfer_reveal(&self.state);
         for action in actions.into_iter().chain(reveal) {
             self._handle(action);
+        }
+        if self.area == Area::KWallet {
+            if let Some((index, reveal)) = self.dev.take_wallet_card(&self.state) {
+                self.wallet_view.sync(&self.state);
+                self.wallet_view.toggle_expanded(index);
+                if reveal {
+                    self.wallet_view.toggle_revealed(index);
+                }
+            }
+            return;
         }
         if self.area != Area::Files {
             return;
@@ -588,6 +622,7 @@ impl KringApp {
                         sidebar::show(ui, &self.state, &mut self.keyring_filter, gates)
                     }
                     Area::Files => files_list::show(ui, &self.state, &mut self.files_filter),
+                    Area::KWallet => wallets_list::show(ui, &self.state, &mut self.wallets_filter),
                     Area::Backups => backups::list(ui, &self.state, &mut self.backup_view),
                     Area::Consolidate => consolidate::list(ui, &self.state, &self.consolidate_view),
                 };
@@ -607,6 +642,9 @@ impl KringApp {
                         collection::show(ui, &self.state, &mut self.filter, &mut self.editor, gates)
                     }
                     Area::Files => file_detail::show(ui, &self.state, &mut self.file_view, gates),
+                    Area::KWallet => {
+                        wallet_detail::show(ui, &self.state, &mut self.wallet_view, gates)
+                    }
                     Area::Backups => {
                         backups::detail(ui, &self.state, &mut self.backup_view, &self.keyrings_dir)
                     }

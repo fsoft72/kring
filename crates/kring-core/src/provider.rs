@@ -13,9 +13,10 @@ const SECRETS_PATH: &str = "/org/freedesktop/secrets";
 const PRIVATE_IFACE: &str = "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface";
 
 /// Bus names of other secret managers that may compete with the Secret Service owner.
-pub const COMPETITOR_NAMES: [&str; 4] = [
+pub const COMPETITOR_NAMES: [&str; 5] = [
     "org.kde.kwalletd6",
     "org.kde.kwalletd5",
+    "org.kde.ksecretd",
     "org.kde.secretservicecompat",
     "org.keepassxc.KeePassXC.MainWindow",
 ];
@@ -167,6 +168,19 @@ mod tests {
     #[test]
     fn classify_unknown() {
         assert_eq!(classify("foo"), ProviderKind::Other("foo".into()));
+    }
+
+    /// The KWallet daemons (the kwalletd shims and ksecretd, which owns the
+    /// wallets) are probed as competitors.
+    #[test]
+    fn competitors_include_kwallet_daemons() {
+        for name in [
+            "org.kde.kwalletd6",
+            "org.kde.ksecretd",
+            "org.kde.secretservicecompat",
+        ] {
+            assert!(COMPETITOR_NAMES.contains(&name), "{name}");
+        }
     }
 
     /// Only gnome-keyring allows writes.

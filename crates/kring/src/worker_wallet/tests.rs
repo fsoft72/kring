@@ -520,3 +520,129 @@ fn create_wallet_collection_gated() {
         .unwrap();
     assert!(matches!(next(), Event::Error(m) if m == "Not supported on this provider"));
 }
+
+/// ksecretd (the daemon owning the wallets) also triggers the notice.
+#[test]
+fn import_notice_for_ksecretd() {
+    let e = env_with(&["org.kde.ksecretd"]);
+    e.import(&e.main, PASSWORD);
+    let events = e.rest();
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, Event::Notice(t) if t == MSG_KWALLET_COMPETITOR)),
+        "{events:?}"
+    );
+}
+
+/// A symlinked salt or attributes file is refused when opening, and a
+/// symlinked attributes file does not count as app attributes.
+#[test]
+fn open_refuses_symlinked_companions() {
+    let e = env();
+    let link = |src: &str, dst: &str| {
+        std::os::unix::fs::symlink(e.kwallet.join(src), e.kwallet.join(dst)).unwrap();
+    };
+    std::fs::copy(e.kwallet.join("fixture.kwl"), e.kwallet.join("salty.kwl")).unwrap();
+    link("fixture.salt", "salty.salt");
+    std::fs::copy(e.kwallet.join("fixture.kwl"), e.kwallet.join("attrs.kwl")).unwrap();
+    std::fs::copy(e.kwallet.join("fixture.salt"), e.kwallet.join("attrs.salt")).unwrap();
+    link("fixture_attributes.json", "attrs_attributes.json");
+    for name in ["salty", "attrs"] {
+        e.send(Command::OpenWallet {
+            name: name.into(),
+            password: SecretValue::from_text(PASSWORD),
+        });
+        let message = e.expect_error();
+        assert!(message.contains("not a regular file"), "{message}");
+        assert!(e.rest().is_empty());
+    }
+    e.send(Command::ScanWallets);
+    let list = e.expect_wallets();
+    let attrs = list.iter().find(|w| w.name == "attrs").unwrap();
+    assert!(!attrs.has_attributes);
+}
+
+/// Previews a conflicting import of the fixture into `Main` and returns the plan id.
+fn conflict_preview(e: &Env) -> u64 {
+    e.add_item(
+        &e.main,
+        "mine",
+        &[("service", "fixture"), ("user", "bob")],
+        "other",
+    );
+    e.import(&e.main, PASSWORD);
+    let plan_id = match e.next() {
+        Event::TransferPreview { plan_id, .. } => plan_id,
+        other => panic!("expected TransferPreview, got {other:?}"),
+    };
+    assert!(e.rest().is_empty());
+    plan_id
+}
+
+/// Applies plan `plan_id` keeping the target and returns the first event.
+fn apply_keep(e: &Env, plan_id: u64) -> Event {
+    e.send(Command::ApplyTransfer {
+        plan_id,
+        choices: vec![Choice::KeepTarget],
+        backup_passphrase: None,
+    });
+    let events = e.rest();
+    events.into_iter().next().expect("an event")
+}
+
+/// Scanning or opening wallets keeps a pending plan; creating the wallet
+/// keyring drops it.
+#[test]
+fn wallet_reads_keep_plan_create_drops_it() {
+    let e = env();
+    let plan_id = conflict_preview(&e);
+    e.send(Command::ScanWallets);
+    e.expect_wallets();
+    assert!(e.rest().is_empty());
+    e.open();
+    assert!(e.rest().is_empty());
+    assert!(matches!(apply_keep(&e, plan_id), Event::TransferDone(_)));
+
+    let e = env();
+    let plan_id = conflict_preview(&e);
+    e.send(Command::CreateWalletCollection {
+        name: FIXTURE.into(),
+        password: SecretValue::from_text("new-pw"),
+    });
+    assert!(e.rest().iter().any(|ev| matches!(ev, Event::Done(_))));
+    assert!(matches!(
+        apply_keep(&e, plan_id),
+        Event::Error(m) if m == "Plan is out of date, preview again"
+    ));
+}
+
+/// A failed rescan after creating the wallet keyring is reported on its
+/// own and the creation is still reported done.
+#[test]
+fn created_keyring_done_despite_rescan_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let not_a_dir = dir.path().join("kwalletd");
+    std::fs::write(&not_a_dir, b"file").unwrap();
+    let config = WorkerConfig {
+        backups: BackupManager {
+            root: dir.path().join("backups"),
+            keep: BACKUP_KEEP,
+        },
+        keyrings_dir: dir.path().join("keyrings"),
+        pam_dir: dir.path().join("pam"),
+        kwallet_dir: not_a_dir,
+    };
+    let store = FakeStore::new();
+    store.add_collection(FIXTURE, "pw", false);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = crate::worker::Emitter::for_test(tx, || {});
+    block(super::finish_create(&out, &store, &config, FIXTURE));
+    let events: Vec<Event> = rx.try_iter().collect();
+    assert!(matches!(&events[0], Event::Collections(_)), "{events:?}");
+    assert!(
+        matches!(&events[1], Event::Error(m) if m.starts_with("Cannot rescan the wallets")),
+        "{events:?}"
+    );
+    assert!(matches!(&events[2], Event::Done(m) if m == "Keyring 'fixture' created"));
+}

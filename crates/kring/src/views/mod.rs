@@ -19,6 +19,9 @@ pub mod progress;
 pub mod rail;
 pub mod sidebar;
 pub mod transfer;
+pub mod wallet_detail;
+pub mod wallet_items;
+pub mod wallets_list;
 
 use kring_core::model::{CollectionId, ItemId};
 use kring_core::provider::ProviderInfo;
@@ -58,6 +61,10 @@ pub enum Action {
     SelectFile(String),
     /// Copy the secret of `state.file_items[index]` to the clipboard.
     CopyFileSecret(usize),
+    /// Select a KWallet wallet (it is opened with its password later).
+    SelectWallet(String),
+    /// Copy the secret of `state.wallet_items[index]` to the clipboard.
+    CopyWalletSecret(usize),
     /// Check or uncheck an item of the selected collection.
     ToggleSelect(ItemId),
     /// Uncheck every item.
@@ -87,6 +94,8 @@ pub enum Area {
     Secrets,
     /// Keyring files on disk, read offline.
     Files,
+    /// KWallet wallets on disk, read offline and migrated.
+    KWallet,
     /// Backups of the keyring files and their restore.
     Backups,
     /// Consolidation of the orphan keyrings into one.
@@ -102,17 +111,19 @@ pub fn backups_commands() -> Vec<Command> {
 /// Switches from area `from` to `to`; returns the commands to send on entry.
 ///
 /// Leaving the Offline files area closes the selected file, dropping its
-/// secrets; leaving the Backups area forgets the last restore; leaving the
+/// secrets; leaving the KWallet area closes the selected wallet, dropping
+/// its entries and password; leaving the Backups area forgets the last restore; leaving the
 /// Consolidate area drops the secrets revealed in its preview. Any switch
 /// drops the report of the last import. Entering Files or Consolidate
 /// rescans the keyrings directory (orphan files); entering Backups lists
-/// the backups too.
+/// the backups too; entering KWallet scans the wallets.
 pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     if from == to {
         return Vec::new();
     }
     match from {
         Area::Files => state.close_file(),
+        Area::KWallet => state.close_wallet(),
         Area::Backups => state.last_restore = None,
         Area::Consolidate => state.set_consolidation_shown(false),
         Area::Secrets => {}
@@ -120,6 +131,7 @@ pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     state.last_import = None;
     match to {
         Area::Files => vec![Command::ScanFiles],
+        Area::KWallet => vec![Command::ScanWallets],
         Area::Backups => backups_commands(),
         Area::Consolidate => {
             state.set_consolidation_shown(true);
@@ -248,6 +260,42 @@ mod tests {
         assert!(s.selected_file.is_none());
         let cmds = switch_area(&mut s, Area::Secrets, Area::Files);
         assert!(matches!(&cmds[..], [Command::ScanFiles]));
+    }
+
+    /// Leaving the KWallet area closes the wallet (entries and password
+    /// dropped); entering it scans the wallets.
+    #[test]
+    fn switch_area_closes_wallet_and_scans() {
+        use crate::worker::{OfflineItemView, WalletEntryKind};
+        use kring_core::model::SecretValue;
+        let mut s = AppState::default();
+        s.select_wallet("w".into());
+        s.track_wallet_command(&Command::OpenWallet {
+            name: "w".into(),
+            password: SecretValue::from_text("pw"),
+        });
+        let item = OfflineItemView {
+            label: "x".into(),
+            attributes: Default::default(),
+            folder: "f".into(),
+            key: "x".into(),
+            kind: WalletEntryKind::Password,
+            app_entry: false,
+            modified: 0,
+            secret: SecretValue::from_text("s"),
+        };
+        s.apply(crate::worker::Event::WalletItems {
+            name: "w".into(),
+            items: vec![item],
+        });
+        assert!(s.wallet_password().is_some());
+        let cmds = switch_area(&mut s, Area::Secrets, Area::KWallet);
+        assert!(matches!(&cmds[..], [Command::ScanWallets]));
+        assert!(switch_area(&mut s, Area::KWallet, Area::KWallet).is_empty());
+        assert_eq!(s.wallet_items.len(), 1);
+        assert!(switch_area(&mut s, Area::KWallet, Area::Files).len() == 1);
+        assert!(s.selected_wallet.is_none() && s.wallet_items.is_empty());
+        assert!(s.wallet_password().is_none());
     }
 
     /// Entering Backups lists backups and files; leaving forgets the restore

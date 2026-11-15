@@ -30,7 +30,7 @@ use crate::worker_offline;
 use crate::worker_transfer::{self, PlanState};
 pub use crate::worker_transfer::{ConflictView, ConsolidationSummary, StepSummary};
 use crate::worker_wallet;
-pub use crate::worker_wallet::{OfflineItemView, WalletEntryKind, WalletInfo};
+pub use crate::worker_wallet::{OfflineItemView, WalletEntryKind, WalletInfo, kwallet_competitors};
 
 /// Default PAM configuration directory.
 const PAM_DIR: &str = "/etc/pam.d";
@@ -345,6 +345,12 @@ impl<N: Fn()> Emitter<N> {
     /// Emits an error event.
     pub(crate) fn error(&self, message: impl Into<String>) {
         self.emit(Event::Error(message.into()));
+    }
+
+    /// Builds an emitter over `tx`, for tests of handlers called directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(tx: Sender<Event>, notify: N) -> Self {
+        Self { tx, notify }
     }
 }
 

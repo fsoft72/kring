@@ -21,7 +21,7 @@ const SOON_ALPHA: f32 = 0.4;
 const TILES: [(Option<Area>, Ico, &str); 7] = [
     (Some(Area::Secrets), Ico::Key, "Secrets"),
     (Some(Area::Files), Ico::Folder, "Offline files"),
-    (None, Ico::Wallet, "KWallet"),
+    (Some(Area::KWallet), Ico::Wallet, "KWallet"),
     (None, Ico::Terminal, "SSH keys"),
     (None, Ico::Shield, "GPG keys"),
     (Some(Area::Backups), Ico::Archive, "Backups"),
@@ -185,7 +185,14 @@ mod tests {
     /// Consolidate comes last.
     #[test]
     fn tiles_cover_areas() {
-        for area in [Area::Secrets, Area::Files, Area::Backups, Area::Consolidate] {
+        let areas = [
+            Area::Secrets,
+            Area::Files,
+            Area::KWallet,
+            Area::Backups,
+            Area::Consolidate,
+        ];
+        for area in areas {
             assert_eq!(TILES.iter().filter(|t| t.0 == Some(area)).count(), 1);
         }
         assert!(TILES.iter().all(|t| t.2 != "Tools"));

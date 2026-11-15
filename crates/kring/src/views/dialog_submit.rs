@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use kring_core::model::{ItemUpdate, NewItem, SecretValue};
+use kring_core::model::{CollectionId, ItemUpdate, NewItem, SecretValue};
 use kring_core::validate;
 use zeroize::Zeroizing;
 
 use crate::app_state::FileAction;
-use crate::views::dialogs::DialogKind;
 use crate::views::dialogs::RestorePassphrase;
+use crate::views::dialogs::{DialogKind, ImportTarget, WalletTarget};
 use crate::worker::Command;
 
 /// Error of an import or transfer without a target keyring.
@@ -17,6 +17,8 @@ const MSG_NO_TARGET: &str = "Choose a target keyring";
 const MSG_TARGET_LOCKED: &str = "The chosen keyring is locked, unlock it first";
 /// Error of an empty file password.
 const MSG_NO_PASSWORD: &str = "Enter the password of the keyring file";
+/// Error of an empty wallet password.
+const MSG_NO_WALLET_PASSWORD: &str = "Enter the password of the wallet";
 
 /// Error of an empty archive path.
 pub const MSG_NO_PATH: &str = "Enter the path of the archive file";
@@ -147,6 +149,56 @@ fn _new_password(
     Ok(new)
 }
 
+/// Returns the target, refusing a missing or locked keyring.
+fn _usable_target<'a>(
+    targets: &[ImportTarget],
+    target: Option<&'a CollectionId>,
+) -> Result<&'a CollectionId, String> {
+    let Some(target) = target else {
+        return Err(MSG_NO_TARGET.into());
+    };
+    if !targets.iter().any(|t| &t.id == target && !t.locked) {
+        return Err(MSG_TARGET_LOCKED.into());
+    }
+    Ok(target)
+}
+
+/// Builds the command of the wallet import dialog: the import into the
+/// chosen keyring, or the creation of the keyring labelled like the wallet.
+fn _import_wallet(kind: &DialogKind) -> Result<Command, String> {
+    let DialogKind::ImportWallet {
+        name,
+        password,
+        targets,
+        target,
+        create_blocked,
+        new_password,
+        confirm,
+        ..
+    } = kind
+    else {
+        return Err("Not a wallet import".into());
+    };
+    let keyring = match target {
+        Some(WalletTarget::Create) => {
+            if let Some(reason) = create_blocked {
+                return Err((*reason).into());
+            }
+            return Ok(Command::CreateWalletCollection {
+                name: name.clone(),
+                password: _new_password(new_password, confirm)?,
+            });
+        }
+        Some(WalletTarget::Keyring(id)) => Some(id),
+        None => None,
+    };
+    Ok(Command::PlanWalletImport {
+        name: name.clone(),
+        password: password.clone(),
+        target: _usable_target(targets, keyring)?.clone(),
+    })
+}
+
 /// Validates the fields of a dialog and builds the command to send.
 pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
     let invalid = |e: kring_core::KringError| e.to_string();
@@ -262,20 +314,16 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             name,
             targets,
             target,
-        } => {
-            let Some(target) = target else {
-                return Err(MSG_NO_TARGET.into());
-            };
-            let usable = targets.iter().any(|t| &t.id == target && !t.locked);
-            if !usable {
-                return Err(MSG_TARGET_LOCKED.into());
-            }
-            Command::ImportFile {
-                name: name.clone(),
-                password: None,
-                target: target.clone(),
-            }
-        }
+        } => Command::ImportFile {
+            name: name.clone(),
+            password: None,
+            target: _usable_target(targets, target.as_ref())?.clone(),
+        },
+        DialogKind::WalletPassword { name, password } => Command::OpenWallet {
+            name: name.clone(),
+            password: _required(password, MSG_NO_WALLET_PASSWORD)?,
+        },
+        DialogKind::ImportWallet { .. } => _import_wallet(kind)?,
         DialogKind::RetireFile {
             name,
             passphrase,

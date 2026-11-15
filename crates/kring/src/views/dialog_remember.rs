@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use crate::session_secret::{MSG_REMEMBER, MSG_REMEMBER_WARNING};
 use crate::ui::theme;
 use crate::ui::widgets::secondary_button;
-use crate::views::dialogs::{DialogKind, RestorePassphrase};
+use crate::views::dialogs::{DialogKind, RestorePassphrase, WalletTarget};
 use crate::worker::Command;
 
 /// Note shown instead of the passphrase fields when the remembered one is used.
@@ -30,6 +30,7 @@ pub fn asks_passphrase(kind: &DialogKind) -> bool {
         | DialogKind::Passphrase { .. } => true,
         DialogKind::DeleteFile { spec, backup, .. } => *backup && spec.needs_passphrase,
         DialogKind::RestoreBackup { mode, .. } => *mode != RestorePassphrase::NotNeeded,
+        DialogKind::ImportWallet { target, .. } => *target == Some(WalletTarget::Create),
         _ => false,
     }
 }
@@ -85,6 +86,11 @@ pub fn fill_passphrases(kind: &mut DialogKind, secret: &SecretValue) {
             passphrase,
             confirm,
             ..
+        }
+        | DialogKind::ImportWallet {
+            new_password: passphrase,
+            confirm,
+            ..
         } => {
             _set(passphrase, text);
             _set(confirm, text);
@@ -109,7 +115,9 @@ pub fn fill_passphrases(kind: &mut DialogKind, secret: &SecretValue) {
 /// from a passphrase dialog, the value to remember.
 pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
     match cmd {
-        Command::Unlock { password, .. } => Some(password),
+        Command::Unlock { password, .. } | Command::CreateWalletCollection { password, .. } => {
+            Some(password)
+        }
         Command::RetireFile {
             backup_passphrase, ..
         }
@@ -220,6 +228,36 @@ mod tests {
             label: "x".into(),
         }));
         assert!(!asks_passphrase(&DialogKind::create_collection()));
+    }
+
+    /// The wallet import dialog offers remembering only the password of the
+    /// keyring it creates; the wallet password is never remembered.
+    #[test]
+    fn wallet_import_remembers_new_keyring_password() {
+        use crate::views::dialogs::WalletTarget;
+        let mut kind = DialogKind::import_wallet(
+            "kdewallet".into(),
+            SecretValue::from_text("wallet-pw"),
+            &[],
+            None,
+            None,
+        );
+        assert!(uses_remembered(&kind));
+        fill_passphrases(&mut kind, &SecretValue::from_text(PASS));
+        let cmd = command_for(&kind).unwrap();
+        assert!(matches!(cmd, Command::CreateWalletCollection { .. }));
+        assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+        if let DialogKind::ImportWallet { target, .. } = &mut kind {
+            *target = Some(WalletTarget::Keyring(CollectionId("/c/a".into())));
+        }
+        assert!(!asks_passphrase(&kind));
+        let import = Command::PlanWalletImport {
+            name: "kdewallet".into(),
+            password: SecretValue::from_text("wallet-pw"),
+            target: CollectionId("/c/a".into()),
+        };
+        assert!(passphrase_of(&import).is_none());
+        assert!(!asks_passphrase(&DialogKind::wallet_password("w".into())));
     }
 
     /// A filled new-backup dialog submits without a typed confirmation.

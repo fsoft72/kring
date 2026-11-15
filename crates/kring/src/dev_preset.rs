@@ -21,7 +21,10 @@ use crate::views::file_detail::{delete_dialog, retire_dialog};
 use crate::views::file_items::displayed_file_items;
 use crate::views::item_list::displayed_items;
 use crate::views::transfer::default_choices;
+use crate::views::wallet_detail::import_dialog;
+use crate::views::wallet_items::wallet_groups;
 use crate::views::{Action, Area};
+use crate::views::{Gates, file_detail::default_import_target};
 use crate::worker::Command;
 
 /// Keyring (display name) to select first.
@@ -46,8 +49,18 @@ const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
 /// passphrase dialog of the apply) or `consolidate-now` (then applies with
 /// the preselected choices and [`DEV_PASSPHRASE`] for every passphrase).
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
-/// Area to show first: `files`, `backups` or `consolidate`.
+/// Area to show first: `files`, `kwallet`, `backups` or `consolidate`.
 const VAR_AREA: &str = "KRING_DEV_AREA";
+/// Wallet (name without `.kwl`) to select in the KWallet area. Its dialogs
+/// ([`VAR_DIALOG`]): `wallet-password` (the password dialog), `wallet-open`
+/// (opens it with [`DEV_WALLET_PASSWORD`]), `wallet-import` (opens it, then
+/// the import dialog) or `wallet-import-now` (opens it, then imports into
+/// the default import target).
+const VAR_WALLET: &str = "KRING_DEV_WALLET";
+/// Value of [`VAR_AREA`] selecting the KWallet area.
+const AREA_KWALLET: &str = "kwallet";
+/// Password of the fixture wallet seeded by `scripts/dev-session.sh`.
+const DEV_WALLET_PASSWORD: &str = "fixture-pw";
 /// Keyring file (name without `.keyring`) to select in the files area.
 const VAR_FILE: &str = "KRING_DEV_FILE";
 /// Index (newest first) of the backup to select in the backups area.
@@ -100,6 +113,10 @@ pub struct DevPreset {
     pub consolidate_follow: Option<String>,
     /// Remember [`DEV_PASSPHRASE`] for the session at start.
     pub remember: bool,
+    /// Wallet to select in the KWallet area.
+    pub wallet: Option<String>,
+    /// The open request of the preset wallet was sent.
+    pub wallet_open_sent: bool,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -125,6 +142,8 @@ pub fn preset_from(
         transfer_reveal: false,
         consolidate_follow: None,
         remember: var(VAR_REMEMBER).is_some(),
+        wallet: var(VAR_WALLET),
+        wallet_open_sent: false,
     }
 }
 
@@ -163,6 +182,7 @@ impl DevPreset {
         let area = self.area.take()?;
         match area.as_str() {
             AREA_FILES => Some(Area::Files),
+            AREA_KWALLET => Some(Area::KWallet),
             AREA_BACKUPS => Some(Area::Backups),
             AREA_CONSOLIDATE => Some(Area::Consolidate),
             _ => None,
@@ -258,6 +278,77 @@ impl DevPreset {
             out.push(action);
         }
         out
+    }
+
+    /// KWallet area actions due now: selects the preset wallet once
+    /// scanned, then runs its dialog value (password dialog, open with the
+    /// fixture password, then the import dialog or the import); each fires once.
+    pub fn take_wallet_actions(&mut self, state: &AppState, gates: Gates) -> Vec<Action> {
+        if let Some(name) = self.wallet.as_deref() {
+            if !state.wallets.iter().any(|w| w.name == name) {
+                return Vec::new();
+            }
+            let name = self.wallet.take().unwrap_or_default();
+            return vec![Action::SelectWallet(name)];
+        }
+        let Some(info) = state
+            .selected_wallet
+            .as_ref()
+            .and_then(|n| state.wallets.iter().find(|w| &w.name == n))
+        else {
+            return Vec::new();
+        };
+        let Some(dialog) = self.dialog.clone() else {
+            return Vec::new();
+        };
+        if dialog == "wallet-password" {
+            self.dialog = None;
+            return vec![Action::Open(DialogKind::wallet_password(info.name.clone()))];
+        }
+        let wanted = ["wallet-open", "wallet-import", "wallet-import-now"];
+        if !wanted.contains(&dialog.as_str()) {
+            return Vec::new();
+        }
+        if !state.wallet_opened {
+            if std::mem::replace(&mut self.wallet_open_sent, true) {
+                return Vec::new();
+            }
+            return vec![Action::Send(Command::OpenWallet {
+                name: info.name.clone(),
+                password: SecretValue::from_text(DEV_WALLET_PASSWORD),
+            })];
+        }
+        self.dialog = None;
+        let action = match dialog.as_str() {
+            "wallet-import" => import_dialog(state, info, gates).map(Action::Open),
+            "wallet-import-now" => {
+                let password = state.wallet_password().cloned();
+                let target = default_import_target(&state.collections);
+                password.zip(target).map(|(password, target)| {
+                    Action::Send(Command::PlanWalletImport {
+                        name: info.name.clone(),
+                        password,
+                        target,
+                    })
+                })
+            }
+            _ => None,
+        };
+        action.into_iter().collect()
+    }
+
+    /// KWallet area card to expand, as `(index into wallet_items, reveal)`
+    /// (the index counts cards in displayed order); returned once, after the
+    /// entries of the selected wallet arrived.
+    pub fn take_wallet_card(&mut self, state: &AppState) -> Option<(usize, bool)> {
+        let wanted = self.expand?;
+        let shown: Vec<usize> = wallet_groups(&state.wallet_items, "")
+            .into_iter()
+            .flat_map(|(_, list)| list)
+            .collect();
+        let index = *shown.get(wanted)?;
+        self.expand = None;
+        Some((index, self.reveal))
     }
 
     /// Files area card to expand, as `(index into file_items, reveal)`; returned
@@ -483,6 +574,7 @@ mod tests {
             VAR_FILE => Some("textual_two_items".into()),
             VAR_BACKUP => Some("1".into()),
             VAR_REMEMBER => Some("1".into()),
+            VAR_WALLET => Some("fixture".into()),
             _ => None,
         }
     }
@@ -504,6 +596,8 @@ mod tests {
                 transfer_reveal: false,
                 consolidate_follow: None,
                 remember: true,
+                wallet: Some("fixture".into()),
+                wallet_open_sent: false,
             }
         );
     }
@@ -956,5 +1050,72 @@ mod tests {
         let reveal = p.take_transfer_reveal(&s);
         assert_eq!(reveal.len(), 2);
         assert!(p.take_transfer_reveal(&s).is_empty());
+    }
+
+    /// The KWallet preset selects the wallet, opens it once with the fixture
+    /// password, then opens the import dialog; the card index follows the
+    /// displayed (grouped) order.
+    #[test]
+    fn kwallet_area_preset() {
+        use crate::worker::{OfflineItemView, WalletEntryKind, WalletInfo};
+        let mut p = DevPreset {
+            area: Some(AREA_KWALLET.into()),
+            wallet: Some("fixture".into()),
+            dialog: Some("wallet-import".into()),
+            expand: Some(0),
+            reveal: true,
+            ..DevPreset::default()
+        };
+        assert_eq!(p.take_area(), Some(Area::KWallet));
+        let gates = Gates::from_provider(None);
+        let mut s = AppState::default();
+        assert!(
+            p.take_wallet_actions(&s, gates).is_empty(),
+            "not scanned yet"
+        );
+        s.apply(Event::Wallets(vec![WalletInfo {
+            name: "fixture".into(),
+            path: "/k/fixture.kwl".into(),
+            size: 1,
+            modified: 0,
+            header: None,
+            has_attributes: false,
+            suggested_target: None,
+        }]));
+        let actions = p.take_wallet_actions(&s, gates);
+        assert!(matches!(&actions[..], [Action::SelectWallet(n)] if n == "fixture"));
+        s.select_wallet("fixture".into());
+        let actions = p.take_wallet_actions(&s, gates);
+        let [Action::Send(cmd)] = &actions[..] else {
+            panic!("expected the open request");
+        };
+        let Command::OpenWallet { password, .. } = cmd else {
+            panic!("expected OpenWallet");
+        };
+        assert_eq!(password.as_text(), Some(DEV_WALLET_PASSWORD));
+        s.track_wallet_command(cmd);
+        assert!(p.take_wallet_actions(&s, gates).is_empty(), "sent once");
+        let entry = |folder: &str, label: &str| OfflineItemView {
+            label: label.into(),
+            attributes: Default::default(),
+            folder: folder.into(),
+            key: label.into(),
+            kind: WalletEntryKind::Password,
+            app_entry: false,
+            modified: 0,
+            secret: SecretValue::from_text("s"),
+        };
+        s.apply(Event::WalletItems {
+            name: "fixture".into(),
+            items: vec![entry("b", "x"), entry("a", "y")],
+        });
+        assert_eq!(p.take_wallet_card(&s), Some((1, true)));
+        assert_eq!(p.take_wallet_card(&s), None);
+        let actions = p.take_wallet_actions(&s, gates);
+        assert!(matches!(
+            &actions[..],
+            [Action::Open(DialogKind::ImportWallet { .. })]
+        ));
+        assert!(p.take_wallet_actions(&s, gates).is_empty());
     }
 }

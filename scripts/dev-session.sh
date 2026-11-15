@@ -25,6 +25,10 @@
 # plaintext, unreadable (multi-line secret), empty and garbage files. The seed
 # also writes two backups of those temp fixtures into the temp backups dir
 # (passphrase `backup`) for the Backups area.
+# The KWallet fixture wallet of crates/kring-core/tests/fixtures/kwallet
+# (`fixture.kwl`, `.salt`, `_attributes.json`, password `fixture-pw`) is
+# copied as wallets `kdewallet` and `fixture` into the TEMP
+# `$XDG_DATA_HOME/kwalletd` for the KWallet area (never from or to the real one).
 # The temp dir is deleted on exit unless KRING_DEV_KEEP=1.
 set -u
 
@@ -36,6 +40,7 @@ export TMP_ROOT
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 REAL_KEYRINGS="${XDG_DATA_HOME:-$HOME/.local/share}/keyrings"
+REAL_KWALLET="${XDG_DATA_HOME:-$HOME/.local/share}/kwalletd"
 REAL_XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 if [ -f "$REAL_XAUTHORITY" ]; then
   export XAUTHORITY="$REAL_XAUTHORITY"
@@ -45,9 +50,9 @@ if [ -n "${WAYLAND_DISPLAY:-}" ] && [ "${WAYLAND_DISPLAY#/}" = "$WAYLAND_DISPLAY
   export WAYLAND_DISPLAY="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$WAYLAND_DISPLAY"
 fi
 
-# Prints the modification time of the real keyrings dir (or `missing`).
+# Prints the modification times of the real keyrings and KWallet dirs (or `missing`).
 _real_mtime() {
-  stat -c %Y "$REAL_KEYRINGS" 2>/dev/null || echo missing
+  echo "$(stat -c %Y "$REAL_KEYRINGS" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_KWALLET" 2>/dev/null || echo missing)"
 }
 MTIME_BEFORE="$(_real_mtime)"
 
@@ -59,9 +64,9 @@ _cleanup() {
     rm -rf "$TMP_ROOT"
   fi
   MTIME_AFTER="$(_real_mtime)"
-  echo "dev-session: real keyrings mtime before=$MTIME_BEFORE after=$MTIME_AFTER" >&2
+  echo "dev-session: real keyrings/kwalletd mtimes before=$MTIME_BEFORE after=$MTIME_AFTER" >&2
   if [ "$MTIME_BEFORE" != "$MTIME_AFTER" ]; then
-    echo "dev-session: WARNING the real keyrings directory changed" >&2
+    echo "dev-session: WARNING the real keyrings or kwalletd directory changed" >&2
   fi
 }
 trap _cleanup EXIT
@@ -95,6 +100,27 @@ chmod 700 "$TEMP_KEYRINGS"
 for f in "$FIXTURES_DIR"/*.keyring; do
   [ -e "$f" ] || continue
   install -m 600 "$f" "$TEMP_KEYRINGS/"
+done
+
+# Seed the temp KWallet dir with the fixture wallet (repo files only).
+KWALLET_FIXTURES="$REPO_ROOT/crates/kring-core/tests/fixtures/kwallet"
+TEMP_KWALLET="$XDG_DATA_HOME/kwalletd"
+case "$TEMP_KWALLET" in
+  "$TMP_ROOT"/*) ;;
+  *) echo "dev-session: refusing to seed outside $TMP_ROOT" >&2; exit 1 ;;
+esac
+if [ "$TEMP_KWALLET" = "$REAL_KWALLET" ]; then
+  echo "dev-session: refusing to seed the real kwalletd dir" >&2
+  exit 1
+fi
+mkdir -p "$TEMP_KWALLET"
+chmod 700 "$TEMP_KWALLET"
+# Seeded as `kdewallet` (no keyring has that label: Import offers to create
+# it) and as `fixture` (the binary fixture keyring is labelled `fixture`).
+for wallet in kdewallet fixture; do
+  install -m 600 "$KWALLET_FIXTURES/fixture.kwl" "$TEMP_KWALLET/$wallet.kwl"
+  install -m 600 "$KWALLET_FIXTURES/fixture.salt" "$TEMP_KWALLET/$wallet.salt"
+  install -m 600 "$KWALLET_FIXTURES/fixture_attributes.json" "$TEMP_KWALLET/${wallet}_attributes.json"
 done
 
 cd "$REPO_ROOT" || exit 1

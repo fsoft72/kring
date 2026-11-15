@@ -101,3 +101,22 @@
   `AppState` keeps wallets, the selected wallet and its items (`select_wallet`, `close_wallet`, cleared on
   wallet change and rescan), and keeps the offline side of a wallet preview revealable only while that
   wallet is open (`wallet_incoming`, `offline_incoming_secret`, used by the conflict row).
+- Plan 4 Task 5: KWallet area (rail tile enabled). List panel "KWallet wallets" (`views/wallets_list.rs`: rescan,
+  search, rows with BLOWFISH CBC / PBKDF2, UNSUPPORTED or UNKNOWN chips, size and "app attributes"). Detail
+  (`views/wallet_detail.rs`): header with path and subline, read-only note, target note (the keyring labelled
+  like the wallet, or the warning that apps using KWallet look for a keyring named like it), a "KWallet is still
+  running" card while a KWallet daemon is on the bus, the last import report, Open (password dialog) and
+  "Import into...". Entries (`views/wallet_items.rs`) are grouped in collapsible folders, read-only cards with
+  PASSWORD/MAP/STREAM and "app entry" chips, Show/Copy and the attributes the import gives them. The wallet
+  password is kept in `AppState` only while the wallet is open (`track_wallet_command`, `wallet_password`) so
+  the import needs no second prompt; leaving the area calls `close_wallet` (entries and password dropped). The
+  import dialog preselects the keyring labelled like the wallet; without one it offers "Create keyring
+  '<wallet>'" (`CreateWalletCollection`, new password with "Remember for this session") with the info line,
+  plain keyrings stay selectable; conflicts go through the Plan 3 preview. `org.kde.ksecretd` added to
+  `provider::COMPETITOR_NAMES` (and to the KWallet notice). Worker fixes: wallet companion files (`.salt`,
+  `_attributes.json`) must be regular files (symlinks refused, not counted as app attributes);
+  `CreateWalletCollection` checks the store before the gate and destructures once; `Done` is emitted even when
+  the rescan after the creation fails (reported as its own error). `scripts/dev-session.sh` seeds the fixture
+  wallet as `kdewallet` and `fixture` into the temp `$XDG_DATA_HOME/kwalletd`; dev presets
+  `KRING_DEV_AREA=kwallet`, `KRING_DEV_WALLET`, `KRING_DEV_DIALOG=wallet-password|wallet-open|wallet-import|wallet-import-now`
+  (fixture password, debug builds inside the isolated session only).

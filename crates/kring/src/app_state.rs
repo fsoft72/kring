@@ -179,6 +179,12 @@ pub struct AppState {
     pub wallet_items: Vec<OfflineItemView>,
     /// True once the entries of the selected wallet arrived (even zero).
     pub wallet_opened: bool,
+    /// Password of the open wallet, kept with its entries (which hold every
+    /// secret of the wallet anyway) so an import needs no second prompt;
+    /// dropped with them. `Debug` redacts it.
+    wallet_password: Option<SecretValue>,
+    /// Open request `(wallet, password)` waiting for its entries.
+    pending_wallet_open: Option<(String, SecretValue)>,
     /// Backups, newest first.
     pub backups: Vec<BackupInfo>,
     /// Outcome of the last import.
@@ -328,6 +334,8 @@ impl AppState {
                 }
                 self.wallet_items = items;
                 self.wallet_opened = true;
+                let pending = self.pending_wallet_open.take();
+                self.wallet_password = pending.filter(|(n, _)| *n == name).map(|(_, pw)| pw);
                 self._sync_wallet_reveal();
             }
             Event::Notice(text) => self.notices.push(text),
@@ -475,6 +483,7 @@ impl AppState {
     /// Selects a wallet, dropping the entries (and secrets) of the previous one.
     pub fn select_wallet(&mut self, name: String) {
         self.close_wallet();
+        self.last_import = None;
         self.selected_wallet = Some(name);
     }
 
@@ -485,7 +494,26 @@ impl AppState {
         self.selected_wallet = None;
         self.wallet_items.clear();
         self.wallet_opened = false;
+        self.wallet_password = None;
+        self.pending_wallet_open = None;
         self._sync_wallet_reveal();
+    }
+
+    /// Remembers the password of a sent [`Command::OpenWallet`] for the
+    /// selected wallet; it is kept once the entries arrive.
+    pub fn track_wallet_command(&mut self, cmd: &Command) {
+        let Command::OpenWallet { name, password } = cmd else {
+            return;
+        };
+        if self.selected_wallet.as_ref() != Some(name) {
+            return;
+        }
+        self.pending_wallet_open = Some((name.clone(), password.clone()));
+    }
+
+    /// Returns the password of the open wallet (for its import).
+    pub fn wallet_password(&self) -> Option<&SecretValue> {
+        self.wallet_password.as_ref()
     }
 
     /// Returns true when the entries of wallet `name` are open (selected and loaded).
@@ -1866,6 +1894,41 @@ mod tests {
         s.apply(Event::Wallets(vec![wallet("b")]));
         assert_eq!(s.selected_wallet, None, "vanished wallet closed");
         assert!(s.wallet_items.is_empty());
+    }
+
+    /// The password of an open request is kept once its entries arrive and
+    /// dropped with them (wallet change, close, select again).
+    #[test]
+    fn wallet_password_kept_while_open() {
+        let open = |name: &str, pw: &str| Command::OpenWallet {
+            name: name.into(),
+            password: SecretValue::from_text(pw),
+        };
+        let kept = |s: &AppState| {
+            s.wallet_password()
+                .and_then(|p| p.as_text())
+                .map(String::from)
+        };
+        let mut s = AppState::default();
+        s.apply(Event::Wallets(vec![wallet("a"), wallet("b")]));
+        s.select_wallet("a".into());
+        s.track_wallet_command(&open("a", "pw"));
+        assert_eq!(kept(&s), None, "not before the entries");
+        s.apply(wallet_items("a", &["x"]));
+        assert_eq!(kept(&s).as_deref(), Some("pw"));
+        s.select_wallet("b".into());
+        assert_eq!(kept(&s), None);
+        s.track_wallet_command(&open("b", "pb"));
+        s.select_wallet("a".into());
+        s.apply(wallet_items("b", &["x"]));
+        s.apply(wallet_items("a", &["x"]));
+        assert_eq!(kept(&s), None, "request of another selection");
+        s.track_wallet_command(&open("a", "zq-wallet-pw"));
+        s.apply(wallet_items("a", &["x"]));
+        assert_eq!(kept(&s).as_deref(), Some("zq-wallet-pw"));
+        assert!(!format!("{s:?}").contains("zq-wallet-pw"));
+        s.close_wallet();
+        assert_eq!(kept(&s), None);
     }
 
     /// The offline side of a wallet import preview is revealable only while

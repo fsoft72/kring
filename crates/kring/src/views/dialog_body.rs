@@ -14,8 +14,9 @@ use crate::ui::theme;
 use crate::ui::widgets::{field_label, input, semibold};
 use crate::views::dialog_submit::delete_dialog_blocked;
 use crate::views::dialogs::RestorePassphrase;
-use crate::views::dialogs::{DialogKind, ImportTarget};
+use crate::views::dialogs::{DialogKind, ImportTarget, WalletTarget};
 use crate::views::item_detail::attribute_rows;
+use crate::views::wallet_detail::{create_option_label, wallet_keyring_info};
 use crate::worker::Command;
 
 /// Width of dialog content.
@@ -42,6 +43,9 @@ const MSG_CONSOLIDATE_ORPHANS: &str = "The empty plaintext files are retired wit
      encrypted backup, choose its passphrase.";
 /// Warning of a delete without backup.
 const MSG_DELETE_NO_BACKUP: &str = "Permanent deletion: no backup will be made";
+/// Note of the wallet import dialog when the keyring is created first.
+const MSG_CREATE_THEN_IMPORT: &str = "The keyring is created and unlocked; then choose \
+     Import into... again to copy the entries into it.";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -146,6 +150,108 @@ fn _target_combo(ui: &mut egui::Ui, targets: &[ImportTarget], target: &mut Optio
                 });
             }
         });
+}
+
+/// Combo of wallet import targets: "Create keyring '<wallet>'" first when
+/// `offer_create` (disabled with `create_blocked` as tooltip), then every
+/// keyring, locked ones disabled with "(locked)".
+fn _wallet_target_combo(
+    ui: &mut egui::Ui,
+    name: &str,
+    targets: &[ImportTarget],
+    target: &mut Option<WalletTarget>,
+    offer_create: bool,
+    create_blocked: Option<&'static str>,
+) {
+    let create = create_option_label(name);
+    let selected = match target.as_ref() {
+        Some(WalletTarget::Create) => create.clone(),
+        Some(WalletTarget::Keyring(id)) => targets
+            .iter()
+            .find(|t| &t.id == id)
+            .map_or_else(|| "Choose a keyring".to_string(), |t| t.label.clone()),
+        None => "Choose a keyring".to_string(),
+    };
+    egui::ComboBox::from_id_salt("kring-wallet-target")
+        .selected_text(selected)
+        .width(FIELD_WIDTH)
+        .show_ui(ui, |ui| {
+            if offer_create {
+                let checked = *target == Some(WalletTarget::Create);
+                let resp = ui
+                    .add_enabled_ui(create_blocked.is_none(), |ui| {
+                        ui.selectable_label(checked, create.as_str())
+                    })
+                    .inner;
+                if resp.clicked() {
+                    *target = Some(WalletTarget::Create);
+                }
+                if let Some(reason) = create_blocked {
+                    resp.on_disabled_hover_text(reason);
+                }
+            }
+            for t in targets {
+                let text = if t.locked {
+                    format!("{} (locked)", t.label)
+                } else {
+                    t.label.clone()
+                };
+                let checked = *target == Some(WalletTarget::Keyring(t.id.clone()));
+                ui.add_enabled_ui(!t.locked, |ui| {
+                    if ui.selectable_label(checked, text).clicked() {
+                        *target = Some(WalletTarget::Keyring(t.id.clone()));
+                    }
+                });
+            }
+        });
+}
+
+/// Renders the wallet import dialog: target combo, the info line when no
+/// keyring is labelled like the wallet, then the new keyring password
+/// fields (Create) or the conflicts note (import). `hide` leaves out the
+/// password fields (the remembered passphrase is used).
+fn _import_wallet(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool) -> MainAction {
+    let DialogKind::ImportWallet {
+        name,
+        targets,
+        target,
+        offer_create,
+        create_blocked,
+        new_password,
+        confirm,
+        ..
+    } = kind
+    else {
+        return _primary("Import");
+    };
+    _title(ui, &format!("Import \"{name}\""));
+    _text(ui, "Copy the entries of this wallet into a keyring.");
+    field_label(ui, "Target keyring");
+    _wallet_target_combo(ui, name, targets, target, *offer_create, *create_blocked);
+    if *offer_create {
+        ui.label(
+            RichText::new(wallet_keyring_info(name))
+                .color(theme::TERTIARY)
+                .size(12.5),
+        );
+    }
+    if *target != Some(WalletTarget::Create) {
+        _muted(ui, MSG_IMPORT_CONFLICTS);
+        return _primary("Import");
+    }
+    _password_field(
+        ui,
+        hide,
+        "New keyring password",
+        FIELD_PASSWORD,
+        new_password,
+    );
+    _password_field(ui, hide, "Confirm password", FIELD_CONFIRM, confirm);
+    _muted(ui, MSG_CREATE_THEN_IMPORT);
+    MainAction {
+        blocked: *create_blocked,
+        .._primary("Create keyring")
+    }
 }
 
 /// Renders the fields of a dialog and returns its main action; `hide`
@@ -275,6 +381,17 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
             _muted(ui, MSG_IMPORT_CONFLICTS);
             _primary("Import")
         }
+        DialogKind::WalletPassword { name, password } => {
+            _title(ui, &format!("Open \"{name}\""));
+            _muted(
+                ui,
+                "kring decrypts the wallet file itself, KWallet is not used. The password \
+                 stays in memory until the wallet is closed.",
+            );
+            _password_field(ui, false, "Wallet password", FIELD_PASSWORD, password);
+            _primary("Open")
+        }
+        DialogKind::ImportWallet { .. } => _import_wallet(ui, kind, hide),
         DialogKind::RetireFile {
             name,
             lines,
