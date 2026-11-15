@@ -50,6 +50,10 @@ pub struct BackupInfo {
     pub created: String,
     /// Files in the backup.
     pub files: Vec<BackupFile>,
+    /// Creation counter, one more than the highest existing backup; orders
+    /// backups made within the same `created` instant (0 in older manifests).
+    #[serde(default)]
+    pub seq: u32,
     /// Set when the backup was written but older backups could not be pruned.
     #[serde(skip)]
     pub prune_warning: Option<String>,
@@ -144,6 +148,16 @@ fn read_manifest(dir: &Path) -> Option<BackupInfo> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Manifest header fields of a backup being written.
+struct Header<'a> {
+    /// Sanitized reason.
+    reason: &'a str,
+    /// Creation time, RFC 3339 UTC.
+    created: String,
+    /// Creation counter.
+    seq: u32,
+}
+
 impl BackupManager {
     /// Creates a backup of `files`, encrypting plaintext keyrings with `passphrase`.
     ///
@@ -188,11 +202,17 @@ impl BackupManager {
             final_dir = self.root.join(format!("{base}-{n}"));
             n += 1;
         }
+        let seq = self.next_seq()?;
         let mut tmp_name = final_dir.clone().into_os_string();
         tmp_name.push(TMP_SUFFIX);
         let tmp_dir = PathBuf::from(tmp_name);
 
-        let info = self.write_backup(&tmp_dir, &final_dir, &reason, created, &sources, secret);
+        let header = Header {
+            reason: &reason,
+            created,
+            seq,
+        };
+        let info = self.write_backup(&tmp_dir, &final_dir, header, &sources, secret);
         let mut info = match info {
             Ok(info) => info,
             Err(e) => {
@@ -210,13 +230,18 @@ impl BackupManager {
         Ok(info)
     }
 
+    /// Returns the seq for a new backup: one more than the highest existing one.
+    fn next_seq(&self) -> Result<u32> {
+        let max = self.backups()?.iter().map(|(_, i)| i.seq).max();
+        Ok(max.map_or(1, |m| m.saturating_add(1)))
+    }
+
     /// Writes the files and manifest into `tmp_dir`; stored paths point into `final_dir`.
     fn write_backup(
         &self,
         tmp_dir: &Path,
         final_dir: &Path,
-        reason: &str,
-        created: String,
+        header: Header<'_>,
         sources: &[(&PathBuf, bool, Zeroizing<Vec<u8>>)],
         secret: Option<SecretString>,
     ) -> Result<BackupInfo> {
@@ -246,9 +271,10 @@ impl BackupManager {
         }
         let info = BackupInfo {
             dir: final_dir.to_path_buf(),
-            reason: reason.to_string(),
-            created,
+            reason: header.reason.to_string(),
+            created: header.created,
             files: entries,
+            seq: header.seq,
             prune_warning: None,
         };
         let json = serde_json::to_vec_pretty(&info)
@@ -257,28 +283,40 @@ impl BackupManager {
         Ok(info)
     }
 
-    /// Returns backup directories that have a manifest, oldest first.
-    fn backup_dirs(&self) -> Result<Vec<PathBuf>> {
+    /// Returns backup directories with a valid manifest, oldest first.
+    ///
+    /// Order is the manifest `created` instant, then `seq` (never the dir name,
+    /// whose reason suffix would reorder backups made within the same second).
+    /// Directories without a valid manifest or timestamp are left out, so they
+    /// are never pruned.
+    fn backups(&self) -> Result<Vec<(PathBuf, BackupInfo)>> {
         if !self.root.exists() {
             return Ok(Vec::new());
         }
-        let mut dirs = Vec::new();
+        let mut found = Vec::new();
         for entry in fs::read_dir(&self.root).map_err(|e| io_err(&self.root, e))? {
             let path = entry.map_err(|e| io_err(&self.root, e))?.path();
             let is_tmp = path.to_string_lossy().ends_with(TMP_SUFFIX);
-            if path.is_dir() && !is_tmp && path.join(MANIFEST_NAME).is_file() {
-                dirs.push(path);
+            if !path.is_dir() || is_tmp {
+                continue;
             }
+            let Some(info) = read_manifest(&path) else {
+                continue;
+            };
+            let Ok(created) = OffsetDateTime::parse(&info.created, &Rfc3339) else {
+                continue;
+            };
+            found.push((created, path, info));
         }
-        dirs.sort();
-        Ok(dirs)
+        found.sort_by_key(|(created, _, info)| (*created, info.seq));
+        Ok(found.into_iter().map(|(_, p, i)| (p, i)).collect())
     }
 
     /// Removes the oldest backups beyond `keep`.
     fn prune(&self) -> Result<()> {
-        let dirs = self.backup_dirs()?;
-        let excess = dirs.len().saturating_sub(self.keep);
-        for dir in dirs.iter().take(excess) {
+        let backups = self.backups()?;
+        let excess = backups.len().saturating_sub(self.keep);
+        for (dir, _) in backups.iter().take(excess) {
             fs::remove_dir_all(dir).map_err(|e| io_err(dir, e))?;
         }
         Ok(())
@@ -286,11 +324,7 @@ impl BackupManager {
 
     /// Lists backups, newest first; directories without a valid manifest are ignored.
     pub fn list(&self) -> Result<Vec<BackupInfo>> {
-        let mut out: Vec<BackupInfo> = self
-            .backup_dirs()?
-            .iter()
-            .filter_map(|d| read_manifest(d))
-            .collect();
+        let mut out: Vec<BackupInfo> = self.backups()?.into_iter().map(|(_, i)| i).collect();
         out.reverse();
         Ok(out)
     }
@@ -426,6 +460,62 @@ mod tests {
         assert_eq!(listed[0].dir, third.dir);
         assert_eq!(listed[1].dir, second.dir);
         assert!(!first.dir.exists());
+    }
+
+    /// Backups made in a row with different reasons are pruned oldest-first.
+    #[test]
+    fn prunes_oldest_first_across_reasons() {
+        let (_t, mgr, src) = setup(2);
+        let f = binary_file(&src, "a.keyring");
+        let first = mgr.create("zzz", std::slice::from_ref(&f), None).unwrap();
+        let second = mgr.create("aaa", std::slice::from_ref(&f), None).unwrap();
+        let third = mgr.create("mmm", &[f], None).unwrap();
+        assert!(first.seq < second.seq && second.seq < third.seq);
+        let listed: Vec<_> = mgr.list().unwrap().into_iter().map(|i| i.dir).collect();
+        assert_eq!(listed, [third.dir, second.dir]);
+        assert!(!first.dir.exists());
+    }
+
+    /// Writes a hand-made backup dir named `name` with the given manifest fields.
+    fn fake_backup(mgr: &BackupManager, name: &str, created: &str, seq: u32) -> PathBuf {
+        let dir = mgr.root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        let info = BackupInfo {
+            dir: dir.clone(),
+            reason: "r".into(),
+            created: created.into(),
+            files: vec![],
+            seq,
+            prune_warning: None,
+        };
+        fs::write(dir.join(MANIFEST_NAME), serde_json::to_vec(&info).unwrap()).unwrap();
+        dir
+    }
+
+    /// Order comes from the manifest (created, then seq), not from the dir name.
+    #[test]
+    fn prune_orders_by_manifest_not_name() {
+        let (_t, mgr, _src) = setup(1);
+        let same = "2026-11-15T10:00:00Z";
+        // Same second: the dir names sort opposite to the creation order.
+        let oldest = fake_backup(&mgr, "20261115-100000-zzz", same, 1);
+        let middle = fake_backup(&mgr, "20261115-100000-mmm", same, 2);
+        let newest = fake_backup(&mgr, "20261115-100000-aaa", same, 3);
+        // An earlier second always sorts first, whatever its seq.
+        let earlier = fake_backup(&mgr, "20261115-095959-zzz", "2026-11-15T09:59:59.5Z", 9);
+        mgr.prune().unwrap();
+        assert!(newest.exists());
+        for gone in [oldest, middle, earlier] {
+            assert!(!gone.exists(), "{}", gone.display());
+        }
+    }
+
+    /// Manifests without `seq` (older backups) still load, with seq 0.
+    #[test]
+    fn manifest_without_seq_defaults_to_zero() {
+        let json = r#"{"dir":"/b/x","reason":"r","created":"2026-11-15T10:00:00Z","files":[]}"#;
+        let info: BackupInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.seq, 0);
     }
 
     /// A prune failure keeps the new backup and reports a warning instead of failing.

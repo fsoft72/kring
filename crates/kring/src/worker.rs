@@ -1064,10 +1064,7 @@ mod tests {
             root: f.backups.clone(),
             keep: 1,
         };
-        let created = old_mgr.create("old", &[file], None).unwrap();
-        // Make sure it sorts as the oldest backup, whatever the current second is.
-        let old = f.backups.join("20000101-000000-old");
-        std::fs::rename(&created.dir, &old).unwrap();
+        let old = old_mgr.create("old", &[file], None).unwrap().dir;
         // Files inside a read-only directory cannot be unlinked, so pruning fails.
         let set_mode = |m| std::fs::set_permissions(&old, std::fs::Permissions::from_mode(m));
         set_mode(0o500).unwrap();
