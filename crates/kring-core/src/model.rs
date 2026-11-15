@@ -118,6 +118,32 @@ pub struct ItemUpdate {
     pub secret: Option<SecretValue>,
 }
 
+/// Decodes an object path segment escaped by gnome-keyring.
+///
+/// gnome-keyring writes every byte that is not `[A-Za-z0-9]` as `_XX` (hex), so
+/// collection `My_Keys` has the path segment `My_5fKeys`. The decoded bytes must
+/// be valid UTF-8; a malformed escape is an error.
+pub fn decode_path_segment(segment: &str) -> std::result::Result<String, String> {
+    let bad = || format!("malformed object path segment '{segment}'");
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'_' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let hex = segment.get(i + 1..i + 3).ok_or_else(bad)?;
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad());
+        }
+        out.push(u8::from_str_radix(hex, 16).map_err(|_| bad())?);
+        i += 3;
+    }
+    String::from_utf8(out).map_err(|_| bad())
+}
+
 /// Returns true if `id` is the login collection.
 pub fn is_login_collection(id: &CollectionId) -> bool {
     id.0 == LOGIN_COLLECTION_PATH
@@ -143,6 +169,23 @@ mod tests {
         assert!(!is_login_collection(&CollectionId(
             "/org/freedesktop/secrets/collection/Default_3".into()
         )));
+    }
+
+    /// `_XX` escapes are decoded, including multi-byte UTF-8 sequences.
+    #[test]
+    fn object_path_segment_decoding() {
+        assert_eq!(decode_path_segment("My_5fKeys"), Ok("My_Keys".to_string()));
+        assert_eq!(decode_path_segment("My_20Keys"), Ok("My Keys".to_string()));
+        assert_eq!(decode_path_segment("plain"), Ok("plain".to_string()));
+        assert_eq!(
+            decode_path_segment("caf_c3_a9"),
+            Ok("caf\u{e9}".to_string())
+        );
+        assert!(decode_path_segment("_zz").is_err());
+        assert!(decode_path_segment("a_5").is_err());
+        assert!(decode_path_segment("a_").is_err());
+        assert!(decode_path_segment("_c3").is_err());
+        assert_eq!(decode_path_segment("_2f"), Ok("/".to_string()));
     }
 
     /// Non-UTF-8 bytes give no text; clones keep the bytes.

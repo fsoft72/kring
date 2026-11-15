@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use kring_core::backup::{BACKUP_KEEP, BackupInfo, BackupManager, keyring_backup_set};
 use kring_core::model::{
     CollectionId, CollectionInfo, ItemId, ItemInfo, ItemUpdate, NewItem, SecretValue,
+    decode_path_segment,
 };
 use kring_core::pam::{PamStatus, pam_status};
 use kring_core::paths;
@@ -258,21 +259,30 @@ fn collection_of(item: &ItemId) -> CollectionId {
 
 /// Returns the keyring file name of a collection (`<name>` of `<name>.keyring`).
 ///
-/// gnome-keyring names the object path after the file: `.../collection/<name>` is
-/// stored in `<name>.keyring`. The in-memory `session` collection yields `Ok(None)`.
-/// A path that is not a collection path is an error message.
+/// gnome-keyring names the object path after the file, escaping every byte that is
+/// not alphanumeric as `_XX`: `.../collection/My_5fKeys` is stored in `My_Keys.keyring`.
+/// The in-memory `session` collection yields `Ok(None)`. A path that is not a
+/// collection path, a malformed escape, or a decoded name that is empty, `.`, `..`
+/// or contains `/` is an error message (the delete stays refused).
 fn keyring_name(collection: &CollectionId) -> Result<Option<String>, String> {
-    let name = collection.0.strip_prefix(COLLECTION_PATH_PREFIX);
-    let Some(name) = name.filter(|n| !n.is_empty() && !n.contains('/')) else {
-        return Err(format!(
+    let refuse = || {
+        format!(
             "Cannot find the keyring file of {}: {MSG_NO_BACKUP}",
             collection.0
-        ));
+        )
     };
+    let segment = collection.0.strip_prefix(COLLECTION_PATH_PREFIX);
+    let Some(segment) = segment.filter(|n| !n.is_empty() && !n.contains('/')) else {
+        return Err(refuse());
+    };
+    let name = decode_path_segment(segment).map_err(|_| refuse())?;
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(refuse());
+    }
     if name == SESSION_COLLECTION {
         return Ok(None);
     }
-    Ok(Some(name.to_string()))
+    Ok(Some(name))
 }
 
 /// Result of the backup step before a destructive operation.
@@ -1119,6 +1129,22 @@ mod tests {
         assert!(keyring_name(&id("/org/freedesktop/secrets/aliases/default")).is_err());
         assert!(keyring_name(&id("/org/freedesktop/secrets/collection/")).is_err());
         assert!(keyring_name(&id("/org/freedesktop/secrets/collection/a/b")).is_err());
+    }
+
+    /// Escaped object path names decode to the raw keyring file name.
+    #[test]
+    fn keyring_name_decodes_escapes() {
+        let name = |n: &str| keyring_name(&CollectionId(format!("{COLLECTION_PATH_PREFIX}{n}")));
+        assert_eq!(name("My_5fKeys"), Ok(Some("My_Keys".to_string())));
+        assert_eq!(
+            name("Default_5fkeyring"),
+            Ok(Some("Default_keyring".to_string()))
+        );
+        assert_eq!(name("plain"), Ok(Some("plain".to_string())));
+        assert!(name("_zz").is_err());
+        assert!(name("a_2fb").is_err());
+        assert!(name("_2e").is_err());
+        assert!(name("_2e_2e").is_err());
     }
 
     /// The collection is the parent object path of the item.

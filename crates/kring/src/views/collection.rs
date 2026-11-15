@@ -1,7 +1,7 @@
 //! The selected collection: header, actions and item table.
 
 use eframe::egui;
-use kring_core::model::{Attributes, CollectionInfo, ItemInfo};
+use kring_core::model::{Attributes, CollectionInfo, ItemInfo, decode_path_segment};
 
 use crate::app_state::AppState;
 use crate::views::dialogs::DialogKind;
@@ -42,12 +42,13 @@ pub fn badges(c: &CollectionInfo) -> Vec<&'static str> {
         .collect()
 }
 
-/// Returns the label, or the last object path segment when the label is blank.
+/// Returns the label, or the decoded last object path segment when the label is blank.
 pub fn display_name(c: &CollectionInfo) -> String {
     if !c.label.trim().is_empty() {
         return c.label.clone();
     }
-    c.id.0.rsplit('/').next().unwrap_or_default().to_string()
+    let segment = c.id.0.rsplit('/').next().unwrap_or_default();
+    decode_path_segment(segment).unwrap_or_else(|_| segment.to_string())
 }
 
 /// Returns the extra warnings of the delete confirmation (login and default keyring).
@@ -303,6 +304,9 @@ mod tests {
         let mut c = col("/org/freedesktop/secrets/collection/session", &[], false);
         c.label = " ".into();
         assert_eq!(display_name(&c), "session");
+        let mut escaped = col("/org/freedesktop/secrets/collection/My_5fKeys", &[], false);
+        escaped.label = " ".into();
+        assert_eq!(display_name(&escaped), "My_Keys");
         c.label = "Mine".into();
         assert_eq!(display_name(&c), "Mine");
     }

@@ -1,7 +1,8 @@
 //! Integration test: deleting a collection backs up its real keyring file first.
 //!
-//! It checks on a real gnome-keyring that the collection object path name matches
-//! its `<name>.keyring` file, which the worker requires before deleting.
+//! It checks on a real gnome-keyring that the decoded collection object path name
+//! (non-alphanumeric bytes are escaped as `_XX`) matches its `<name>.keyring` file,
+//! which the worker requires before deleting.
 //! Run only through `scripts/it-session.sh` (private bus, throwaway keyring):
 //! `bash scripts/it-session.sh cargo test -p kring --test it_delete_backup -- --ignored`
 
@@ -11,12 +12,13 @@ use std::time::Duration;
 
 use kring::startup;
 use kring::worker::{self, Command, Event, WorkerConfig, WorkerHandle};
-use kring_core::model::SecretValue;
+use kring_core::model::{SecretValue, decode_path_segment};
 
 /// Maximum time to wait for one worker event.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Label of the collection created and deleted by the test.
-const LABEL: &str = "kringdeletetest";
+/// Label of the collection created and deleted by the test (space and underscore
+/// exercise the object path escaping).
+const LABEL: &str = "kring delete_test";
 
 /// Waits for the next event matching `pick`, failing on any worker error.
 fn wait_for<T>(handle: &WorkerHandle, mut pick: impl FnMut(Event) -> Option<T>) -> T {
@@ -64,7 +66,9 @@ fn delete_collection_backs_up_its_keyring_file() {
         _ => None,
     });
     wait_for(&handle, |e| matches!(e, Event::Done(_)).then_some(()));
-    let name = id.0.rsplit('/').next().unwrap().to_string();
+    let segment = id.0.rsplit('/').next().unwrap();
+    assert!(segment.contains("_5f"), "escaped path expected: {}", id.0);
+    let name = decode_path_segment(segment).unwrap();
     let file = keyrings.join(format!("{name}.keyring"));
     assert!(file.is_file(), "{} missing", file.display());
 
