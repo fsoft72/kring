@@ -1,7 +1,6 @@
 //! Core library for kring: Secret Service keyring management.
 
 pub mod backup;
-#[cfg(any(test, feature = "dev"))]
 pub mod dev_guard;
 pub mod error;
 #[cfg(any(test, feature = "fake"))]

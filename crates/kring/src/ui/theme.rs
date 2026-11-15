@@ -48,6 +48,15 @@ pub const PRIMARY_ACTIVE: Color32 = Color32::from_rgb(0x34, 0x59, 0xC0);
 /// Hairline border of inactive buttons.
 pub const BUTTON_BORDER: Color32 = Color32::from_rgb(0x32, 0x3A, 0x4D);
 
+/// ERROR tint of a hovered danger button (ERROR text on it, composited over
+/// FIELD_ROW_BG / SURFACE, stays above 4.5:1).
+pub const DANGER_HOVER_ALPHA: f32 = 0.14;
+/// ERROR tint of a pressed danger button (Paranoid uses 0.30, which drops
+/// ERROR text below 4.5:1 on cards and dialogs).
+pub const DANGER_ACTIVE_ALPHA: f32 = 0.20;
+/// PRIMARY tint of a pressed default button.
+pub const ACCENT_ACTIVE_ALPHA: f32 = 0.30;
+
 /// Corner radius of buttons, inputs and chips.
 pub const RADIUS_CTRL: u8 = 3;
 /// Corner radius of cards and list rows.
@@ -178,8 +187,8 @@ fn _widget_visuals(w: &mut egui::style::Widgets) {
     w.hovered.weak_bg_fill = INPUT_FILL_BLUE;
     w.hovered.bg_stroke = Stroke::new(1.0_f32, PRIMARY);
     w.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
-    w.active.bg_fill = PRIMARY.gamma_multiply(0.30);
-    w.active.weak_bg_fill = PRIMARY.gamma_multiply(0.30);
+    w.active.bg_fill = PRIMARY.gamma_multiply(ACCENT_ACTIVE_ALPHA);
+    w.active.weak_bg_fill = PRIMARY.gamma_multiply(ACCENT_ACTIVE_ALPHA);
     w.active.bg_stroke = Stroke::new(1.0_f32, SECONDARY);
     w.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     w.open.bg_fill = INPUT_FILL_BLUE;
@@ -296,6 +305,51 @@ mod tests {
                 failures.push(format!("ON_ACCENT on {n}: {r:.2}"));
             }
         }
+        failures.extend(_button_state_failures());
         assert!(failures.is_empty(), "contrast failures: {failures:#?}");
+    }
+
+    /// Composites `fg` at `alpha` over the opaque `bg` (gamma space, like egui).
+    fn over(fg: Color32, alpha: f32, bg: Color32) -> Color32 {
+        let mix =
+            |f: u8, b: u8| (f32::from(f) * alpha + f32::from(b) * (1.0 - alpha)).round() as u8;
+        Color32::from_rgb(
+            mix(fg.r(), bg.r()),
+            mix(fg.g(), bg.g()),
+            mix(fg.b(), bg.b()),
+        )
+    }
+
+    /// Text on the hover and pressed fills of danger, primary and default
+    /// buttons, on every surface a button sits on.
+    fn _button_state_failures() -> Vec<String> {
+        let surfaces = [
+            ("DEEP_DARK", DEEP_DARK),
+            ("FIELD_ROW_BG", FIELD_ROW_BG),
+            ("SURFACE", SURFACE),
+            ("NAVY_DARK", NAVY_DARK),
+        ];
+        let mut failures = Vec::new();
+        for (bn, bg) in surfaces {
+            let pairs = [
+                ("danger hover", ERROR, over(ERROR, DANGER_HOVER_ALPHA, bg)),
+                ("danger active", ERROR, over(ERROR, DANGER_ACTIVE_ALPHA, bg)),
+                ("primary hover", ON_ACCENT, PRIMARY),
+                ("primary active", ON_ACCENT, PRIMARY_ACTIVE),
+                ("button hover", Color32::WHITE, INPUT_FILL_BLUE),
+                (
+                    "button active",
+                    Color32::WHITE,
+                    over(PRIMARY, ACCENT_ACTIVE_ALPHA, bg),
+                ),
+            ];
+            for (name, fg, fill) in pairs {
+                let r = contrast_ratio(fg, fill);
+                if r < MIN_TEXT {
+                    failures.push(format!("{name} on {bn}: {r:.2}"));
+                }
+            }
+        }
+        failures
     }
 }

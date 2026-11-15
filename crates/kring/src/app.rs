@@ -8,6 +8,8 @@ use eframe::egui;
 use crate::app_state::AppState;
 use crate::clipboard::ArboardClipboard;
 use crate::copy_flow::SecretCopier;
+#[cfg(debug_assertions)]
+use crate::dev_preset::DevPreset;
 use crate::ui::theme;
 use crate::ui::toasts::{ToastKind, Toasts, kind_for_status};
 use crate::views::dialogs::{Dialog, DialogKind, Outcome};
@@ -33,20 +35,6 @@ const DETAIL_MARGIN_X: i8 = 28;
 /// Vertical margin of the detail pane.
 const DETAIL_MARGIN_Y: i8 = 22;
 
-/// Initial state requested for screenshots, honoured only inside the
-/// isolated dev session (see `main.rs`).
-#[derive(Debug, Default, Clone)]
-pub struct DevPreset {
-    /// Display name of the keyring to select first.
-    pub select: Option<String>,
-    /// Index of the item to expand once items are loaded.
-    pub expand: Option<usize>,
-    /// Reveal the expanded item's secret.
-    pub reveal: bool,
-    /// Dialog to open at start: `new-keyring` or `unlock`.
-    pub dialog: Option<String>,
-}
-
 /// The kring application.
 pub struct KringApp {
     state: AppState,
@@ -62,6 +50,8 @@ pub struct KringApp {
     /// Keyring search text.
     keyring_filter: String,
     toasts: Toasts,
+    /// Screenshot preset (debug builds, isolated session only).
+    #[cfg(debug_assertions)]
     dev: DevPreset,
 }
 
@@ -79,11 +69,13 @@ impl KringApp {
             filter: String::new(),
             keyring_filter: String::new(),
             toasts: Toasts::default(),
+            #[cfg(debug_assertions)]
             dev: DevPreset::default(),
         }
     }
 
     /// Applies a dev preset (screenshots in the isolated dev session only).
+    #[cfg(debug_assertions)]
     pub fn with_dev_preset(mut self, dev: DevPreset) -> Self {
         self.dev = dev;
         self
@@ -174,42 +166,23 @@ impl KringApp {
         if self.state.selected.is_some() || self.worker_stopped {
             return;
         }
-        let wanted = self.dev.select.as_deref();
-        let preset = self
-            .state
-            .collections
-            .iter()
-            .find(|c| wanted == Some(collection::display_name(c).as_str()));
-        let Some(first) = preset.or(self.state.collections.first()) else {
+        #[cfg(debug_assertions)]
+        let preset = self.dev.preferred_collection(&self.state);
+        #[cfg(not(debug_assertions))]
+        let preset = None;
+        let first = self.state.collections.first().map(|c| c.id.clone());
+        let Some(id) = preset.or(first) else {
             return;
         };
-        let id = first.id.clone();
         self._handle(Action::SelectCollection(id));
     }
 
-    /// Applies the dev preset item expansion and dialog once their data exists.
+    /// Runs the dev preset actions whose data has arrived.
+    #[cfg(debug_assertions)]
     fn _apply_dev_preset(&mut self) {
-        if let Some(index) = self.dev.expand
-            && let Some(item) = self.state.items.get(index)
-        {
-            self.dev.expand = None;
-            let id = item.id.clone();
-            self._handle(Action::SelectItem(id.clone()));
-            if self.dev.reveal {
-                self._send(Command::RevealSecret(id));
-            }
+        for action in self.dev.take_actions(&self.state, &self.filter) {
+            self._handle(action);
         }
-        let Some(name) = self.dev.dialog.clone() else {
-            return;
-        };
-        let locked = self.state.collections.iter().find(|c| c.locked);
-        let kind = match (name.as_str(), locked) {
-            ("new-keyring", _) => DialogKind::create_collection(),
-            ("unlock", Some(c)) => DialogKind::unlock(c.id.clone(), collection::display_name(c)),
-            _ => return,
-        };
-        self.dev.dialog = None;
-        self.dialog = Some(Dialog::new(kind));
     }
 
     /// Opens the passphrase dialog when the worker asked for one.
@@ -291,6 +264,7 @@ impl eframe::App for KringApp {
         self.copier.finish(&mut self.state);
         self._hide_locked_secret();
         self._auto_select();
+        #[cfg(debug_assertions)]
         self._apply_dev_preset();
         if self.copier.tick(Instant::now()) {
             ctx.request_repaint_after(CLIPBOARD_REPAINT);

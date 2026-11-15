@@ -4,6 +4,8 @@ pub mod app;
 pub mod app_state;
 pub mod clipboard;
 pub mod copy_flow;
+#[cfg(debug_assertions)]
+pub mod dev_preset;
 pub mod secret_display;
 pub mod startup;
 pub mod ui;

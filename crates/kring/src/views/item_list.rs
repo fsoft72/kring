@@ -186,6 +186,18 @@ fn _card(
     action
 }
 
+/// Items matching `filter` in card order. The bus lists items in no stable
+/// order, so cards are sorted by label (then id) and do not jump around.
+pub fn displayed_items<'a>(state: &'a AppState, filter: &str) -> Vec<&'a ItemInfo> {
+    let mut items: Vec<&ItemInfo> = state
+        .items
+        .iter()
+        .filter(|i| matches_filter(i, filter))
+        .collect();
+    items.sort_by_cached_key(|i| (i.label.to_lowercase(), i.id.0.clone()));
+    items
+}
+
 /// Renders the toolbar and the item cards of collection `c`.
 pub fn show(
     ui: &mut Ui,
@@ -197,13 +209,7 @@ pub fn show(
 ) -> Option<Action> {
     let mut action = _toolbar(ui, c, filter, gates);
     ui.add_space(4.0);
-    let mut items: Vec<&ItemInfo> = state
-        .items
-        .iter()
-        .filter(|i| matches_filter(i, filter))
-        .collect();
-    // The bus lists items in no stable order: sort so cards do not jump around.
-    items.sort_by_cached_key(|i| (i.label.to_lowercase(), i.id.0.clone()));
+    let items = displayed_items(state, filter);
     if items.is_empty() {
         ui.add_space(24.0);
         let text = if filter.trim().is_empty() {

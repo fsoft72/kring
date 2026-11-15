@@ -18,7 +18,9 @@ const TITLE_SIZE: f32 = 18.0;
 
 /// Main action of a dialog: button text and whether it is destructive.
 pub struct MainAction {
+    /// Button text.
     pub text: &'static str,
+    /// True for destructive actions (danger button instead of primary).
     pub danger: bool,
 }
 

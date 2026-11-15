@@ -2,6 +2,9 @@
 //!
 //! Integration tests and the `seed_dev` example may only talk to the private
 //! session started by `scripts/it-session.sh` or `scripts/dev-session.sh`.
+//!
+//! `violation_from` is pure and always compiled (the app's debug-only dev
+//! presets use it); the environment reader stays behind the `dev` feature.
 
 /// Variable set by the session scripts to their private runtime dir.
 pub const IT_RUNTIME_VAR: &str = "KRING_IT_RUNTIME";
@@ -36,6 +39,7 @@ pub fn violation_from(
 }
 
 /// Checks the current process environment; `Some(reason)` means "do not touch the bus".
+#[cfg(any(test, feature = "dev"))]
 pub fn private_session_violation() -> Option<String> {
     let it_runtime = std::env::var(IT_RUNTIME_VAR).ok();
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();

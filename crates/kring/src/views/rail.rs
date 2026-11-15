@@ -25,8 +25,11 @@ const FUTURE_AREAS: [(Ico, &str); 5] = [
 /// State of the background worker shown by the rail dot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerActivity {
+    /// Waiting for commands (OK dot).
     Idle,
+    /// A command is in flight (pulsing SECONDARY dot).
     Busy,
+    /// The worker thread is gone (ERROR dot).
     Stopped,
 }
 

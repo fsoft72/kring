@@ -23,16 +23,22 @@ const INFO_PREFIXES: [&str; 2] = ["Copied", "Backup"];
 /// Severity of a toast; selects the colour of its bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
+    /// Neutral information (SECONDARY bar).
     Info,
+    /// Success (OK bar).
     Ok,
+    /// Failure (ERROR bar, shown longer).
     Error,
 }
 
 /// One message with its expiry time.
 #[derive(Debug)]
 pub struct Toast {
+    /// Message shown.
     pub text: String,
+    /// Severity (bar colour and lifetime).
     pub kind: ToastKind,
+    /// When the toast disappears.
     pub until: Instant,
 }
 

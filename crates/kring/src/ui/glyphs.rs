@@ -14,24 +14,43 @@ const CURVE_STEPS: usize = 12;
 /// Icons available to the UI.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ico {
+    /// Show a secret.
     Eye,
+    /// Hide a secret.
     EyeOff,
+    /// Copy to the clipboard.
     Copy,
+    /// Close or clear.
     Close,
+    /// Key (Secrets area, change password).
     Key,
+    /// Closed padlock (lock, locked state).
     Lock,
+    /// Open padlock (unlock).
     Unlock,
+    /// Magnifier of search boxes.
     Search,
+    /// Set as default.
     Star,
+    /// Rename or edit.
     Pencil,
+    /// Delete.
     Trash,
+    /// Add.
     Plus,
+    /// Collapsed card.
     ChevronRight,
+    /// Expanded card.
     ChevronDown,
+    /// Offline files area.
     Folder,
+    /// KWallet area.
     Wallet,
+    /// SSH keys area.
     Terminal,
+    /// GPG keys area.
     Shield,
+    /// Tools area.
     Sliders,
 }
 

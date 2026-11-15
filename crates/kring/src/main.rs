@@ -1,7 +1,7 @@
 //! kring desktop application entry point.
 
 use eframe::egui;
-use kring::app::{DevPreset, KringApp};
+use kring::app::KringApp;
 use kring::startup::{self, Connected};
 use kring::ui::theme;
 use kring::worker::{self, WorkerConfig};
@@ -10,23 +10,6 @@ use kring::worker::{self, WorkerConfig};
 const WINDOW_SIZE: [f32; 2] = [1280.0, 800.0];
 /// Minimum window size.
 const WINDOW_MIN_SIZE: [f32; 2] = [960.0, 600.0];
-/// Set only inside the isolated dev/it sessions; gates the dev preset.
-const ENV_IT_RUNTIME: &str = "KRING_IT_RUNTIME";
-
-/// Reads the screenshot preset (`KRING_DEV_SELECT`, `KRING_DEV_EXPAND`,
-/// `KRING_DEV_REVEAL`, `KRING_DEV_DIALOG`), only inside the isolated session.
-fn _dev_preset() -> DevPreset {
-    if std::env::var_os(ENV_IT_RUNTIME).is_none() {
-        return DevPreset::default();
-    }
-    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    DevPreset {
-        select: var("KRING_DEV_SELECT"),
-        expand: var("KRING_DEV_EXPAND").and_then(|v| v.parse().ok()),
-        reveal: var("KRING_DEV_REVEAL").is_some(),
-        dialog: var("KRING_DEV_DIALOG"),
-    }
-}
 
 /// Connects to the Secret Service, starts the worker and opens the window.
 fn main() -> eframe::Result<()> {
@@ -59,7 +42,11 @@ fn main() -> eframe::Result<()> {
             let ctx = cc.egui_ctx.clone();
             let notify = move || ctx.request_repaint();
             let handle = worker::spawn(store, provider, WorkerConfig::default_paths(), notify);
-            let app = KringApp::new(handle).with_dev_preset(_dev_preset());
+            let app = KringApp::new(handle);
+            // Screenshot presets exist only in debug builds and only inside
+            // the isolated dev session (checked by `dev_preset::from_env`).
+            #[cfg(debug_assertions)]
+            let app = app.with_dev_preset(kring::dev_preset::from_env());
             Ok(Box::new(app))
         }),
     )
