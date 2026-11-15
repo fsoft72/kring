@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 kring-core = { path = "../kring-core" }
-eframe = "0.37"
+# glow (OpenGL) renderer like Paranoid: wgpu reconfigures its surface on every
+# resize step, which lags badly on X11 and shows artifacts while resizing.
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 arboard = "3.7"
 zeroize = "1.9"

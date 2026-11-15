@@ -5,3 +5,9 @@ members = ["crates/kring-core", "crates/kring"]
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+
+# Optimize dependencies (egui, epaint, glow, zbus, crypto) even in debug builds:
+# unoptimized rendering makes every frame slow and window resizing laggy.
+# kring's own crates stay at opt-level 0, so incremental builds stay fast.
+[profile.dev.package."*"]
+opt-level = 2
