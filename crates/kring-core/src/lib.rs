@@ -12,6 +12,7 @@ pub mod paths;
 pub mod provider;
 pub mod secret_service;
 pub mod store;
+pub mod transfer;
 pub mod validate;
 
 pub use error::{KringError, Result};
