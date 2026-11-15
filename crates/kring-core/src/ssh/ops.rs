@@ -29,11 +29,13 @@ pub const MSG_WRONG_KEY_PASSPHRASE: &str = "Wrong key passphrase";
 /// Error message for an encrypted key used without its passphrase.
 pub const MSG_KEY_PASSPHRASE_REQUIRED: &str = "Key passphrase required";
 /// File names in `~/.ssh` that are never SSH keys and never touched.
-pub const RESERVED_NAMES: [&str; 7] = [
+pub const RESERVED_NAMES: [&str; 9] = [
     "authorized_keys",
     "authorized_keys2",
+    "authorized_principals",
     "known_hosts",
     "known_hosts.old",
+    "known_hosts2",
     "config",
     "environment",
     "rc",
@@ -108,6 +110,25 @@ pub fn valid_key_name(name: &str) -> bool {
     }
     name.chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Loads the OpenSSH private key of `info`, decrypted with `passphrase` when it is encrypted.
+///
+/// Legacy keys are refused. A missing passphrase fails with
+/// `MSG_KEY_PASSPHRASE_REQUIRED`, a wrong one with `MSG_WRONG_KEY_PASSPHRASE`.
+pub(super) fn load_private_key(
+    info: &SshKeyInfo,
+    passphrase: Option<&SecretValue>,
+) -> Result<PrivateKey> {
+    if info.legacy_format {
+        return Err(invalid(MSG_LEGACY));
+    }
+    let path = info
+        .private_path
+        .as_ref()
+        .ok_or_else(|| invalid("No private key"))?;
+    let key = parse_private(&read_bounded(path)?)?;
+    decrypt_if_needed(&key, passphrase)
 }
 
 /// Generates a new key pair `<name>` (0600) and `<name>.pub` (0644) in `dir`.
@@ -590,6 +611,10 @@ fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let tmp = temp_sibling(path);
     create_file(&tmp, bytes, mode).map_err(|e| io_err(&tmp, e))?;
     let linked = fs::hard_link(&tmp, path);
+    if linked.is_ok() {
+        // A leftover temp file would be a second hard link to the key material.
+        return fs::remove_file(&tmp).map_err(|e| io_err(&tmp, e));
+    }
     let _ = fs::remove_file(&tmp);
     let fallback = match linked {
         Ok(()) => return Ok(()),

@@ -23,6 +23,8 @@ pbkdf2 = "0.13"
 libc = "0.2"
 # SSH key files (OpenSSH formats); no GUI or system crypto libraries.
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "p256", "p384", "rsa", "encryption", "getrandom"] }
+# Wire encoding of private keys for ssh-agent (same version as ssh-key uses).
+ssh-encoding = { version = "0.2", default-features = false, features = ["alloc"] }
 
 [features]
 fake = []

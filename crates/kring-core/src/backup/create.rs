@@ -73,7 +73,7 @@ pub struct BackupSource {
 }
 
 impl BackupSource {
-    /// A file stored encrypted unless it is a binary keyring (see [`BackupManager::create`]).
+    /// A file stored verbatim, except a plaintext `*.keyring` (no binary magic), which is age-encrypted.
     pub fn plain(path: PathBuf) -> Self {
         Self {
             path,

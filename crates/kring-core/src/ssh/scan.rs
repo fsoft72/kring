@@ -293,7 +293,7 @@ fn build_info(
 }
 
 /// Maps the `ssh-key` algorithm to [`SshAlgorithm`].
-fn algorithm_of(algorithm: Algorithm) -> SshAlgorithm {
+pub(super) fn algorithm_of(algorithm: Algorithm) -> SshAlgorithm {
     match algorithm {
         Algorithm::Ed25519 => SshAlgorithm::Ed25519,
         Algorithm::Rsa { .. } => SshAlgorithm::Rsa,

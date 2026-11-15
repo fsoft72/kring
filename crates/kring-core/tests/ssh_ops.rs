@@ -240,7 +240,10 @@ fn import_refusals() {
     assert_any_invalid(import_key(&e.ssh, &fixtures().join("id_legacy"), None));
     let link = e.other.join("link");
     std::os::unix::fs::symlink(fixtures().join("id_ed25519"), &link).unwrap();
-    assert!(import_key(&e.ssh, &link, Some("y")).is_err());
+    assert!(matches!(
+        import_key(&e.ssh, &link, Some("y")),
+        Err(KringError::InvalidInput(_))
+    ));
     assert_any_invalid(import_key(
         &e.ssh,
         &fixtures().join("id_ed25519"),
