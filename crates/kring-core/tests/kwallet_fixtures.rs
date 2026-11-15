@@ -38,7 +38,7 @@ fn salt_has_kwallet_size() {
 }
 
 /// The compat layer stored each fdo item under `<folder>/<key>` with its
-/// exact attributes; native entries have no attributes record.
+/// exact attributes.
 #[test]
 fn attributes_json_holds_compat_entries() {
     let raw = std::fs::read(_fixture("fixture_attributes.json")).expect("read attributes");
@@ -89,7 +89,8 @@ fn attributes_json_holds_compat_entries() {
     assert_eq!(blob["server"], "Streams");
     assert_eq!(blob["type"], "binary");
     assert_eq!(blob["user"], "blob");
-    for native in ["Passwords/site", "Maps/form"] {
-        assert!(!root.contains_key(native), "native entry {native} in JSON");
-    }
+    // Observed with this fixture, not a contract: `Passwords/site` and
+    // `Maps/form` have no record because `writePassword` / `writeMap` created
+    // in-memory fdo items before the unlock. A real wallet may hold records for
+    // native entries, so this is not asserted.
 }

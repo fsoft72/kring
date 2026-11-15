@@ -77,8 +77,11 @@ dbus-run-session -- bash -c '
   }
   trap stop_daemon EXIT
 
+  # Only a private bus is accepted: its socket lives under TMP_ROOT or is the
+  # fresh /tmp/dbus-* socket that dbus-run-session creates.
   case "${DBUS_SESSION_BUS_ADDRESS:-}" in
-    ""|*/run/user/*)
+    *"$TMP_ROOT"*|unix:path=/tmp/dbus-*) ;;
+    *)
       echo "kwallet-session: refusing to run on bus ${DBUS_SESSION_BUS_ADDRESS:-<unset>}" >&2
       exit 1 ;;
   esac
