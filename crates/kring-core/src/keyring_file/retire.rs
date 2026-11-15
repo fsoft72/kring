@@ -3,14 +3,19 @@
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
-use super::scan::{KeyringFileInfo, KeyringFormat};
-use crate::backup::{BackupInfo, BackupManager};
+use super::scan::{KeyringFileInfo, KeyringFormat, detect_format};
+use crate::backup::{BackupInfo, BackupManager, io_err};
 use crate::error::{KringError, Result};
 use crate::model::{CollectionId, CollectionInfo, SecretValue, decode_path_segment};
 
 /// Reason recorded on the backup made before a plaintext file is retired.
 const RETIRE_REASON: &str = "retire-plaintext";
+/// Message for a file that no longer matches the scan.
+const STALE_MESSAGE: &str = "File changed since scan, rescan first";
+/// Extension of keyring files.
+const KEYRING_EXTENSION: &str = "keyring";
 /// Object path prefix of real (non-alias) collections.
 const COLLECTION_PREFIX: &str = "/org/freedesktop/secrets/collection/";
 
@@ -41,12 +46,16 @@ pub fn retire_mode(info: &KeyringFileInfo, live: &[CollectionInfo]) -> RetireMod
 /// Backs up a plaintext keyring file (age-encrypted with `passphrase`) and then deletes it.
 ///
 /// Preconditions, each failing with `InvalidInput`: the mode is `DeleteFile`
-/// (re-checked against `live`), the file is plaintext and not binary, and it is
-/// unchanged since the scan (size and mtime). The file is removed only after the
-/// backup manifest lists it with the sha256 of its current content.
+/// (re-checked against `live`); the path is a regular `*.keyring` file (not a
+/// symlink) directly inside `keyrings_dir`; `info.plaintext` is set and the
+/// bytes on disk are not a binary keyring (decided from the bytes, not from
+/// `info`); the file is unchanged since the scan (size and mtime, checked
+/// again right before the unlink). The file is removed only after the backup
+/// manifest lists it as encrypted with the sha256 of its current content.
 pub fn retire_file(
     manager: &BackupManager,
     info: &KeyringFileInfo,
+    keyrings_dir: &Path,
     live: &[CollectionInfo],
     passphrase: &SecretValue,
 ) -> Result<BackupInfo> {
@@ -58,41 +67,80 @@ pub fn retire_file(
     if !info.plaintext {
         return Err(invalid("Only plaintext keyring files can be retired"));
     }
-    if info.format == KeyringFormat::BinaryV0 {
+    check_location(info, keyrings_dir)?;
+    check_unchanged(info)?;
+    let bytes = Zeroizing::new(std::fs::read(&info.path).map_err(|e| io_err(&info.path, e))?);
+    if detect_format(&bytes) == KeyringFormat::BinaryV0 {
         return Err(invalid("Binary keyring files cannot be retired"));
     }
-    check_unchanged(info)?;
-    let bytes = std::fs::read(&info.path).map_err(|e| io_err(&info.path, e))?;
-    let digest = hex::encode(Sha256::digest(&bytes));
+    let digest = hex::encode(Sha256::digest(bytes.as_slice()));
     let backup = manager.create(
         RETIRE_REASON,
         std::slice::from_ref(&info.path),
         Some(passphrase),
     )?;
-    let listed = backup
-        .files
-        .iter()
-        .any(|f| f.original == info.path && f.sha256 == digest);
-    if !listed {
-        return Err(invalid(
-            "Backup does not list the file with the expected checksum, file kept",
-        ));
-    }
+    verify_backup(&backup, &info.path, &digest)?;
+    check_unchanged(info)?;
     std::fs::remove_file(&info.path).map_err(|e| io_err(&info.path, e))?;
     Ok(backup)
 }
 
+/// Fails unless the manifest lists `path` as encrypted with the given sha256.
+fn verify_backup(backup: &BackupInfo, path: &Path, digest: &str) -> Result<()> {
+    let Some(entry) = backup
+        .files
+        .iter()
+        .find(|f| f.original == path && f.sha256 == digest)
+    else {
+        return Err(invalid(
+            "Backup does not list the file with the expected checksum, file kept",
+        ));
+    };
+    if !entry.encrypted {
+        return Err(invalid("Backup not encrypted, file kept"));
+    }
+    Ok(())
+}
+
+/// Fails unless `info.path` is a non-symlink `*.keyring` file directly in `keyrings_dir`.
+fn check_location(info: &KeyringFileInfo, keyrings_dir: &Path) -> Result<()> {
+    if info.path.extension().is_none_or(|e| e != KEYRING_EXTENSION) {
+        return Err(invalid("Only .keyring files can be retired"));
+    }
+    let meta = std::fs::symlink_metadata(&info.path).map_err(|e| meta_err(&info.path, e))?;
+    if !meta.file_type().is_file() {
+        return Err(invalid("Keyring path is not a regular file"));
+    }
+    let parent = info
+        .path
+        .parent()
+        .ok_or_else(|| invalid("Keyring path has no parent directory"))?;
+    let parent = std::fs::canonicalize(parent).map_err(|e| io_err(parent, e))?;
+    let dir = std::fs::canonicalize(keyrings_dir).map_err(|e| io_err(keyrings_dir, e))?;
+    if parent != dir {
+        return Err(invalid("Keyring file is outside the keyrings directory"));
+    }
+    Ok(())
+}
+
+/// Maps a metadata error: a vanished file means the scan is stale, anything else is I/O.
+fn meta_err(path: &Path, e: std::io::Error) -> KringError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return invalid(STALE_MESSAGE);
+    }
+    io_err(path, e)
+}
+
 /// Fails unless the file on disk still has the size and mtime recorded at scan time.
 fn check_unchanged(info: &KeyringFileInfo) -> Result<()> {
-    let stale = || invalid("File changed since scan, rescan first");
-    let meta = std::fs::metadata(&info.path).map_err(|_| stale())?;
+    let meta = std::fs::metadata(&info.path).map_err(|e| meta_err(&info.path, e))?;
     let modified = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
     if meta.len() != info.size || modified != info.modified {
-        return Err(stale());
+        return Err(invalid(STALE_MESSAGE));
     }
     Ok(())
 }
@@ -100,11 +148,6 @@ fn check_unchanged(info: &KeyringFileInfo) -> Result<()> {
 /// Builds an `InvalidInput` error.
 fn invalid(msg: &str) -> KringError {
     KringError::InvalidInput(msg.to_string())
-}
-
-/// Wraps an I/O error with the path.
-fn io_err(path: &Path, e: std::io::Error) -> KringError {
-    KringError::InvalidInput(format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -166,45 +209,119 @@ mod tests {
         assert_eq!(retire_mode(&info, &[]), RetireMode::DeleteFile);
     }
 
+    /// Default call: keyrings dir is the parent of the file.
+    fn retire(
+        mgr: &BackupManager,
+        info: &KeyringFileInfo,
+        live: &[CollectionInfo],
+    ) -> Result<BackupInfo> {
+        let dir = info.path.parent().unwrap().to_path_buf();
+        retire_file(mgr, info, &dir, live, &SecretValue::from_text("pw"))
+    }
+
     /// The backup is made and verified before the file is removed.
     #[test]
     fn retire_backs_up_then_deletes() {
         let (_t, info, mgr) = fixture("old.keyring", PLAIN.as_bytes());
         let pass = SecretValue::from_text("pw");
-        let backup = retire_file(&mgr, &info, &[], &pass).unwrap();
+        let backup = retire(&mgr, &info, &[]).unwrap();
         assert!(!info.path.exists());
         assert_eq!(backup.reason, RETIRE_REASON);
         assert!(backup.files[0].encrypted);
+        assert_eq!(
+            backup.files[0].sha256,
+            hex::encode(Sha256::digest(PLAIN.as_bytes()))
+        );
         let plain =
             crate::backup::read_backup_file(&backup, &backup.files[0], Some(&pass)).unwrap();
         assert_eq!(plain.as_slice(), PLAIN.as_bytes());
     }
 
-    /// Binary, live and stale files are refused and kept.
+    /// Asserts a refusal with `InvalidInput`, a kept file and no backup root.
+    fn assert_refused(r: Result<BackupInfo>, info: &KeyringFileInfo, mgr: &BackupManager) {
+        assert!(matches!(r, Err(KringError::InvalidInput(_))), "{r:?}");
+        assert!(info.path.exists());
+        assert!(!mgr.root.exists());
+    }
+
+    /// Binary files are refused, from the bytes even when `info` claims plaintext.
     #[test]
     fn retire_refuses_binary() {
         let mut bin = crate::backup::KEYRING_MAGIC.to_vec();
         bin.extend_from_slice(b"payload");
-        let (_t, info, mgr) = fixture("b.keyring", &bin);
+        let (_t, mut info, mgr) = fixture("b.keyring", &bin);
+        assert_refused(retire(&mgr, &info, &[]), &info, &mgr);
+        info.plaintext = true;
+        info.format = KeyringFormat::Textual;
+        assert_refused(retire(&mgr, &info, &[]), &info, &mgr);
+    }
+
+    /// Live collections and `plaintext == false` are refused.
+    #[test]
+    fn retire_refuses_live_and_not_plaintext() {
+        let (_t, mut info, mgr) = fixture("p.keyring", PLAIN.as_bytes());
+        let live = [coll("/org/freedesktop/secrets/collection/p")];
+        assert_refused(retire(&mgr, &info, &live), &info, &mgr);
+        info.plaintext = false;
+        assert_refused(retire(&mgr, &info, &[]), &info, &mgr);
+    }
+
+    /// Non-`.keyring` paths are refused even when flagged plaintext.
+    #[test]
+    fn retire_refuses_other_extension() {
+        let (_t, mut info, mgr) = fixture("a.keyring", PLAIN.as_bytes());
+        let other = info.path.with_file_name("notes.txt");
+        std::fs::rename(&info.path, &other).unwrap();
+        info.path = other;
+        info.plaintext = true;
+        assert_refused(retire(&mgr, &info, &[]), &info, &mgr);
+    }
+
+    /// Files outside the keyrings dir and symlinks are refused.
+    #[test]
+    fn retire_refuses_outside_dir_and_symlink() {
+        let (tmp, info, mgr) = fixture("a.keyring", PLAIN.as_bytes());
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
         let pass = SecretValue::from_text("pw");
-        let err = retire_file(&mgr, &info, &[], &pass).unwrap_err();
-        assert!(matches!(err, KringError::InvalidInput(_)));
+        let r = retire_file(&mgr, &info, &other, &[], &pass);
+        assert_refused(r, &info, &mgr);
+
+        let dir = info.path.parent().unwrap().to_path_buf();
+        let target = tmp.path().join("target.keyring");
+        std::fs::write(&target, PLAIN).unwrap();
+        let link = dir.join("link.keyring");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut linked = info.clone();
+        linked.path = link;
+        linked.name = "link".into();
+        let r = retire_file(&mgr, &linked, &dir, &[], &pass);
+        assert_refused(r, &linked, &mgr);
+        assert!(target.exists());
+    }
+
+    /// A file changed after the scan (size, or mtime only) is refused.
+    #[test]
+    fn retire_refuses_changed_since_scan() {
+        let (_t, info, mgr) = fixture("c.keyring", PLAIN.as_bytes());
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&info.path)
+            .unwrap();
+        f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.modified + 100))
+            .unwrap();
+        drop(f);
+        let err = retire(&mgr, &info, &[]).unwrap_err();
+        assert!(err.to_string().contains("File changed since scan"));
         assert!(info.path.exists());
         assert!(!mgr.root.exists());
 
-        let (_t, info, mgr) = fixture("p.keyring", PLAIN.as_bytes());
-        let live = [coll("/org/freedesktop/secrets/collection/p")];
-        assert!(matches!(
-            retire_file(&mgr, &info, &live, &pass),
-            Err(KringError::InvalidInput(_))
-        ));
+        let (_t, info, mgr) = fixture("d.keyring", PLAIN.as_bytes());
         std::fs::write(&info.path, format!("{PLAIN}extra=1\n")).unwrap();
-        let err = retire_file(&mgr, &info, &[], &pass).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            KringError::InvalidInput("File changed since scan, rescan first".into()).to_string()
-        );
-        assert!(info.path.exists());
+        assert_refused(retire(&mgr, &info, &[]), &info, &mgr);
+        std::fs::remove_file(&info.path).unwrap();
+        let err = retire(&mgr, &info, &[]).unwrap_err();
+        assert!(err.to_string().contains("File changed since scan"));
     }
 
     /// A failing backup leaves the file in place.
@@ -217,8 +334,43 @@ mod tests {
             root: blocker.join("sub"),
             keep: 20,
         };
-        let pass = SecretValue::from_text("pw");
-        assert!(retire_file(&mgr, &info, &[], &pass).is_err());
+        assert!(retire(&mgr, &info, &[]).is_err());
         assert!(info.path.exists());
+    }
+
+    /// The manifest check fails closed on a missing, mismatching or unencrypted entry.
+    ///
+    /// A real `BackupManager` always lists the file it was given, so the guard
+    /// is exercised directly with fabricated manifests.
+    #[test]
+    fn verify_backup_fails_closed() {
+        let path = std::path::PathBuf::from("/x/a.keyring");
+        let entry = |original: &str, sha: &str, encrypted: bool| crate::backup::BackupFile {
+            original: original.into(),
+            stored: "/b/a.keyring.age".into(),
+            sha256: sha.into(),
+            encrypted,
+        };
+        let backup = |files| BackupInfo {
+            dir: "/b".into(),
+            reason: RETIRE_REASON.into(),
+            created: String::new(),
+            files,
+            seq: 1,
+            prune_warning: None,
+        };
+        let msg = |b: &BackupInfo| verify_backup(b, &path, "abc").unwrap_err().to_string();
+        assert!(msg(&backup(vec![])).contains("does not list"));
+        assert!(msg(&backup(vec![entry("/x/other", "abc", true)])).contains("does not list"));
+        assert!(msg(&backup(vec![entry("/x/a.keyring", "zzz", true)])).contains("does not list"));
+        assert!(msg(&backup(vec![entry("/x/a.keyring", "abc", false)])).contains("not encrypted"));
+        assert!(
+            verify_backup(
+                &backup(vec![entry("/x/a.keyring", "abc", true)]),
+                &path,
+                "abc"
+            )
+            .is_ok()
+        );
     }
 }
