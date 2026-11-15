@@ -90,6 +90,37 @@ impl BackupSource {
     }
 }
 
+/// One in-memory content to back up (never written to disk in clear).
+///
+/// Used for data that has no file of its own, such as a gpg key export. The
+/// backup manifest records `original` as the source path; since that path is
+/// not a real file, the backup counts as holding the only copy and is never
+/// pruned (see [`BackupManager::prune_into`]).
+#[derive(Clone, Debug)]
+pub struct MemoryEntry {
+    /// File name of the copy in the backup (a plain name, e.g. `<fpr>.secret.asc`).
+    pub name: String,
+    /// Informational source path recorded in the manifest (must be unique per backup).
+    pub original: PathBuf,
+    /// Content to back up.
+    pub bytes: Zeroizing<Vec<u8>>,
+    /// True when the content is secret in clear: the stored copy is then
+    /// always age-encrypted.
+    pub sensitive: bool,
+}
+
+/// One content ready to be written into a backup.
+struct Prepared {
+    /// Source path recorded in the manifest.
+    original: PathBuf,
+    /// File name of the copy (before the `.age` suffix).
+    name: String,
+    /// Whether the copy is age-encrypted.
+    encrypt: bool,
+    /// Content.
+    bytes: Zeroizing<Vec<u8>>,
+}
+
 /// Creates, lists and prunes backups under a root directory.
 #[derive(Clone, Debug)]
 pub struct BackupManager {
@@ -212,6 +243,35 @@ fn is_pinned(info: &BackupInfo) -> bool {
         .any(|f| fs::symlink_metadata(&f.original).is_err())
 }
 
+/// Refuses memory entries whose names are not plain, distinct file names, or
+/// whose originals are not distinct.
+fn check_memory_entries(entries: &[MemoryEntry]) -> Result<()> {
+    for (i, entry) in entries.iter().enumerate() {
+        let name = entry.name.as_str();
+        let plain = !name.is_empty()
+            && name != "."
+            && name != ".."
+            && name != MANIFEST_NAME
+            && !name.contains('/')
+            && !name.contains('\0');
+        if !plain {
+            return Err(KringError::InvalidInput(format!(
+                "Invalid backup entry name {name:?}"
+            )));
+        }
+        let rest = &entries[i + 1..];
+        if rest
+            .iter()
+            .any(|e| e.name == entry.name || e.original == entry.original)
+        {
+            return Err(KringError::InvalidInput(format!(
+                "Duplicate backup entry {name:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Manifest header fields of a backup being written.
 struct Header<'a> {
     /// Sanitized reason.
@@ -263,6 +323,34 @@ impl BackupManager {
         Ok(info)
     }
 
+    /// Creates a backup of in-memory `entries`, pruning old backups afterwards.
+    ///
+    /// Sensitive entries are age-encrypted with `passphrase` (missing:
+    /// `PassphraseRequired`, before anything is written); other entries are
+    /// stored verbatim. Entry names must be plain, distinct file names (not
+    /// the manifest name) and originals distinct, else `InvalidInput`. Nothing
+    /// is ever written in clear outside the stored copies of non-sensitive entries.
+    pub fn create_from_memory(
+        &self,
+        reason: &str,
+        entries: &[MemoryEntry],
+        passphrase: Option<&SecretValue>,
+    ) -> Result<BackupInfo> {
+        check_memory_entries(entries)?;
+        let prepared = entries
+            .iter()
+            .map(|e| Prepared {
+                original: e.original.clone(),
+                name: e.name.clone(),
+                encrypt: e.sensitive,
+                bytes: e.bytes.clone(),
+            })
+            .collect();
+        let mut info = self.create_prepared(reason, prepared, passphrase)?;
+        self.prune_into(&[], &mut info);
+        Ok(info)
+    }
+
     /// Like [`BackupManager::create`], but never prunes old backups.
     pub(crate) fn create_unpruned(
         &self,
@@ -274,7 +362,7 @@ impl BackupManager {
         self.create_sources_unpruned(reason, &sources, passphrase)
     }
 
-    /// Writes one backup of `files` without pruning (shared by all `create*` methods).
+    /// Writes one backup of `files` without pruning (shared by the file `create*` methods).
     fn create_sources_unpruned(
         &self,
         reason: &str,
@@ -282,15 +370,35 @@ impl BackupManager {
         passphrase: Option<&SecretValue>,
     ) -> Result<BackupInfo> {
         // Read everything and validate before touching the filesystem.
-        let mut sources = Vec::new();
+        let mut prepared = Vec::new();
         for source in files {
             let path = &source.path;
             let bytes = Zeroizing::new(fs::read(path).map_err(|e| io_err(path, e))?);
             let is_keyring = path.extension().is_some_and(|e| e == KEYRING_EXT);
             let encrypt = source.sensitive || (is_keyring && is_plaintext_keyring(&bytes));
-            sources.push((path, encrypt, bytes));
+            let name = path
+                .file_name()
+                .ok_or_else(|| KringError::InvalidInput(format!("bad path {}", path.display())))?
+                .to_string_lossy()
+                .into_owned();
+            prepared.push(Prepared {
+                original: path.clone(),
+                name,
+                encrypt,
+                bytes,
+            });
         }
-        let secret = if sources.iter().any(|s| s.1) {
+        self.create_prepared(reason, prepared, passphrase)
+    }
+
+    /// Writes one backup of prepared contents without pruning.
+    fn create_prepared(
+        &self,
+        reason: &str,
+        sources: Vec<Prepared>,
+        passphrase: Option<&SecretValue>,
+    ) -> Result<BackupInfo> {
+        let secret = if sources.iter().any(|s| s.encrypt) {
             let pass = passphrase.ok_or(KringError::PassphraseRequired)?;
             let text = pass
                 .as_text()
@@ -361,31 +469,27 @@ impl BackupManager {
         tmp_dir: &Path,
         final_dir: &Path,
         header: Header<'_>,
-        sources: &[(&PathBuf, bool, Zeroizing<Vec<u8>>)],
+        sources: &[Prepared],
         secret: Option<SecretString>,
     ) -> Result<BackupInfo> {
         mkdir_private(tmp_dir)?;
         let mut entries = Vec::new();
-        for (path, encrypt, bytes) in sources {
-            let name = path
-                .file_name()
-                .ok_or_else(|| KringError::InvalidInput(format!("bad path {}", path.display())))?
-                .to_string_lossy()
-                .into_owned();
-            let (stored_name, encrypted) = match (encrypt, &secret) {
-                (true, Some(pass)) => {
-                    (format!("{name}.age"), Some(encrypt_age(bytes, pass, path)?))
-                }
-                _ => (name, None),
+        for source in sources {
+            let (stored_name, encrypted) = match (source.encrypt, &secret) {
+                (true, Some(pass)) => (
+                    format!("{}.age", source.name),
+                    Some(encrypt_age(&source.bytes, pass, &source.original)?),
+                ),
+                _ => (source.name.clone(), None),
             };
             // Binary keyrings are written straight from the zeroized source buffer.
-            let data: &[u8] = encrypted.as_deref().unwrap_or(bytes);
+            let data: &[u8] = encrypted.as_deref().unwrap_or(&source.bytes);
             write_private(&tmp_dir.join(&stored_name), data)?;
             entries.push(BackupFile {
-                original: (*path).clone(),
+                original: source.original.clone(),
                 stored: final_dir.join(&stored_name),
-                sha256: hex::encode(Sha256::digest(bytes.as_slice())),
-                encrypted: *encrypt,
+                sha256: hex::encode(Sha256::digest(source.bytes.as_slice())),
+                encrypted: source.encrypt,
             });
         }
         let info = BackupInfo {
@@ -834,6 +938,86 @@ mod tests {
         let info = mgr.create_with("t", &sources, Some(&pass)).unwrap();
         let flags: Vec<bool> = info.files.iter().map(|f| f.encrypted).collect();
         assert_eq!(flags, [false, true, false]);
+    }
+
+    /// A memory entry named `name` with `bytes`, its original below `/nonexistent`.
+    fn memory(name: &str, bytes: &[u8], sensitive: bool) -> MemoryEntry {
+        MemoryEntry {
+            name: name.into(),
+            original: PathBuf::from("/nonexistent/kring-test").join(name),
+            bytes: Zeroizing::new(bytes.to_vec()),
+            sensitive,
+        }
+    }
+
+    /// Memory entries are stored like files: sensitive ones age-encrypted, others verbatim.
+    #[test]
+    fn memory_entries_are_backed_up() {
+        let (_t, mgr, _src) = setup(20);
+        let secret = b"-----BEGIN PGP PRIVATE KEY BLOCK-----\nsecret\n";
+        let entries = [
+            memory("k.public.asc", b"public", false),
+            memory("k.secret.asc", secret, true),
+        ];
+        let pass = SecretValue::from_text("hunter2");
+        let info = mgr
+            .create_from_memory("delete-gpg-key", &entries, Some(&pass))
+            .unwrap();
+        assert_eq!(info.reason, "delete-gpg-key");
+        let (p, k) = (&info.files[0], &info.files[1]);
+        assert_eq!(p.original, entries[0].original);
+        assert!(!p.encrypted && k.encrypted);
+        assert_eq!(fs::read(&p.stored).unwrap(), b"public");
+        assert_eq!(k.stored.file_name().unwrap(), "k.secret.asc.age");
+        assert_eq!(k.sha256, hex::encode(Sha256::digest(secret)));
+        let stored = fs::read(&k.stored).unwrap();
+        assert!(!stored.windows(6).any(|w| w == b"secret"));
+        let got = crate::backup::read_backup_file(&info, k, Some(&pass)).unwrap();
+        assert_eq!(got.as_slice(), secret);
+        assert_eq!(mgr.list().unwrap(), vec![info]);
+    }
+
+    /// A sensitive memory entry without a passphrase fails and writes nothing.
+    #[test]
+    fn memory_sensitive_requires_passphrase() {
+        let (_t, mgr, _src) = setup(20);
+        let entries = [memory("k.secret.asc", b"secret", true)];
+        let err = mgr.create_from_memory("t", &entries, None).unwrap_err();
+        assert!(matches!(err, KringError::PassphraseRequired));
+        assert!(!mgr.root.exists());
+    }
+
+    /// Bad or duplicate entry names and duplicate originals are refused before writing.
+    #[test]
+    fn memory_entry_names_are_checked() {
+        let (_t, mgr, _src) = setup(20);
+        for bad in ["", ".", "..", "a/b", MANIFEST_NAME, "a\0b"] {
+            let r = mgr.create_from_memory("t", &[memory(bad, b"x", false)], None);
+            assert!(matches!(r, Err(KringError::InvalidInput(_))), "{bad:?}");
+        }
+        let twice = [memory("a", b"x", false), memory("a", b"y", false)];
+        let r = mgr.create_from_memory("t", &twice, None);
+        assert!(matches!(r, Err(KringError::InvalidInput(_))));
+        let mut same_original = [memory("a", b"x", false), memory("b", b"y", false)];
+        same_original[1].original = same_original[0].original.clone();
+        let r = mgr.create_from_memory("t", &same_original, None);
+        assert!(matches!(r, Err(KringError::InvalidInput(_))));
+        assert!(!mgr.root.exists());
+    }
+
+    /// Memory backups have no real original, so they are pinned and never pruned.
+    #[test]
+    fn memory_backups_are_pinned() {
+        let (_t, mgr, src) = setup(1);
+        let pinned = mgr
+            .create_from_memory("t", &[memory("k.public.asc", b"public", false)], None)
+            .unwrap();
+        let f = binary_file(&src, "a.keyring");
+        for _ in 0..3 {
+            mgr.create("t", std::slice::from_ref(&f), None).unwrap();
+        }
+        assert!(pinned.dir.join(MANIFEST_NAME).exists());
+        assert_eq!(mgr.list().unwrap().len(), 2);
     }
 
     /// Magic detection.

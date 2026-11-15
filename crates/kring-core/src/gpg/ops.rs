@@ -5,17 +5,14 @@
 //! the runner's pipes (loopback pinentry). Destructive operations first back the
 //! key up: the armored public export, and for secret keys the armored secret
 //! export, which is always age-encrypted in the backup (an unprotected key exports
-//! in clear). The exports are staged in a private directory below the backup root
-//! and removed afterwards; the backup is read back and checked before gpg is
-//! asked to change or delete anything. Because the staged originals are removed,
-//! these backups count as holding the only copy and are never pruned.
+//! in clear). The exports are fed to the backup from memory, so an unprotected
+//! secret key never touches the disk in clear; the backup is read back and checked
+//! before gpg is asked to change or delete anything. The manifest records
+//! `<gnupg home>/<file name>` as the original of each export, which is not a real
+//! file, so these backups count as holding the only copy and are never pruned.
 
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -26,7 +23,7 @@ use super::runner::{
     GpgOutput, GpgRunner, MAX_OUTPUT, MSG_PASSPHRASE_NEWLINE, Reply, TIMEOUT_DEFAULT,
     TIMEOUT_KEYGEN,
 };
-use crate::backup::{BackupInfo, BackupManager, BackupSource, io_err, read_backup_file};
+use crate::backup::{BackupInfo, BackupManager, MemoryEntry, read_backup_file};
 use crate::error::{KringError, Result};
 use crate::keyring_file::retire::verify_backup_entry;
 use crate::model::SecretValue;
@@ -84,8 +81,8 @@ const PROMPT_PASSPHRASE: &str = "GET_HIDDEN passphrase.enter";
 /// Prefix of every status prompt.
 const PROMPT_PREFIX: &str = "GET_";
 
-/// Most passphrase prompts answered during one `--passwd` (old, new, per subkey).
-const MAX_PROMPTS: usize = 6;
+/// Upper bound of the passphrase prompts answered during one `--passwd`, whatever the key.
+const MAX_PROMPTS_CAP: usize = 64;
 
 /// First line of an armored public key export.
 const PUBLIC_ARMOR: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
@@ -102,17 +99,8 @@ const MAX_EXPIRE_LEN: usize = 32;
 /// Expiration value for keys that never expire.
 const NEVER: &str = "never";
 
-/// Prefix of the staging directories below the backup root.
-const STAGING_PREFIX: &str = ".gpg-export-";
-
-/// Suffix of the staging directories (the backup scanner skips it).
-const STAGING_SUFFIX: &str = ".tmp";
-
-/// Mode of staging directories.
-const STAGING_DIR_MODE: u32 = 0o700;
-
-/// Mode of staged export files.
-const STAGING_FILE_MODE: u32 = 0o600;
+/// GnuPG home directory below `$HOME` used by gpg when none is configured.
+const DEFAULT_GNUPG_DIR: &str = ".gnupg";
 
 /// Agent KEYINFO type of a key stored on disk.
 const KEYINFO_DISK: &str = "D";
@@ -122,9 +110,6 @@ const KEYINFO_PROTECTED: &str = "P";
 
 /// Agent KEYINFO protection flag of an unprotected key.
 const KEYINFO_CLEAR: &str = "C";
-
-/// Counter making staging directory names unique within the process.
-static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Algorithms offered for new keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -308,6 +293,10 @@ pub fn export_secret(
 /// with `backup_passphrase`, which is required) and the backup is verified;
 /// then gpg `--passwd` is driven over the command fd, answering its passphrase
 /// prompts with the old passphrase first (protected keys only), then the new one.
+///
+/// The outer error means nothing was backed up or changed. Once the backup is
+/// written it is always returned, with the outcome of the change beside it, so
+/// a caller can report the backup even when gpg then failed.
 pub fn change_passphrase(
     runner: &GpgRunner,
     manager: &BackupManager,
@@ -315,7 +304,7 @@ pub fn change_passphrase(
     old: Option<&SecretValue>,
     new: &SecretValue,
     backup_passphrase: Option<&SecretValue>,
-) -> Result<BackupInfo> {
+) -> Result<(BackupInfo, Result<()>)> {
     let fpr = check_fingerprint(fpr)?;
     if new.is_empty() {
         return Err(invalid(MSG_EMPTY_PASSPHRASE));
@@ -338,15 +327,19 @@ pub fn change_passphrase(
         true => Some(old.ok_or_else(|| invalid(MSG_GPG_PASSPHRASE_REQUIRED))?),
         false => None,
     };
+    let protected = old.is_some();
     let backup = backup_key(runner, manager, &key, CHANGE_REASON, old, backup_passphrase)?;
-    let out = passwd(runner, &fpr, old, new)?;
-    if let Some(e) = passphrase_error(&out, true) {
-        return Err(e);
-    }
-    if !out.success() || !out.has_status("SUCCESS") {
-        return Err(failed("passphrase change", &out));
-    }
-    Ok(backup)
+    let max_prompts = max_prompts(&key, protected);
+    let result = passwd(runner, &fpr, old, new, max_prompts).and_then(|out| {
+        if let Some(e) = passphrase_error(&out, true) {
+            return Err(e);
+        }
+        if !out.success() || !out.has_status("SUCCESS") {
+            return Err(failed("passphrase change", &out));
+        }
+        Ok(())
+    });
+    Ok((backup, result))
 }
 
 /// Deletes the key `fpr` (secret and public) after a verified backup.
@@ -358,13 +351,16 @@ pub fn change_passphrase(
 /// is age-encrypted with `backup_passphrase`, which is then required. Reason
 /// `delete-gpg-key`. The key is deleted by full fingerprint only after the
 /// backup was read back and the key is still the one backed up.
+///
+/// As with [`change_passphrase`], the outer error means nothing was backed up
+/// or deleted; once written, the backup is returned with the outcome of the delete.
 pub fn delete_key(
     runner: &GpgRunner,
     manager: &BackupManager,
     fpr: &str,
     passphrase_for_backup: Option<&SecretValue>,
     backup_passphrase: Option<&SecretValue>,
-) -> Result<BackupInfo> {
+) -> Result<(BackupInfo, Result<()>)> {
     let fpr = check_fingerprint(fpr)?;
     let key = require_key(runner, &fpr)?;
     if key.secret && !key.primary_secret {
@@ -381,8 +377,15 @@ pub fn delete_key(
         passphrase_for_backup,
         backup_passphrase,
     )?;
-    let now = require_key(runner, &fpr)?;
-    if now != key {
+    let result = delete_backed_up(runner, &key);
+    Ok((backup, result))
+}
+
+/// Deletes `key` (already backed up) by full fingerprint, if it did not change meanwhile.
+fn delete_backed_up(runner: &GpgRunner, key: &GpgKey) -> Result<()> {
+    let fpr = &key.fingerprint;
+    let now = require_key(runner, fpr)?;
+    if &now != key {
         return Err(invalid(MSG_STALE));
     }
     let out = runner.run(
@@ -402,12 +405,12 @@ pub fn delete_key(
     if !out.success() {
         return Err(failed("key deletion", &out));
     }
-    if find_key(runner, &fpr)?.is_some() {
+    if find_key(runner, fpr)?.is_some() {
         return Err(KringError::Gpg(format!(
             "key {fpr} is still listed after deletion"
         )));
     }
-    Ok(backup)
+    Ok(())
 }
 
 /// The key `fpr` as listed now, if any.
@@ -469,34 +472,66 @@ fn backup_key(
         true => Some(secret_export(runner, fpr, key_passphrase)?),
         false => None,
     };
-    let staging = Staging::new(&manager.root)?;
-    // (staged path, sensitive, sha256 of the exported bytes)
-    let mut files: Vec<(PathBuf, bool, String)> = Vec::new();
-    let path = staging.write(&format!("{fpr}.public.asc"), public.as_bytes())?;
-    files.push((path, false, sha256_hex(public.as_bytes())));
-    if let Some(secret) = &secret {
-        let path = staging.write(&format!("{fpr}.secret.asc"), secret)?;
-        files.push((path, true, sha256_hex(secret)));
+    let home = gnupg_home(runner);
+    let entry = |suffix: &str, bytes: Zeroizing<Vec<u8>>, sensitive: bool| {
+        let name = format!("{fpr}.{suffix}");
+        MemoryEntry {
+            original: home.join(&name),
+            name,
+            bytes,
+            sensitive,
+        }
+    };
+    let mut entries = vec![entry(
+        "public.asc",
+        Zeroizing::new(public.into_bytes()),
+        false,
+    )];
+    if let Some(secret) = secret {
+        entries.push(entry("secret.asc", secret, true));
     }
-    let sources: Vec<BackupSource> = files
-        .iter()
-        .map(|(path, sensitive, _)| BackupSource {
-            path: path.clone(),
-            sensitive: *sensitive,
-        })
-        .collect();
-    let backup = manager.create_with(reason, &sources, backup_passphrase)?;
-    for (path, sensitive, digest) in &files {
-        verify_backup_entry(&backup, path, digest, *sensitive)?;
-        let entry = backup
+    let backup = manager.create_from_memory(reason, &entries, backup_passphrase)?;
+    for entry in &entries {
+        let digest = sha256_hex(&entry.bytes);
+        verify_backup_entry(&backup, &entry.original, &digest, entry.sensitive)?;
+        let file = backup
             .files
             .iter()
-            .find(|f| &f.original == path)
+            .find(|f| f.original == entry.original)
             .ok_or_else(|| invalid("Backup does not list the key export, key kept"))?;
         // Decrypts age copies and checks the sha256 again, from the stored file.
-        read_backup_file(&backup, entry, backup_passphrase)?;
+        read_backup_file(&backup, file, backup_passphrase)?;
     }
     Ok(backup)
+}
+
+/// GnuPG home recorded as the (informational) original of backed up exports.
+///
+/// The runner's home, else `GNUPGHOME`, else `$HOME/.gnupg` (gpg's default),
+/// else `/.gnupg`.
+fn gnupg_home(runner: &GpgRunner) -> PathBuf {
+    if let Some(dir) = runner.homedir() {
+        return dir.to_path_buf();
+    }
+    let absolute = |var: &str| {
+        std::env::var_os(var)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    if let Some(dir) = absolute("GNUPGHOME") {
+        return dir;
+    }
+    absolute("HOME")
+        .unwrap_or_else(|| PathBuf::from("/"))
+        .join(DEFAULT_GNUPG_DIR)
+}
+
+/// Most passphrase prompts a `--passwd` of `key` may ask: one per key (primary
+/// and subkeys) plus the old passphrase of a protected key, at most [`MAX_PROMPTS_CAP`].
+fn max_prompts(key: &GpgKey, protected: bool) -> usize {
+    let keys = key.subkeys.len().saturating_add(1);
+    keys.saturating_add(usize::from(protected))
+        .min(MAX_PROMPTS_CAP)
 }
 
 /// Runs `gpg --passwd` for `fpr`, answering passphrase prompts over the command fd.
@@ -504,18 +539,19 @@ fn backup_key(
 /// The first prompt gets `old` when the key is protected; every other prompt
 /// gets `new` (gpg asks once per unprotected key, and after the old passphrase
 /// of a protected key only once for the new one). Any other prompt, or more
-/// than [`MAX_PROMPTS`] passphrase prompts, closes the command fd so gpg fails.
+/// than `max_prompts` passphrase prompts, closes the command fd so gpg fails.
 fn passwd(
     runner: &GpgRunner,
     fpr: &str,
     old: Option<&SecretValue>,
     new: &SecretValue,
+    max_prompts: usize,
 ) -> Result<GpgOutput> {
     let mut prompts = 0;
     let mut responder = |line: &str| {
         if line == PROMPT_PASSPHRASE {
             prompts += 1;
-            return passwd_answer(prompts, old, new);
+            return passwd_answer(prompts, max_prompts, old, new);
         }
         if line.starts_with(PROMPT_PREFIX) {
             return Reply::Close;
@@ -525,9 +561,14 @@ fn passwd(
     runner.run_interactive(["--passwd", "--", fpr], &mut responder, TIMEOUT_DEFAULT)
 }
 
-/// The answer to the `n`th (1-based) passphrase prompt of `--passwd`.
-fn passwd_answer<'a>(n: usize, old: Option<&'a SecretValue>, new: &'a SecretValue) -> Reply<'a> {
-    if n > MAX_PROMPTS {
+/// The answer to the `n`th (1-based) passphrase prompt of `--passwd`; past `max` it gives up.
+fn passwd_answer<'a>(
+    n: usize,
+    max: usize,
+    old: Option<&'a SecretValue>,
+    new: &'a SecretValue,
+) -> Reply<'a> {
+    if n > max {
         return Reply::Close;
     }
     match (n, old) {
@@ -769,62 +810,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// A private directory below the backup root holding exports while they are backed up.
-///
-/// Its name ends in `.tmp`, so the backup scanner ignores it; it is removed on drop.
-struct Staging {
-    /// The directory (mode 0700).
-    dir: PathBuf,
-}
-
-impl Staging {
-    /// Creates a new, unique staging directory below `root` (created 0700 if missing).
-    fn new(root: &Path) -> Result<Self> {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(STAGING_DIR_MODE)
-            .create(root)
-            .map_err(|e| io_err(root, e))?;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let n = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!(
-            "{STAGING_PREFIX}{}-{n}-{nanos}{STAGING_SUFFIX}",
-            std::process::id()
-        );
-        let dir = root.join(name);
-        fs::DirBuilder::new()
-            .mode(STAGING_DIR_MODE)
-            .create(&dir)
-            .map_err(|e| io_err(&dir, e))?;
-        Ok(Self { dir })
-    }
-
-    /// Writes `bytes` to the new file `name` (mode 0600) and returns its path.
-    fn write(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
-        let path = self.dir.join(name);
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(STAGING_FILE_MODE)
-            .open(&path)
-            .map_err(|e| io_err(&path, e))?;
-        file.write_all(bytes).map_err(|e| io_err(&path, e))?;
-        Ok(path)
-    }
-}
-
-impl Drop for Staging {
-    /// Removes the staging directory and the exports in it.
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpg::parse_listing;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
@@ -1014,7 +1003,7 @@ mod tests {
     #[test]
     fn passwd_answer_order() {
         let (old, new) = (SecretValue::from_text("old"), SecretValue::from_text("new"));
-        let pick = |n, old: Option<&SecretValue>| match passwd_answer(n, old, &new) {
+        let pick = |n, old: Option<&SecretValue>| match passwd_answer(n, 3, old, &new) {
             Reply::Answer(s) => s.as_text().unwrap().to_string(),
             Reply::Close => "close".into(),
             Reply::Ignore => "ignore".into(),
@@ -1024,7 +1013,21 @@ mod tests {
         assert_eq!(pick(3, Some(&old)), "new");
         assert_eq!(pick(1, None), "new");
         assert_eq!(pick(2, None), "new");
-        assert_eq!(pick(MAX_PROMPTS + 1, Some(&old)), "close");
+        assert_eq!(pick(4, Some(&old)), "close");
+        assert_eq!(pick(4, None), "close");
+    }
+
+    /// The prompt limit follows the key: one per key, one more for the old passphrase, capped.
+    #[test]
+    fn max_prompts_follow_the_key() {
+        let keys = parse_listing(include_bytes!("../../tests/fixtures/gpg/list-keys.txt"));
+        let mut key = keys.into_iter().next().unwrap();
+        assert_eq!(key.subkeys.len(), 1);
+        assert_eq!(max_prompts(&key, false), 2);
+        assert_eq!(max_prompts(&key, true), 3);
+        let sub = key.subkeys[0].clone();
+        key.subkeys = vec![sub; 1000];
+        assert_eq!(max_prompts(&key, true), MAX_PROMPTS_CAP);
     }
 
     /// Fake gpg for `--passwd`: prompts three times, then asks a yes/no question.
@@ -1052,41 +1055,15 @@ echo '[GNUPG:] SUCCESS keyedit.passwd' >&4
             SecretValue::from_text("old-pass"),
             SecretValue::from_text("new-pass"),
         );
-        let out = passwd(&runner, "FPR", Some(&old), &new).unwrap();
+        let out = passwd(&runner, "FPR", Some(&old), &new, 3).unwrap();
         assert!(out.success(), "{out:?}");
         assert_eq!(out.stdout.as_slice(), b"old-pass,new-pass,new-pass,");
         assert!(out.has_status("SUCCESS"));
-        let out = passwd(&runner, "FPR", None, &new).unwrap();
+        let out = passwd(&runner, "FPR", None, &new, 3).unwrap();
         assert_eq!(out.stdout.as_slice(), b"new-pass,new-pass,new-pass,");
-    }
-
-    /// Staging files are private and removed with their directory.
-    #[test]
-    fn staging_is_private_and_cleaned_up() {
-        let root = tempfile::tempdir().unwrap();
-        let backups = root.path().join("backups");
-        let staging = Staging::new(&backups).unwrap();
-        let path = staging.write("x.asc", b"data").unwrap();
-        let dir_mode = fs::metadata(&staging.dir).unwrap().permissions().mode();
-        assert_eq!(dir_mode & 0o777, 0o700);
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(
-            staging.write("x.asc", b"again").is_err(),
-            "never overwrites"
-        );
-        let name = staging
-            .dir
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX));
-        let dir = staging.dir.clone();
-        drop(staging);
-        assert!(!dir.exists());
-        assert!(backups.exists());
+        // One prompt more than the key allows: the command fd is closed and gpg fails.
+        let out = passwd(&runner, "FPR", Some(&old), &new, 2).unwrap();
+        assert!(!out.success(), "{out:?}");
+        assert_eq!(out.stdout.as_slice(), b"old-pass,new-pass,");
     }
 }

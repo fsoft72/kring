@@ -4,7 +4,7 @@ mod create;
 mod restore;
 
 pub use create::{
-    BACKUP_KEEP, BackupFile, BackupInfo, BackupManager, BackupSource, KEYRING_MAGIC,
+    BACKUP_KEEP, BackupFile, BackupInfo, BackupManager, BackupSource, KEYRING_MAGIC, MemoryEntry,
     is_plaintext_keyring, keyring_backup_set,
 };
 pub(crate) use create::{age_identity, encrypt_age, io_err};

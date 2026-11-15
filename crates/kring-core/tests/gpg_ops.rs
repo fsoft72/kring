@@ -111,6 +111,13 @@ fn listed(runner: &GpgRunner, fpr: &str) -> Option<GpgKey> {
         .find(|k| k.fingerprint == fpr)
 }
 
+/// The backup of an operation that ran after it, failing the test if the operation failed.
+fn completed(r: kring_core::Result<(BackupInfo, kring_core::Result<()>)>) -> BackupInfo {
+    let (info, result) = r.unwrap();
+    result.unwrap();
+    info
+}
+
 /// Reads the backup copy whose stored name ends with `suffix`.
 fn backup_bytes(info: &BackupInfo, suffix: &str) -> Vec<u8> {
     let file = info
@@ -308,15 +315,14 @@ fn change_passphrase_with_backup() {
     let env = env_or_skip!();
     let key = env.key(Some(KEY_PW));
     let fpr = key.fingerprint.as_str();
-    let info = change_passphrase(
+    let info = completed(change_passphrase(
         env.runner(),
         &env.mgr,
         fpr,
         Some(&pw(KEY_PW)),
         &pw(NEW_PW),
         Some(&pw(BACKUP_PW)),
-    )
-    .unwrap();
+    ));
     assert_eq!(info.reason, "change-gpg-passphrase");
     assert_eq!(info.files.len(), 2);
     let secret = info
@@ -349,15 +355,14 @@ fn change_passphrase_of_unprotected_key() {
     let env = env_or_skip!();
     let key = env.key(None);
     let fpr = key.fingerprint.as_str();
-    change_passphrase(
+    completed(change_passphrase(
         env.runner(),
         &env.mgr,
         fpr,
         Some(&pw("ignored-old")),
         &pw(NEW_PW),
         Some(&pw(BACKUP_PW)),
-    )
-    .unwrap();
+    ));
     let out = tempfile::tempdir().unwrap();
     assert!(unlocks(env.runner(), fpr, NEW_PW, out.path()));
     assert!(!unlocks(env.runner(), fpr, "ignored-old", out.path()));
@@ -387,14 +392,13 @@ fn delete_secret_key_with_backup() {
     assert!(listed(env.runner(), fpr).is_some(), "nothing deleted");
     assert!(env.mgr.list().unwrap().is_empty(), "no backup written");
 
-    let info = delete_key(
+    let info = completed(delete_key(
         env.runner(),
         &env.mgr,
         fpr,
         Some(&pw(KEY_PW)),
         Some(&pw(BACKUP_PW)),
-    )
-    .unwrap();
+    ));
     assert_eq!(info.reason, "delete-gpg-key");
     assert!(listed(env.runner(), fpr).is_none());
     assert!(list_keys(env.runner()).unwrap().is_empty());
@@ -407,7 +411,7 @@ fn delete_secret_key_with_backup() {
             .iter()
             .any(|f| f.encrypted && f.stored.to_string_lossy().ends_with(".secret.asc.age"))
     );
-    // No staging leftovers next to the backups.
+    // Nothing but the backup below the backup root (no staged exports).
     let names: Vec<String> = std::fs::read_dir(&env.mgr.root)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -430,7 +434,13 @@ fn delete_public_key() {
     let other = Env::new().unwrap();
     import_keys(other.runner(), text.as_bytes()).unwrap();
 
-    let info = delete_key(other.runner(), &other.mgr, &source.fingerprint, None, None).unwrap();
+    let info = completed(delete_key(
+        other.runner(),
+        &other.mgr,
+        &source.fingerprint,
+        None,
+        None,
+    ));
     assert_eq!(info.files.len(), 1);
     assert!(!info.files[0].encrypted);
     assert_eq!(
@@ -525,4 +535,47 @@ fn loopback_refused_is_explained() {
         Some(&pw(BACKUP_PW)),
     );
     assert_msg(r, MSG_LOOPBACK_REFUSED);
+}
+
+/// With a backup root that cannot be written, delete and passwd fail closed: the key is kept
+/// with its passphrase and no backup exists.
+#[test]
+fn unwritable_backup_root_changes_nothing() {
+    let env = env_or_skip!();
+    let key = env.key(Some(KEY_PW));
+    let fpr = key.fingerprint.as_str();
+    std::fs::create_dir_all(&env.mgr.root).unwrap();
+    std::fs::set_permissions(&env.mgr.root, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let deleted = delete_key(
+        env.runner(),
+        &env.mgr,
+        fpr,
+        Some(&pw(KEY_PW)),
+        Some(&pw(BACKUP_PW)),
+    );
+    let changed = change_passphrase(
+        env.runner(),
+        &env.mgr,
+        fpr,
+        Some(&pw(KEY_PW)),
+        &pw(NEW_PW),
+        Some(&pw(BACKUP_PW)),
+    );
+    std::fs::set_permissions(&env.mgr.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(deleted, Err(KringError::Io { .. })), "{deleted:?}");
+    assert!(matches!(changed, Err(KringError::Io { .. })), "{changed:?}");
+    assert_eq!(
+        listed(env.runner(), fpr).as_ref(),
+        Some(&key),
+        "key kept unchanged"
+    );
+    let out = tempfile::tempdir().unwrap();
+    assert!(
+        unlocks(env.runner(), fpr, KEY_PW, out.path()),
+        "passphrase unchanged"
+    );
+    assert!(env.mgr.list().unwrap().is_empty(), "no backup written");
+    assert_eq!(std::fs::read_dir(&env.mgr.root).unwrap().count(), 0);
 }
