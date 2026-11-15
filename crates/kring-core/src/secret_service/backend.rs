@@ -51,6 +51,11 @@ impl SecretServiceBackend {
         &self.connection
     }
 
+    /// Returns the raw Secret Service API proxy (used to open dedicated sessions).
+    pub(super) fn api_service(&self) -> &api::Service {
+        &self.api_service
+    }
+
     /// Finds a collection by object path.
     async fn find_collection(&self, id: &CollectionId) -> Result<Collection> {
         let collections = self

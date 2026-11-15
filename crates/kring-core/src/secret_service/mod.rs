@@ -2,5 +2,6 @@
 
 mod backend;
 pub mod errors;
+mod master_password;
 
 pub use backend::SecretServiceBackend;

@@ -12,3 +12,4 @@
 - Added `scripts/it-session.sh` (private dbus session + throwaway gnome-keyring) and the `it_smoke` integration test.
 - Added Secret Service backend (`SecretServiceBackend`, standard API via oo7, encrypted session) with D-Bus error mapping; integration tests guarded by `it_guard` (session script now exports `KRING_IT_RUNTIME`).
 - Added provider detection (`ProviderKind`, `detect`, `classify`) and PAM detection (`pam_status`), with an `it_provider` integration test.
+- Added gnome-keyring master password support (`MasterPasswordStore` for `SecretServiceBackend`: create, unlock and change password via the private interface over a dedicated encrypted session, no prompts) with the `it_master_password` integration test.
