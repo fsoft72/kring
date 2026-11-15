@@ -4,3 +4,4 @@
 
 - Added design document `docs/superpowers/specs/2026-11-15-kring-design.md`
   (Secret Service, offline keyring files, consolidate, KWallet migration, SSH, GPG).
+- Added implementation plan 1 (foundation + Secret Service) in `docs/superpowers/plans/`.
