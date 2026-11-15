@@ -2469,6 +2469,7 @@ dependencies = [
  "eframe",
  "kring-core",
  "tempfile",
+ "time",
  "tokio",
  "zeroize",
 ]

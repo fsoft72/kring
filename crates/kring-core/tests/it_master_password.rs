@@ -7,7 +7,7 @@ mod common;
 
 use common::within;
 use kring_core::error::KringError;
-use kring_core::model::{CollectionId, SecretValue};
+use kring_core::model::{CollectionId, NewItem, SecretValue};
 use kring_core::secret_service::SecretServiceBackend;
 use kring_core::{MasterPasswordStore, SecretStore};
 
@@ -104,4 +104,32 @@ async fn change_password_with_wrong_original_fails() {
         .await
         .unwrap();
     assert!(!is_locked(&backend, &id).await);
+}
+
+/// Listing the items of a locked collection works without a prompt and marks them locked.
+#[tokio::test]
+#[ignore]
+async fn list_items_of_locked_collection() {
+    if !common::it_guard() {
+        return;
+    }
+    let backend = within(SecretServiceBackend::connect()).await.unwrap();
+    let pw = SecretValue::from_text("pw");
+    let id = within(backend.create_with_password("kring-it-locked-list", &pw))
+        .await
+        .unwrap();
+    let item = NewItem {
+        label: "locked-entry".into(),
+        attributes: [("kring-it".to_string(), "locked-list".to_string())].into(),
+        secret: SecretValue::from_text("s"),
+        replace: false,
+    };
+    within(backend.create_item(&id, item)).await.unwrap();
+    within(backend.lock(&id)).await.unwrap();
+    assert!(is_locked(&backend, &id).await);
+
+    let items = within(backend.list_items(&id)).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].label, "locked-entry");
+    assert!(items[0].locked, "items of a locked collection are locked");
 }

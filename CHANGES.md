@@ -16,3 +16,5 @@
 - Added backups (`BackupManager`, age-encrypted plaintext keyrings, manifest with sha256, pruning) and `paths` helpers.
 - Added the `kring` app library with `worker` (background thread, command/event channels, provider gating, backup before deletes, NotFound refresh).
 - Added `app_state` (event reducer with sorted collections), `clipboard` (30 s auto-clear guard over arboard) and `secret_display` (text vs hex view).
+- Added the egui UI (`KringApp`): sidebar with collections and disabled future sections, collection header with badges and PAM notices, item table with search, item detail (masked secret, Show/Hide, Copy with 30 s auto-clear, editable attributes), modal dialogs (unlock, create, rename, change password, delete confirmations, new/edit item, backup passphrase) with zeroized password buffers, provider gating tooltips and a status bar.
+- Added `startup::connect` (keeps the D-Bus runtime alive for the worker) with the `it_startup` integration test, the `it_master_password` check that locked collections list their items as locked, the `seed_dev` example and `scripts/dev-session.sh` for isolated manual testing.
