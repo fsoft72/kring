@@ -59,6 +59,27 @@ pub fn retire_file(
     live: &[CollectionInfo],
     passphrase: &SecretValue,
 ) -> Result<BackupInfo> {
+    let digest = precheck(info, keyrings_dir, live)?;
+    let backup = manager.create(
+        RETIRE_REASON,
+        std::slice::from_ref(&info.path),
+        Some(passphrase),
+    )?;
+    verify_backup(&backup, &info.path, &digest)?;
+    check_unchanged(info)?;
+    std::fs::remove_file(&info.path).map_err(|e| io_err(&info.path, e))?;
+    Ok(backup)
+}
+
+/// Runs the checks shared by single and batch retire and returns the sha256 of the file.
+///
+/// Order: not live, plaintext flag, location, unchanged since scan, then the
+/// bytes on disk must not be a binary keyring (decided from the bytes).
+fn precheck(
+    info: &KeyringFileInfo,
+    keyrings_dir: &Path,
+    live: &[CollectionInfo],
+) -> Result<String> {
     if retire_mode(info, live) != RetireMode::DeleteFile {
         return Err(invalid(
             "Keyring is live in the daemon, delete the collection instead",
@@ -73,16 +94,76 @@ pub fn retire_file(
     if detect_format(&bytes) == KeyringFormat::BinaryV0 {
         return Err(invalid("Binary keyring files cannot be retired"));
     }
-    let digest = hex::encode(Sha256::digest(bytes.as_slice()));
-    let backup = manager.create(
-        RETIRE_REASON,
-        std::slice::from_ref(&info.path),
-        Some(passphrase),
-    )?;
-    verify_backup(&backup, &info.path, &digest)?;
-    check_unchanged(info)?;
-    std::fs::remove_file(&info.path).map_err(|e| io_err(&info.path, e))?;
-    Ok(backup)
+    Ok(hex::encode(Sha256::digest(bytes.as_slice())))
+}
+
+/// Outcome of [`retire_files_batch`].
+#[derive(Debug)]
+pub struct RetireBatchReport {
+    /// The single backup holding every file that passed the pre-checks.
+    ///
+    /// `None` when no file passed them (no backup is created then).
+    pub backup: Option<BackupInfo>,
+    /// Names (`KeyringFileInfo::name`) of the files that were backed up and removed.
+    pub removed: Vec<String>,
+    /// Names of the files that were kept, each with the reason.
+    pub kept: Vec<(String, String)>,
+}
+
+/// Retires many plaintext keyring files with ONE encrypted backup.
+///
+/// Every file goes through the same pre-checks as [`retire_file`]; a file
+/// failing them is listed in `kept` and excluded. The remaining files are
+/// backed up together, then each is verified in the manifest (encrypted and
+/// sha256) and unlinked after a final unchanged check; a file failing either
+/// step is kept and listed, the others proceed. A backup failure is returned
+/// as an error and nothing is removed.
+///
+/// # Errors
+///
+/// `InvalidInput` when `infos` is empty, or the backup error.
+pub fn retire_files_batch(
+    manager: &BackupManager,
+    infos: &[KeyringFileInfo],
+    keyrings_dir: &Path,
+    live: &[CollectionInfo],
+    passphrase: &SecretValue,
+) -> Result<RetireBatchReport> {
+    if infos.is_empty() {
+        return Err(invalid("No files to retire"));
+    }
+    let mut kept = Vec::new();
+    let mut accepted = Vec::new();
+    for info in infos {
+        match precheck(info, keyrings_dir, live) {
+            Ok(digest) => accepted.push((info, digest)),
+            Err(e) => kept.push((info.name.clone(), e.to_string())),
+        }
+    }
+    if accepted.is_empty() {
+        return Ok(RetireBatchReport {
+            backup: None,
+            removed: Vec::new(),
+            kept,
+        });
+    }
+    let paths: Vec<_> = accepted.iter().map(|(i, _)| i.path.clone()).collect();
+    let backup = manager.create(RETIRE_REASON, &paths, Some(passphrase))?;
+    let mut removed = Vec::new();
+    for (info, digest) in accepted {
+        let outcome = verify_backup(&backup, &info.path, &digest)
+            .and_then(|()| check_unchanged(info))
+            .and_then(|()| std::fs::remove_file(&info.path).map_err(|e| io_err(&info.path, e)));
+        match outcome {
+            Ok(()) => removed.push(info.name.clone()),
+            Err(e) => kept.push((info.name.clone(), e.to_string())),
+        }
+    }
+    Ok(RetireBatchReport {
+        backup: Some(backup),
+        removed,
+        kept,
+    })
 }
 
 /// Fails unless the manifest lists `path` as encrypted with the given sha256.
@@ -373,5 +454,115 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// Writes a plaintext file next to the scanned ones and rescans the directory.
+    fn batch_fixture(
+        files: &[(&str, &[u8])],
+    ) -> (tempfile::TempDir, Vec<KeyringFileInfo>, BackupManager) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("keyrings");
+        std::fs::create_dir(&dir).unwrap();
+        for (n, c) in files {
+            std::fs::write(dir.join(n), c).unwrap();
+        }
+        let mut infos = scan_dir(&dir).unwrap();
+        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        let mgr = BackupManager {
+            root: tmp.path().join("backups"),
+            keep: 20,
+        };
+        (tmp, infos, mgr)
+    }
+
+    /// Runs the batch with the keyrings dir taken from the first file.
+    fn batch(
+        mgr: &BackupManager,
+        infos: &[KeyringFileInfo],
+        live: &[CollectionInfo],
+    ) -> Result<RetireBatchReport> {
+        let dir = infos[0].path.parent().unwrap().to_path_buf();
+        retire_files_batch(mgr, infos, &dir, live, &SecretValue::from_text("pw"))
+    }
+
+    /// Many files, one backup, all removed.
+    #[test]
+    fn batch_one_backup_many_files() {
+        let (_t, infos, mgr) = batch_fixture(&[
+            ("a.keyring", PLAIN.as_bytes()),
+            ("b.keyring", PLAIN.as_bytes()),
+            ("c.keyring", b"[keyring]\ndisplay-name=C\n"),
+        ]);
+        let r = batch(&mgr, &infos, &[]).unwrap();
+        let backup = r.backup.unwrap();
+        assert_eq!(backup.files.len(), 3);
+        assert!(backup.files.iter().all(|f| f.encrypted));
+        assert_eq!(r.removed, vec!["a", "b", "c"]);
+        assert!(r.kept.is_empty());
+        assert!(infos.iter().all(|i| !i.path.exists()));
+        assert_eq!(std::fs::read_dir(&mgr.root).unwrap().count(), 1);
+    }
+
+    /// Live and binary files are kept and excluded; with nothing left no backup is made.
+    #[test]
+    fn batch_excludes_live_and_binary() {
+        let mut bin = crate::backup::KEYRING_MAGIC.to_vec();
+        bin.extend_from_slice(b"payload");
+        let (_t, infos, mgr) = batch_fixture(&[
+            ("bin.keyring", &bin),
+            ("live.keyring", PLAIN.as_bytes()),
+            ("ok.keyring", PLAIN.as_bytes()),
+        ]);
+        let live = [coll("/org/freedesktop/secrets/collection/live")];
+        let r = batch(&mgr, &infos, &live).unwrap();
+        assert_eq!(r.removed, vec!["ok"]);
+        assert_eq!(r.backup.unwrap().files.len(), 1);
+        let kept: Vec<_> = r.kept.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(kept, vec!["bin", "live"]);
+        assert!(infos[0].path.exists() && infos[1].path.exists());
+
+        let only: Vec<_> = infos[..2].to_vec();
+        let (_t2, _i2, mgr2) = batch_fixture(&[]);
+        let r = batch(&mgr2, &only, &live).unwrap();
+        assert!(r.backup.is_none() && r.removed.is_empty());
+        assert_eq!(r.kept.len(), 2);
+        assert!(!mgr2.root.exists());
+    }
+
+    /// A file changed since the scan is kept, the others are retired.
+    #[test]
+    fn batch_keeps_changed_file() {
+        let (_t, infos, mgr) = batch_fixture(&[
+            ("a.keyring", PLAIN.as_bytes()),
+            ("b.keyring", PLAIN.as_bytes()),
+        ]);
+        std::fs::write(&infos[1].path, format!("{PLAIN}extra=1\n")).unwrap();
+        let r = batch(&mgr, &infos, &[]).unwrap();
+        assert_eq!(r.removed, vec!["a"]);
+        assert_eq!(r.kept.len(), 1);
+        assert_eq!(r.kept[0].0, "b");
+        assert!(r.kept[0].1.contains("File changed since scan"));
+        assert!(infos[1].path.exists());
+    }
+
+    /// A failing backup removes nothing; empty input is refused.
+    #[test]
+    fn batch_backup_failure_removes_nothing() {
+        let (tmp, infos, _m) = batch_fixture(&[
+            ("a.keyring", PLAIN.as_bytes()),
+            ("b.keyring", PLAIN.as_bytes()),
+        ]);
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let mgr = BackupManager {
+            root: blocker.join("sub"),
+            keep: 20,
+        };
+        assert!(batch(&mgr, &infos, &[]).is_err());
+        assert!(infos.iter().all(|i| i.path.exists()));
+
+        let dir = infos[0].path.parent().unwrap().to_path_buf();
+        let r = retire_files_batch(&mgr, &[], &dir, &[], &SecretValue::from_text("pw"));
+        assert!(matches!(r, Err(KringError::InvalidInput(m)) if m == "No files to retire"));
     }
 }

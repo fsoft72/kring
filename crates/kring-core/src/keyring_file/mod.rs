@@ -6,6 +6,6 @@ pub mod scan;
 pub mod summary;
 pub mod textual;
 
-pub use retire::{RetireMode, retire_file, retire_mode};
+pub use retire::{RetireBatchReport, RetireMode, retire_file, retire_files_batch, retire_mode};
 pub use scan::{KeyringFileInfo, KeyringFormat, detect_format, scan_dir};
 pub use summary::{FileSummary, summarize_bytes, summarize_dir};
