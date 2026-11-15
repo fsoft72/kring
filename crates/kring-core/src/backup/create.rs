@@ -1,4 +1,4 @@
-//! Backups of keyring files, with age encryption for plaintext keyrings.
+//! Creation, listing and pruning of backups.
 
 use crate::error::{KringError, Result};
 use crate::model::SecretValue;
