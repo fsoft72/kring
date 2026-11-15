@@ -362,6 +362,27 @@ fn retire_live_file_refused_without_writes() {
     assert!(!e.backups.exists());
 }
 
+/// A live binary file is refused before the delete-collection flow: no backup, no delete.
+#[test]
+fn retire_live_binary_file_refused() {
+    let e = env(gnome(), &[(BINARY, MAIN)]);
+    e.send(Command::RetireFile {
+        name: MAIN.into(),
+        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+    });
+    assert!(
+        e.expect_error()
+            .ends_with("Only plaintext keyring files can be retired")
+    );
+    assert!(e.keyring(MAIN).exists());
+    assert!(!e.backups.exists());
+    e.send(Command::Refresh);
+    match e.next() {
+        Event::Collections(list) => assert!(list.iter().any(|c| c.id == e.main)),
+        other => panic!("expected Collections, got {other:?}"),
+    }
+}
+
 /// A plaintext file that is not live is backed up encrypted, then removed.
 #[test]
 fn retire_plaintext_file_backs_up_then_removes() {
@@ -471,6 +492,43 @@ fn restore_emits_report() {
         other => panic!("expected Done, got {other:?}"),
     }
     assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+/// Restoring an encrypted entry without a passphrase asks for one with the same command.
+#[test]
+fn restore_encrypted_without_passphrase_asks_for_it() {
+    let e = env(gnome(), &[(TEXTUAL, TEXTUAL)]);
+    let path = e.keyring(TEXTUAL);
+    let manager = BackupManager {
+        root: e.backups.clone(),
+        keep: BACKUP_KEEP,
+    };
+    let pass = SecretValue::from_text(PASSPHRASE);
+    let info = manager
+        .create("test", std::slice::from_ref(&path), Some(&pass))
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let cmd = Command::RestoreBackup {
+        dir: info.dir.clone(),
+        files: vec![path.clone()],
+        passphrase: None,
+    };
+    e.send(cmd);
+    match e.next() {
+        Event::PassphraseNeeded(resend) => match *resend {
+            Command::RestoreBackup {
+                dir,
+                files,
+                passphrase,
+            } => {
+                assert_eq!((dir, files), (info.dir, vec![path.clone()]));
+                assert!(passphrase.is_none());
+            }
+            other => panic!("expected RestoreBackup, got {other:?}"),
+        },
+        other => panic!("expected PassphraseNeeded, got {other:?}"),
+    }
+    assert!(!path.exists());
 }
 
 /// A restore of an unlisted backup dir or of a file outside its manifest is refused.

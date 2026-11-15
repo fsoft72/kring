@@ -437,6 +437,7 @@ mod tests {
             files,
             seq: 1,
             prune_warning: None,
+            pruned: Vec::new(),
         }
     }
 

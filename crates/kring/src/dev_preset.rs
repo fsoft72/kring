@@ -363,6 +363,7 @@ mod tests {
             secret: SecretValue::from_text("s"),
             created: 0,
             modified: 0,
+            secret_missing: false,
         };
         s.apply(Event::FileItems {
             name: "t".into(),
@@ -402,6 +403,7 @@ mod tests {
             }],
             seq: 0,
             prune_warning: None,
+            pruned: Vec::new(),
         };
         s.apply(Event::Backups(vec![info("/b/2"), info("/b/1")]));
         let actions = p.take_backup_actions(&s, &mut view, k);

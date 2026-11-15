@@ -284,6 +284,7 @@ pub fn read_archive(path: &Path, passphrase: &SecretValue) -> Result<Vec<Exporte
                     secret: SecretValue::new(bytes, &it.content_type),
                     created: it.created,
                     modified: it.modified,
+                    secret_missing: false,
                 },
             })
         })
@@ -307,6 +308,7 @@ mod tests {
                 secret: SecretValue::new(secret, ct),
                 created: 10,
                 modified: 20,
+                secret_missing: false,
             },
         }
     }

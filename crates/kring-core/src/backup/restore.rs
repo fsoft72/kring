@@ -5,7 +5,8 @@
 //! fail for content reasons (names, passphrase, sha256, stale temp files,
 //! pre-restore backup) happens before the first write, so a restore either
 //! changes nothing or, after an I/O failure in the write phase, a prefix of
-//! the files (the error names the files already restored).
+//! the files (the error names the files already restored). Old backups are
+//! pruned only after the write phase succeeded, never the source backup.
 
 use super::create::{BackupFile, BackupInfo, BackupManager, io_err};
 use crate::error::{KringError, Result};
@@ -13,8 +14,9 @@ use crate::model::SecretValue;
 use age::secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::fs::DirBuilder;
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -22,6 +24,8 @@ use zeroize::Zeroizing;
 pub const RESTART_HINT: &str = "systemctl --user restart gnome-keyring-daemon";
 /// Reason recorded on the backup of the files a restore overwrites.
 const PRE_RESTORE_REASON: &str = "pre-restore";
+/// Mode of a keyrings directory created by a restore.
+const KEYRINGS_DIR_MODE: u32 = 0o700;
 /// Message for a wrong passphrase or an undecryptable age entry.
 const WRONG_PASSPHRASE: &str = "Wrong passphrase for backup";
 
@@ -36,7 +40,9 @@ pub struct RestoreReport {
 
 /// Reads a file of a backup, decrypting `.age` entries and verifying sha256.
 ///
-/// An encrypted entry without a passphrase is `PassphraseRequired`; a wrong
+/// The stored copy must be a regular file (not a symlink) directly inside
+/// `info.dir`, else `InvalidInput`. An encrypted entry without a passphrase
+/// is `PassphraseRequired`; a wrong
 /// passphrase is `InvalidInput("Wrong passphrase for backup")`; a digest that
 /// differs from the manifest is `InvalidInput("Backup file corrupted ...")`.
 pub fn read_backup_file(
@@ -44,6 +50,7 @@ pub fn read_backup_file(
     file: &BackupFile,
     passphrase: Option<&SecretValue>,
 ) -> Result<Zeroizing<Vec<u8>>> {
+    check_stored_inside(info, file)?;
     let raw = Zeroizing::new(fs::read(&file.stored).map_err(|e| io_err(&file.stored, e))?);
     let plain = if file.encrypted {
         decrypt(&raw, passphrase)?
@@ -58,6 +65,29 @@ pub fn read_backup_file(
         )));
     }
     Ok(plain)
+}
+
+/// Fails with `InvalidInput` unless `file.stored` is a non-symlink regular
+/// file whose canonical parent is the canonical `info.dir`.
+fn check_stored_inside(info: &BackupInfo, file: &BackupFile) -> Result<()> {
+    let refuse = || {
+        KringError::InvalidInput(format!(
+            "Refusing to read {}: not a file of backup {}",
+            file.stored.display(),
+            info.dir.display()
+        ))
+    };
+    let meta = fs::symlink_metadata(&file.stored).map_err(|e| io_err(&file.stored, e))?;
+    if !meta.file_type().is_file() {
+        return Err(refuse());
+    }
+    let parent = file.stored.parent().ok_or_else(refuse)?;
+    let parent = fs::canonicalize(parent).map_err(|e| io_err(parent, e))?;
+    let dir = fs::canonicalize(&info.dir).map_err(|e| io_err(&info.dir, e))?;
+    if parent != dir {
+        return Err(refuse());
+    }
+    Ok(())
 }
 
 /// Decrypts an age scrypt-passphrase blob into a zeroizing buffer.
@@ -132,7 +162,10 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
 /// decrypted and checked against its sha256 before anything is written, then
 /// the current versions of the files that exist are backed up with reason
 /// `pre-restore` (using `passphrase` for plaintext ones); if that backup
-/// fails nothing is restored. The write phase is atomic per file. Only an
+/// fails nothing is restored. A missing `keyrings_dir` is created with mode
+/// 0700. The write phase is atomic per file. Old backups are pruned only
+/// after every file was written, and never the source `info.dir`; the
+/// outcome is recorded on the pre-restore backup. Only an
 /// I/O failure during the write phase can leave a partial restore; the error
 /// message then lists the files already restored. The caller should show
 /// [`RESTART_HINT`] afterwards.
@@ -166,11 +199,17 @@ pub fn restore(
     }
 
     let existing: Vec<PathBuf> = dests.iter().filter(|d| d.exists()).cloned().collect();
-    let pre_restore_backup = if existing.is_empty() {
+    // Pruning waits until every file is written, so a failed restore never loses backups.
+    let mut pre_restore_backup = if existing.is_empty() {
         None
     } else {
-        Some(manager.create(PRE_RESTORE_REASON, &existing, passphrase)?)
+        Some(manager.create_unpruned(PRE_RESTORE_REASON, &existing, passphrase)?)
     };
+    DirBuilder::new()
+        .recursive(true)
+        .mode(KEYRINGS_DIR_MODE)
+        .create(keyrings_dir)
+        .map_err(|e| io_err(keyrings_dir, e))?;
 
     let mut restored: Vec<PathBuf> = Vec::new();
     for (dest, bytes) in dests.iter().zip(&contents) {
@@ -185,6 +224,10 @@ pub fn restore(
             });
         }
         restored.push(dest.clone());
+    }
+    if let Some(pre) = pre_restore_backup.as_mut() {
+        // The source backup is never pruned by its own restore.
+        manager.prune_into(std::slice::from_ref(&info.dir), pre);
     }
     Ok(RestoreReport {
         restored,
@@ -353,6 +396,80 @@ mod tests {
         file.original = PathBuf::from("/elsewhere/default");
         let report = restore(&mgr, &info, &[file], &live, None).unwrap();
         assert_eq!(report.restored, [live.join("default")]);
+    }
+
+    /// Restoring from the oldest of 20 backups never prunes the source backup.
+    #[test]
+    fn restore_keeps_its_source_backup() {
+        let (_t, mgr, live, src) = setup();
+        let orig = src.join("a.keyring");
+        fs::write(&orig, binary("old")).unwrap();
+        let oldest = mgr.create("t", std::slice::from_ref(&orig), None).unwrap();
+        for _ in 1..20 {
+            mgr.create("t", std::slice::from_ref(&orig), None).unwrap();
+        }
+        fs::write(live.join("a.keyring"), binary("current")).unwrap();
+        let report = restore(&mgr, &oldest, &oldest.files, &live, None).unwrap();
+        assert!(report.pre_restore_backup.is_some());
+        assert!(oldest.dir.join("manifest.json").exists());
+        assert!(mgr.list().unwrap().iter().any(|b| b.seq == oldest.seq));
+        assert_eq!(fs::read(live.join("a.keyring")).unwrap(), binary("old"));
+    }
+
+    /// The prune after a restore is reported on the pre-restore backup.
+    #[test]
+    fn restore_reports_pruned_backups() {
+        let (_t, mgr, live, src) = setup();
+        let orig = src.join("a.keyring");
+        fs::write(&orig, binary("old")).unwrap();
+        let made: Vec<BackupInfo> = (0..4)
+            .map(|_| mgr.create("t", std::slice::from_ref(&orig), None).unwrap())
+            .collect();
+        fs::write(live.join("a.keyring"), binary("current")).unwrap();
+        let small = BackupManager {
+            root: mgr.root.clone(),
+            keep: 2,
+        };
+        let report = restore(&small, &made[3], &made[3].files, &live, None).unwrap();
+        let pre = report.pre_restore_backup.unwrap();
+        assert_eq!(pre.pruned, [made[0].dir.clone(), made[1].dir.clone()]);
+        assert!(made[2].dir.exists() && made[3].dir.exists() && pre.dir.exists());
+    }
+
+    /// A stored path outside the backup dir, or a symlink, is refused.
+    #[test]
+    fn stored_path_must_be_inside_backup_dir() {
+        let (_t, mgr, _live, src) = setup();
+        let orig = src.join("a.keyring");
+        fs::write(&orig, binary("a")).unwrap();
+        let info = mgr.create("t", std::slice::from_ref(&orig), None).unwrap();
+        let mut outside = info.files[0].clone();
+        outside.stored = orig.clone();
+        let err = read_backup_file(&info, &outside, None).unwrap_err();
+        assert!(matches!(err, KringError::InvalidInput(_)), "{err:?}");
+        let link = info.dir.join("link.keyring");
+        std::os::unix::fs::symlink(&orig, &link).unwrap();
+        let mut linked = info.files[0].clone();
+        linked.stored = link;
+        let err = read_backup_file(&info, &linked, None).unwrap_err();
+        assert!(matches!(err, KringError::InvalidInput(_)), "{err:?}");
+        let mut dotdot = info.files[0].clone();
+        dotdot.stored = info.dir.join("..").join("..").join("src").join("a.keyring");
+        assert!(read_backup_file(&info, &dotdot, None).is_err());
+    }
+
+    /// A missing keyrings dir is created with mode 0700 before writing.
+    #[test]
+    fn restore_creates_missing_keyrings_dir() {
+        let (t, mgr, _live, src) = setup();
+        let orig = src.join("a.keyring");
+        fs::write(&orig, binary("a")).unwrap();
+        let info = mgr.create("t", &[orig], None).unwrap();
+        let missing = t.path().join("new").join("keyrings");
+        let report = restore(&mgr, &info, &info.files, &missing, None).unwrap();
+        assert_eq!(report.restored, [missing.join("a.keyring")]);
+        let mode = fs::metadata(&missing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     /// A stale temp file is reported and nothing is touched.

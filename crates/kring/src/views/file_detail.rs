@@ -1,6 +1,7 @@
 //! The selected keyring file: header, notes, actions and its items.
 
 use eframe::egui::{self, RichText};
+use kring_core::keyring_file::textual::{ParseWarning, WarningKind};
 use kring_core::keyring_file::{KeyringFileInfo, KeyringFormat, RetireMode, retire_mode};
 use kring_core::model::{CollectionId, CollectionInfo};
 
@@ -56,6 +57,14 @@ pub fn file_subline(info: &KeyringFileInfo) -> String {
         text.push_str(&format!(" - {n} {noun}"));
     }
     text
+}
+
+/// Returns how many lines were joined to recover multi-line values.
+pub fn joined_lines(warnings: &[ParseWarning]) -> usize {
+    warnings
+        .iter()
+        .filter(|w| w.kind == WarningKind::ContinuationLine)
+        .count()
 }
 
 /// Returns the error note of a file gnome-keyring cannot read.
@@ -215,14 +224,14 @@ fn _notes(
     if let Some(text) = unreadable_note(info) {
         accent_card(ui, theme::ERROR, |ui| {
             ui.label(RichText::new(text).color(theme::ERROR).size(12.5));
-            let warnings = state.file_warnings.len();
-            if warnings > 0 {
-                let noun = if warnings == 1 {
+            let joined = joined_lines(&state.file_warnings);
+            if joined > 0 {
+                let noun = if joined == 1 {
                     "line was"
                 } else {
                     "lines were"
                 };
-                let text = format!("{warnings} {noun} joined to recover multi-line values");
+                let text = format!("{joined} {noun} joined to recover multi-line values");
                 ui.label(RichText::new(text).color(theme::MUTED).size(12.0));
             }
         });
@@ -440,6 +449,20 @@ mod tests {
             )
         );
         assert!(unreadable_note(&textual("t", 3, true)).is_none());
+    }
+
+    /// Only continuation lines count as joined lines.
+    #[test]
+    fn joined_lines_counts_continuations_only() {
+        let w = |line, kind| ParseWarning { line, kind };
+        let warnings = [
+            w(3, WarningKind::ContinuationLine),
+            w(4, WarningKind::MissingSecret),
+            w(5, WarningKind::ContinuationLine),
+            w(6, WarningKind::BadNumber),
+        ];
+        assert_eq!(joined_lines(&warnings), 2);
+        assert_eq!(joined_lines(&[]), 0);
     }
 
     /// login wins when unlocked, otherwise the first unlocked keyring; none when all locked.

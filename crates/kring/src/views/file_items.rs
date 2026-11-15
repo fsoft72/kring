@@ -20,6 +20,8 @@ use crate::views::item_list::{CARD_GAP, card_border, card_header};
 
 /// Room taken by each icon button next to the secret.
 const SECRET_BUTTONS_ROOM: f32 = 36.0;
+/// Shown instead of the secret controls when the file has no secret for the item.
+const MSG_NO_SECRET: &str = "No secret in file";
 /// Tooltip of Copy for binary secrets.
 const MSG_BINARY: &str = "Binary secrets cannot be copied";
 /// Width of the item search box.
@@ -149,7 +151,8 @@ fn _attributes(ui: &mut egui::Ui, item: &OfflineItem) {
         });
 }
 
-/// Renders one read-only item card; the expanded card shows secret and attributes.
+/// Renders one read-only item card; the expanded card shows secret and attributes
+/// (a muted note instead of the secret controls when the file had no secret).
 fn _card(
     ui: &mut egui::Ui,
     item: &OfflineItem,
@@ -177,7 +180,12 @@ fn _card(
         ui.add_space(6.0);
         divider(ui);
         ui.add_space(6.0);
-        action = _secret_row(ui, item, index, view);
+        if item.secret_missing {
+            field_label(ui, "Secret");
+            muted(ui, MSG_NO_SECRET);
+        } else {
+            action = _secret_row(ui, item, index, view);
+        }
         ui.add_space(6.0);
         _attributes(ui, item);
         ui.add_space(4.0);
@@ -252,6 +260,7 @@ mod tests {
             secret: SecretValue::from_text("s"),
             created: 0,
             modified: 0,
+            secret_missing: false,
         }
     }
 

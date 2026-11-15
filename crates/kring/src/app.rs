@@ -121,12 +121,15 @@ impl KringApp {
         }
     }
 
-    /// Moves new status and error messages from the state into toasts.
+    /// Moves new status messages, notices and errors from the state into toasts.
     fn _feed_toasts(&mut self) {
         let now = Instant::now();
         let (status, errors) = self.state.drain_messages();
         if let Some(status) = status {
             self.toasts.push(kind_for_status(&status), status, now);
+        }
+        for notice in self.state.drain_notices() {
+            self.toasts.push(ToastKind::Info, notice, now);
         }
         for e in errors {
             self.toasts.push(ToastKind::Error, user_message(&e), now);
@@ -184,7 +187,8 @@ impl KringApp {
                 }
             }
             Action::CopyFileSecret(index) => {
-                let Some(secret) = self.state.file_items.get(index).map(|i| i.secret.clone())
+                let item = self.state.file_items.get(index);
+                let Some(secret) = item.filter(|i| !i.secret_missing).map(|i| i.secret.clone())
                 else {
                     return;
                 };

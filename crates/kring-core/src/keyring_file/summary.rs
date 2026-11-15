@@ -6,6 +6,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use zeroize::Zeroizing;
+
 use super::scan::{KeyringFormat, detect_format};
 use super::textual::parse_textual;
 use crate::error::{KringError, Result};
@@ -101,7 +103,8 @@ pub fn summarize_dir(dir: &Path) -> Result<Vec<FileSummary>> {
         if !path.is_file() || path.extension().is_none_or(|x| x != KEYRING_EXTENSION) {
             continue;
         }
-        let bytes = std::fs::read(&path).map_err(|e| io(&path, e))?;
+        // The bytes hold plaintext secrets: wiped when dropped.
+        let bytes = Zeroizing::new(std::fs::read(&path).map_err(|e| io(&path, e))?);
         let name = entry.file_name().to_string_lossy().into_owned();
         summaries.push(summarize_bytes(&name, &bytes));
     }

@@ -4,6 +4,7 @@
 //! migrated v1 keyring; it is a path inside a fresh temporary directory that is
 //! never written to.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,15 +23,27 @@ use crate::model::{Attributes, SecretValue};
 /// and no partial item list is returned on error.
 pub async fn read_binary(path: &Path, password: &SecretValue) -> Result<Vec<OfflineItem>> {
     let name = _display_name(path);
-    let bytes = std::fs::read(path).map_err(|e| KringError::Io {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    if !bytes.starts_with(BINARY_MAGIC) {
+    if !_has_binary_magic(path)? {
         return Err(KringError::InvalidInput("Not a binary keyring".into()));
     }
-    drop(bytes);
     _read_with_target(path, password, &_scratch_target(), &name).await
+}
+
+/// Returns true when the first bytes of `path` are the binary magic (only they are read).
+///
+/// A file shorter than the magic is not binary; an open failure is an Io error.
+fn _has_binary_magic(path: &Path) -> Result<bool> {
+    let io = |e: std::io::Error| KringError::Io {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    };
+    let mut file = std::fs::File::open(path).map_err(io)?;
+    let mut head = [0u8; BINARY_MAGIC.len()];
+    match file.read_exact(&mut head) {
+        Ok(()) => Ok(head == BINARY_MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(io(e)),
+    }
 }
 
 /// Builds a unique path under the temp dir that is only a placeholder for oo7 and never created.
@@ -91,6 +104,7 @@ fn _convert_item(item: &oo7::file::UnlockedItem) -> OfflineItem {
         secret: SecretValue::new(secret.as_bytes().to_vec(), secret.content_type().as_str()),
         created: item.created().as_secs(),
         modified: item.modified().as_secs(),
+        secret_missing: false,
     }
 }
 
@@ -124,6 +138,7 @@ mod tests {
             assert_eq!(item.attributes.get("user").unwrap(), user);
             assert_eq!(item.secret.as_text(), Some(secret));
             assert!(item.created > 0 && item.modified >= item.created);
+            assert!(!item.secret_missing);
         }
     }
 
@@ -150,6 +165,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(&err, KringError::InvalidInput(m) if m == "Not a binary keyring"));
+    }
+
+    /// A file shorter than the magic, or a missing one, never reaches oo7.
+    #[tokio::test]
+    async fn short_file_is_not_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let short = dir.path().join("short.keyring");
+        std::fs::write(&short, &BINARY_MAGIC[..5]).unwrap();
+        let err = read_binary(&short, &SecretValue::from_text("x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, KringError::InvalidInput(m) if m == "Not a binary keyring"));
+        let missing = dir.path().join("missing.keyring");
+        let err = read_binary(&missing, &SecretValue::from_text("x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KringError::Io { .. }), "{err:?}");
     }
 
     /// Reading never creates the scratch target (nothing is written).

@@ -30,6 +30,8 @@ const MSG_BAD_NAME: &str = "Invalid keyring file name";
 const MSG_UNKNOWN_BACKUP: &str = "Unknown backup";
 /// Message for a restore without files.
 const MSG_NO_RESTORE_FILES: &str = "No files selected for restore";
+/// Message for a retire request on a file that is not plaintext.
+const MSG_NOT_PLAINTEXT: &str = "Only plaintext keyring files can be retired";
 /// Message after a plaintext file was retired.
 const MSG_RETIRED: &str = "Plaintext file retired";
 /// Extension of keyring files.
@@ -240,7 +242,7 @@ async fn import_into<S: SecretStore, N: Fn()>(
     Ok(())
 }
 
-/// Retires keyring file `name`.
+/// Retires plaintext keyring file `name`; any other file is refused first.
 ///
 /// When the daemon serves it (a live collection decodes to the name) this is
 /// the `DeleteCollection` flow with its gate and backup; otherwise the
@@ -259,6 +261,10 @@ where
     N: Fn(),
 {
     let info = resolve_file(config, name)?;
+    // Checked before the live branch: a binary file must never reach DeleteCollection.
+    if info.format == KeyringFormat::BinaryV0 || !info.plaintext {
+        return Err(invalid(MSG_NOT_PLAINTEXT));
+    }
     // Without a daemon no collection is live, so no file is loaded by it.
     let live = match store {
         Some(store) => store.list_collections().await?,
@@ -372,6 +378,7 @@ async fn export<S: SecretStore, N: Fn()>(
                 secret,
                 created: item.created,
                 modified: item.modified,
+                secret_missing: false,
             },
         });
     }

@@ -2,7 +2,9 @@
 //!
 //! Policy: same attributes and same secret in the target is skipped as a
 //! duplicate; same attributes with a different secret is skipped and reported
-//! as a conflict (never overwritten); anything else is created with
+//! as a conflict (never overwritten); an item whose file had no secret is
+//! skipped and counted (it never takes part in duplicate or conflict
+//! detection, so it cannot shadow a real item); anything else is created with
 //! `replace = false`. Attribute equality ignores `xdg:content-type`.
 
 use oo7::CONTENT_TYPE_ATTRIBUTE;
@@ -21,6 +23,8 @@ pub enum ImportDecision {
     SkipDuplicate,
     /// An item with the same attributes but a different secret exists.
     SkipConflict,
+    /// The item had no secret in its file.
+    SkipNoSecret,
 }
 
 /// The decision for one incoming item (never carries the secret).
@@ -45,6 +49,8 @@ pub struct ImportReport {
     pub conflicts: Vec<String>,
     /// `(label, error message)` of items that failed to be created.
     pub failed: Vec<(String, String)>,
+    /// Items skipped because their file had no secret for them.
+    pub no_secret: usize,
 }
 
 /// Returns the attributes used for equality, without `xdg:content-type`.
@@ -57,7 +63,8 @@ fn comparable(attrs: &Attributes) -> Attributes {
 /// Decides what to do with each incoming item, in order (pure).
 ///
 /// Earlier incoming items that will be created count as existing for later
-/// ones, so the first of two clashing incoming items wins.
+/// ones, so the first of two clashing incoming items wins. Items without a
+/// secret are always `SkipNoSecret` and never count as existing.
 pub fn plan_import(
     incoming: &[OfflineItem],
     existing: &[(ItemInfo, SecretValue)],
@@ -68,6 +75,14 @@ pub fn plan_import(
         .collect();
     let mut plan = Vec::with_capacity(incoming.len());
     for item in incoming {
+        if item.secret_missing {
+            plan.push(ImportPlanEntry {
+                label: item.label.clone(),
+                attributes: item.attributes.clone(),
+                decision: ImportDecision::SkipNoSecret,
+            });
+            continue;
+        }
         let attrs = comparable(&item.attributes);
         let mut same_attrs = known.iter().filter(|(a, _)| *a == attrs).peekable();
         let decision = if same_attrs.peek().is_none() {
@@ -107,8 +122,11 @@ pub async fn import_items<S: SecretStore + ?Sized>(
     if collection.locked {
         return Err(KringError::Locked(target.0.clone()));
     }
-    let incoming_attrs: Vec<Attributes> =
-        incoming.iter().map(|i| comparable(&i.attributes)).collect();
+    let incoming_attrs: Vec<Attributes> = incoming
+        .iter()
+        .filter(|i| !i.secret_missing)
+        .map(|i| comparable(&i.attributes))
+        .collect();
     let mut existing = Vec::new();
     for info in store.list_items(target).await? {
         if !incoming_attrs.contains(&comparable(&info.attributes)) {
@@ -123,6 +141,7 @@ pub async fn import_items<S: SecretStore + ?Sized>(
         match entry.decision {
             ImportDecision::SkipDuplicate => report.duplicates += 1,
             ImportDecision::SkipConflict => report.conflicts.push(entry.label),
+            ImportDecision::SkipNoSecret => report.no_secret += 1,
             ImportDecision::Create => {
                 let new_item = NewItem {
                     label: item.label,
@@ -162,6 +181,7 @@ mod tests {
             secret: SecretValue::from_text(secret),
             created: 0,
             modified: 0,
+            secret_missing: false,
         }
     }
 
@@ -277,13 +297,69 @@ mod tests {
                 created: 1,
                 duplicates: 1,
                 conflicts: vec!["conf".into()],
-                failed: vec![]
+                failed: vec![],
+                no_secret: 0,
             }
         );
         let items = store.list_items(&c).await.unwrap();
         assert_eq!(items.len(), 4);
         let new = items.iter().find(|i| i.label == "new").unwrap();
         assert_eq!(store.read_secret(&new.id).await.unwrap().as_bytes(), b"s3");
+    }
+
+    /// Builds an incoming item that had no secret in its file.
+    fn no_secret(label: &str, pairs: &[(&str, &str)]) -> OfflineItem {
+        let mut item = offline(label, pairs, "");
+        item.secret_missing = true;
+        item
+    }
+
+    /// Items without a secret never take part in duplicate or conflict detection.
+    #[test]
+    fn plan_skips_items_without_secret() {
+        let ex = [existing(&[("a", "1")], "s1")];
+        let incoming = [
+            no_secret("empty", &[("a", "2")]),
+            offline("real", &[("a", "2")], "s2"),
+            no_secret("dup-attrs", &[("a", "1")]),
+        ];
+        assert_eq!(
+            decisions(&plan_import(&incoming, &ex)),
+            [
+                ImportDecision::SkipNoSecret,
+                ImportDecision::Create,
+                ImportDecision::SkipNoSecret
+            ]
+        );
+    }
+
+    /// Items without a secret are skipped and counted; a real item after an
+    /// empty one with the same attributes is still created.
+    #[tokio::test]
+    async fn import_skips_and_counts_items_without_secret() {
+        let store = FakeStore::new();
+        let c = store.add_collection("t", "pw", false);
+        let incoming = vec![
+            no_secret("empty", &[("a", "1")]),
+            offline("real", &[("a", "1")], "s1"),
+            no_secret("other", &[("b", "2")]),
+        ];
+        let report = import_items(&store, &c, incoming).await.unwrap();
+        assert_eq!(
+            report,
+            ImportReport {
+                created: 1,
+                no_secret: 2,
+                ..Default::default()
+            }
+        );
+        let items = store.list_items(&c).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "real");
+        assert_eq!(
+            store.read_secret(&items[0].id).await.unwrap().as_bytes(),
+            b"s1"
+        );
     }
 
     /// A locked target is refused and nothing is created.

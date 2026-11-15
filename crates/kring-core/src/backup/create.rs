@@ -57,6 +57,9 @@ pub struct BackupInfo {
     /// Set when the backup was written but older backups could not be pruned.
     #[serde(skip)]
     pub prune_warning: Option<String>,
+    /// Backup directories removed by the pruning that followed this backup.
+    #[serde(skip)]
+    pub pruned: Vec<PathBuf>,
 }
 
 /// Creates, lists and prunes backups under a root directory.
@@ -148,6 +151,15 @@ fn read_manifest(dir: &Path) -> Option<BackupInfo> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Returns true when a backup may hold the only copy of some data: one of its
+/// originals no longer exists (or cannot be checked), e.g. a retired plaintext
+/// file or the file of a deleted collection. Such backups are never pruned.
+fn is_pinned(info: &BackupInfo) -> bool {
+    info.files
+        .iter()
+        .any(|f| fs::symlink_metadata(&f.original).is_err())
+}
+
 /// Manifest header fields of a backup being written.
 struct Header<'a> {
     /// Sanitized reason.
@@ -163,9 +175,22 @@ impl BackupManager {
     ///
     /// Nothing is written if a source is missing or a passphrase is needed but absent.
     /// The backup is written to a temporary directory and renamed when complete.
-    /// Pruning old backups is best-effort: a failure is reported in
-    /// [`BackupInfo::prune_warning`] and does not fail the call.
+    /// Old backups are then pruned (see [`BackupManager::prune_into`]): the
+    /// removed directories are listed in [`BackupInfo::pruned`], and a failure
+    /// is reported in [`BackupInfo::prune_warning`] without failing the call.
     pub fn create(
+        &self,
+        reason: &str,
+        files: &[PathBuf],
+        passphrase: Option<&SecretValue>,
+    ) -> Result<BackupInfo> {
+        let mut info = self.create_unpruned(reason, files, passphrase)?;
+        self.prune_into(&[], &mut info);
+        Ok(info)
+    }
+
+    /// Like [`BackupManager::create`], but never prunes old backups.
+    pub(crate) fn create_unpruned(
         &self,
         reason: &str,
         files: &[PathBuf],
@@ -213,7 +238,7 @@ impl BackupManager {
             seq,
         };
         let info = self.write_backup(&tmp_dir, &final_dir, header, &sources, secret);
-        let mut info = match info {
+        let info = match info {
             Ok(info) => info,
             Err(e) => {
                 let _ = fs::remove_dir_all(&tmp_dir);
@@ -224,10 +249,17 @@ impl BackupManager {
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(io_err(&final_dir, e));
         }
-        if let Err(e) = self.prune() {
+        Ok(info)
+    }
+
+    /// Prunes old backups (sparing `exempt`) and records the outcome on `info`.
+    ///
+    /// Removed directories go to [`BackupInfo::pruned`]; a failure goes to
+    /// [`BackupInfo::prune_warning`].
+    pub(crate) fn prune_into(&self, exempt: &[PathBuf], info: &mut BackupInfo) {
+        if let Err(e) = self.prune(exempt, &mut info.pruned) {
             info.prune_warning = Some(e.to_string());
         }
-        Ok(info)
     }
 
     /// Returns the seq for a new backup: one more than the highest existing one.
@@ -276,6 +308,7 @@ impl BackupManager {
             files: entries,
             seq: header.seq,
             prune_warning: None,
+            pruned: Vec::new(),
         };
         let json = serde_json::to_vec_pretty(&info)
             .map_err(|e| io_err(&tmp_dir.join(MANIFEST_NAME), e))?;
@@ -288,7 +321,7 @@ impl BackupManager {
     /// Order is the manifest `created` instant, then `seq` (never the dir name,
     /// whose reason suffix would reorder backups made within the same second).
     /// Directories without a valid manifest or timestamp are left out, so they
-    /// are never pruned.
+    /// are never pruned. `BackupInfo::dir` is the directory actually scanned.
     fn backups(&self) -> Result<Vec<(PathBuf, BackupInfo)>> {
         if !self.root.exists() {
             return Ok(Vec::new());
@@ -300,9 +333,11 @@ impl BackupManager {
             if !path.is_dir() || is_tmp {
                 continue;
             }
-            let Some(info) = read_manifest(&path) else {
+            let Some(mut info) = read_manifest(&path) else {
                 continue;
             };
+            // The directory is where the manifest was found, never what it claims.
+            info.dir = path.clone();
             let Ok(created) = OffsetDateTime::parse(&info.created, &Rfc3339) else {
                 continue;
             };
@@ -312,12 +347,21 @@ impl BackupManager {
         Ok(found.into_iter().map(|(_, p, i)| (p, i)).collect())
     }
 
-    /// Removes the oldest backups beyond `keep`.
-    fn prune(&self) -> Result<()> {
-        let backups = self.backups()?;
-        let excess = backups.len().saturating_sub(self.keep);
-        for (dir, _) in backups.iter().take(excess) {
-            fs::remove_dir_all(dir).map_err(|e| io_err(dir, e))?;
+    /// Removes the oldest prunable backups beyond `keep`, pushing each removed dir to `removed`.
+    ///
+    /// Pinned backups (see [`is_pinned`]) and `exempt` directories are never
+    /// removed and do not count toward `keep`.
+    fn prune(&self, exempt: &[PathBuf], removed: &mut Vec<PathBuf>) -> Result<()> {
+        let prunable: Vec<PathBuf> = self
+            .backups()?
+            .into_iter()
+            .filter(|(dir, info)| !exempt.contains(dir) && !is_pinned(info))
+            .map(|(dir, _)| dir)
+            .collect();
+        let excess = prunable.len().saturating_sub(self.keep);
+        for dir in prunable.into_iter().take(excess) {
+            fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+            removed.push(dir);
         }
         Ok(())
     }
@@ -487,6 +531,7 @@ mod tests {
             files: vec![],
             seq,
             prune_warning: None,
+            pruned: Vec::new(),
         };
         fs::write(dir.join(MANIFEST_NAME), serde_json::to_vec(&info).unwrap()).unwrap();
         dir
@@ -503,11 +548,84 @@ mod tests {
         let newest = fake_backup(&mgr, "20261115-100000-aaa", same, 3);
         // An earlier second always sorts first, whatever its seq.
         let earlier = fake_backup(&mgr, "20261115-095959-zzz", "2026-11-15T09:59:59.5Z", 9);
-        mgr.prune().unwrap();
+        let mut removed = Vec::new();
+        mgr.prune(&[], &mut removed).unwrap();
         assert!(newest.exists());
+        assert_eq!(removed.len(), 3);
         for gone in [oldest, middle, earlier] {
             assert!(!gone.exists(), "{}", gone.display());
         }
+    }
+
+    /// Backups whose original file is gone (retired, deleted) are never pruned
+    /// and do not count toward `keep`.
+    #[test]
+    fn backups_of_missing_originals_are_pinned() {
+        let (_t, mgr, src) = setup(20);
+        let retired = src.join("old.keyring");
+        fs::write(&retired, "[keyring]\n").unwrap();
+        let pass = SecretValue::from_text("hunter2");
+        let pinned = mgr.create(
+            "retire-plaintext",
+            std::slice::from_ref(&retired),
+            Some(&pass),
+        );
+        let pinned = pinned.unwrap();
+        fs::remove_file(&retired).unwrap();
+        let f = binary_file(&src, "a.keyring");
+        let mut first_seq = None;
+        for _ in 0..25 {
+            let info = mgr.create("t", std::slice::from_ref(&f), None).unwrap();
+            first_seq.get_or_insert(info.seq);
+        }
+        let listed = mgr.list().unwrap();
+        assert_eq!(listed.len(), 21);
+        assert_eq!(listed.last().unwrap().seq, pinned.seq);
+        assert!(pinned.dir.join(MANIFEST_NAME).exists());
+        // Names can be reused within a second, so the oldest is checked by seq.
+        assert!(listed.iter().all(|i| Some(i.seq) != first_seq));
+    }
+
+    /// The directories removed by pruning are reported on the new backup.
+    #[test]
+    fn pruned_dirs_are_reported() {
+        let (_t, mgr, src) = setup(2);
+        let f = binary_file(&src, "a.keyring");
+        let first = mgr.create("t", std::slice::from_ref(&f), None).unwrap();
+        let second = mgr.create("t", std::slice::from_ref(&f), None).unwrap();
+        assert!(first.pruned.is_empty() && second.pruned.is_empty());
+        let third = mgr.create("t", &[f], None).unwrap();
+        assert_eq!(third.pruned, [first.dir]);
+    }
+
+    /// Exempt directories are neither removed nor counted.
+    #[test]
+    fn exempt_dirs_survive_prune() {
+        let (_t, mgr, src) = setup(1);
+        let f = binary_file(&src, "a.keyring");
+        let first = mgr
+            .create_unpruned("t", std::slice::from_ref(&f), None)
+            .unwrap();
+        let second = mgr
+            .create_unpruned("t", std::slice::from_ref(&f), None)
+            .unwrap();
+        let third = mgr.create_unpruned("t", &[f], None).unwrap();
+        let mut removed = Vec::new();
+        mgr.prune(std::slice::from_ref(&first.dir), &mut removed)
+            .unwrap();
+        assert_eq!(removed, [second.dir]);
+        assert!(first.dir.exists() && third.dir.exists());
+    }
+
+    /// A manifest claiming another directory is listed under its real one.
+    #[test]
+    fn list_uses_real_dir_not_manifest_dir() {
+        let (_t, mgr, _src) = setup(20);
+        let real = fake_backup(&mgr, "20261115-100000-r", "2026-11-15T10:00:00Z", 1);
+        let mut info = read_manifest(&real).unwrap();
+        info.dir = PathBuf::from("/elsewhere");
+        fs::write(real.join(MANIFEST_NAME), serde_json::to_vec(&info).unwrap()).unwrap();
+        assert_eq!(mgr.list().unwrap()[0].dir, real);
     }
 
     /// Manifests without `seq` (older backups) still load, with seq 0.

@@ -53,6 +53,9 @@ pub struct OfflineItem {
     pub created: u64,
     /// Modification time, unix seconds (0 if unknown).
     pub modified: u64,
+    /// True when the file has no secret for this item (neither `secret` nor
+    /// `binary-secret`); `secret` is then empty and the item is not imported.
+    pub secret_missing: bool,
 }
 
 /// What kind of irregularity a [`ParseWarning`] reports.
@@ -301,18 +304,23 @@ fn number_value(group: &Group, key: &str, warnings: &mut Vec<ParseWarning>) -> O
 }
 
 /// Builds the secret of an item from `secret` or `binary-secret`.
-fn read_secret(group: &Group, warnings: &mut Vec<ParseWarning>) -> SecretValue {
+///
+/// Returns the secret and whether the group had neither key.
+fn read_secret(group: &Group, warnings: &mut Vec<ParseWarning>) -> (SecretValue, bool) {
     if let Some(text) = string_value(group, "secret", warnings) {
-        return SecretValue::new(text.as_bytes().to_vec(), TEXT_CONTENT_TYPE);
+        return (
+            SecretValue::new(text.as_bytes().to_vec(), TEXT_CONTENT_TYPE),
+            false,
+        );
     }
     let Some(raw) = group.entries.get("binary-secret") else {
         warnings.push(ParseWarning {
             line: group.line,
             kind: WarningKind::MissingSecret,
         });
-        return SecretValue::new(Vec::new(), BINARY_CONTENT_TYPE);
+        return (SecretValue::new(Vec::new(), BINARY_CONTENT_TYPE), true);
     };
-    match hex::decode(raw.first.trim()) {
+    let secret = match hex::decode(raw.first.trim()) {
         Ok(bytes) => SecretValue::new(bytes, BINARY_CONTENT_TYPE),
         Err(_) => {
             warnings.push(ParseWarning {
@@ -321,7 +329,8 @@ fn read_secret(group: &Group, warnings: &mut Vec<ParseWarning>) -> SecretValue {
             });
             SecretValue::new(Vec::new(), BINARY_CONTENT_TYPE)
         }
-    }
+    };
+    (secret, false)
 }
 
 /// Builds the attributes of an item from its `[id:attributeN]` groups.
@@ -387,12 +396,15 @@ pub fn parse_textual(bytes: &[u8]) -> Result<TextualKeyring> {
         let label = string_value(group, "display-name", &mut warnings)
             .map(|l| (*l).clone())
             .unwrap_or_default();
+        let attributes = read_attributes(id, group, &groups, &mut warnings);
+        let (secret, secret_missing) = read_secret(group, &mut warnings);
         items.push(OfflineItem {
             label,
-            attributes: read_attributes(id, group, &groups, &mut warnings),
-            secret: read_secret(group, &mut warnings),
+            attributes,
+            secret,
             created: number_value(group, "ctime", &mut warnings).unwrap_or(0),
             modified: number_value(group, "mtime", &mut warnings).unwrap_or(0),
+            secret_missing,
         });
     }
     warnings.sort_by_key(|w| w.line);
@@ -426,6 +438,7 @@ mod tests {
         assert_eq!(first.secret.content_type, "text/plain");
         assert_eq!((first.created, first.modified), (10, 11));
         assert_eq!(first.attributes["user"], "alice");
+        assert!(!first.secret_missing);
         assert_eq!(kr.items[1].label, "Second");
         assert_eq!((kr.items[1].created, kr.items[1].modified), (0, 0));
     }
@@ -602,6 +615,9 @@ mod tests {
         assert_eq!(kr.items[0].secret.content_type, "application/octet-stream");
         assert!(kr.items[1].secret.is_empty());
         assert!(kr.items[2].secret.is_empty());
+        // Bad hex still had a secret line; only the third item has none.
+        let missing: Vec<bool> = kr.items.iter().map(|i| i.secret_missing).collect();
+        assert_eq!(missing, [false, false, true]);
         let kinds: Vec<WarningKind> = kr.warnings.iter().map(|w| w.kind).collect();
         assert_eq!(
             kinds,

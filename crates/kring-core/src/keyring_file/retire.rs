@@ -358,6 +358,7 @@ mod tests {
             files,
             seq: 1,
             prune_warning: None,
+            pruned: Vec::new(),
         };
         let msg = |b: &BackupInfo| verify_backup(b, &path, "abc").unwrap_err().to_string();
         assert!(msg(&backup(vec![])).contains("does not list"));

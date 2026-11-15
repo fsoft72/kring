@@ -25,7 +25,8 @@ pub enum FileAction {
 }
 
 /// Returns the toast text of a finished import, e.g.
-/// `Imported 2 items, skipped 1 duplicate, 0 conflicts`.
+/// `Imported 2 items, skipped 1 duplicate, 0 conflicts`, followed by
+/// `, M without secret` and `, F failed` when those are not zero.
 pub fn import_summary(report: &ImportReport) -> String {
     let mut text = format!(
         "Imported {}, skipped {}, {}",
@@ -33,6 +34,9 @@ pub fn import_summary(report: &ImportReport) -> String {
         _count(report.duplicates, "duplicate"),
         _count(report.conflicts.len(), "conflict"),
     );
+    if report.no_secret > 0 {
+        text.push_str(&format!(", {} without secret", report.no_secret));
+    }
     if !report.failed.is_empty() {
         text.push_str(&format!(", {} failed", report.failed.len()));
     }
@@ -81,6 +85,8 @@ pub struct AppState {
     pub last_restore: Option<RestoreReport>,
     /// Set when a backup was created or restored since the last listing.
     backups_stale: bool,
+    /// Notices shown as toasts besides `status` (e.g. pruned backups).
+    notices: Vec<String>,
 }
 
 /// Sort key: login first, then default alias, then label (case-insensitive).
@@ -122,6 +128,10 @@ impl AppState {
             Event::BackupCreated(info) => {
                 self.status = format!("Backup created: {}", info.dir.display());
                 self.backups_stale = true;
+                if !info.pruned.is_empty() {
+                    let removed = _count(info.pruned.len(), "old backup");
+                    self.notices.push(format!("Removed {removed}"));
+                }
             }
             Event::PassphraseNeeded(cmd) => self.pending_passphrase = Some(*cmd),
             Event::Files(v) => self._set_files(v),
@@ -136,6 +146,7 @@ impl AppState {
                 self.file_items = items;
                 self.file_warnings = warnings;
                 self.file_opened = true;
+                self.pending_file_action = None;
             }
             Event::PasswordNeeded(name) => {
                 if self.selected_file.as_ref() == Some(&name) {
@@ -156,9 +167,8 @@ impl AppState {
             }
             Event::Done(msg) => self.status = msg,
             Event::Error(msg) => {
-                // The failed command may be the pending file command: never resend it.
-                self.pending_file_action = None;
-                self.pending_file_password = None;
+                // The pending file command survives unrelated errors; it is
+                // dropped on file change, on its items or when its dialog is taken.
                 self.errors.push(msg);
                 let excess = self.errors.len().saturating_sub(MAX_ERRORS);
                 self.errors.drain(..excess);
@@ -244,6 +254,11 @@ impl AppState {
             return None;
         }
         Some((name, action))
+    }
+
+    /// Takes the queued notices, oldest first, for display as toasts.
+    pub fn drain_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
     }
 
     /// Returns true (once) when the backup list must be reloaded.
@@ -418,6 +433,7 @@ mod tests {
             secret: SecretValue::from_text("s"),
             created: 0,
             modified: 0,
+            secret_missing: false,
         }
     }
 
@@ -535,7 +551,7 @@ mod tests {
         );
     }
 
-    /// A command with a password, an error or a file change drops the pending action.
+    /// A command with a password, the file's items or a file change drops the pending action.
     #[test]
     fn pending_action_cleared() {
         let open = Command::OpenFile {
@@ -549,7 +565,11 @@ mod tests {
         });
         assert!(s.pending_file_action.is_none());
         let mut s = tracked("a", open.clone());
-        s.apply(Event::Error("invalid input: Wrong password".into()));
+        s.apply(Event::FileItems {
+            name: "a".into(),
+            items: vec![],
+            warnings: vec![],
+        });
         assert!(s.pending_file_action.is_none());
         let mut s = tracked("a", open.clone());
         s.select_file("b".into());
@@ -560,6 +580,77 @@ mod tests {
         assert!(s.pending_file_action.is_none() && s.take_password_request().is_none());
     }
 
+    /// An unrelated error keeps the pending file command and its password request.
+    #[test]
+    fn unrelated_error_keeps_pending_action() {
+        let open = Command::OpenFile {
+            name: "a".into(),
+            password: None,
+        };
+        let mut s = tracked("a", open);
+        s.apply(Event::PasswordNeeded("a".into()));
+        s.apply(Event::Error("clipboard failed".into()));
+        assert_eq!(
+            s.take_password_request(),
+            Some(("a".to_string(), FileAction::Open))
+        );
+        let mut other = tracked(
+            "a",
+            Command::OpenFile {
+                name: "a".into(),
+                password: None,
+            },
+        );
+        other.apply(Event::FileItems {
+            name: "b".into(),
+            items: vec![],
+            warnings: vec![],
+        });
+        assert_eq!(other.pending_file_action, Some(FileAction::Open));
+    }
+
+    /// Items skipped for a missing secret are named in the summary.
+    #[test]
+    fn import_summary_counts_items_without_secret() {
+        let report = ImportReport {
+            created: 1,
+            no_secret: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            import_summary(&report),
+            "Imported 1 item, skipped 0 duplicates, 0 conflicts, 3 without secret"
+        );
+    }
+
+    /// A backup that pruned old ones queues a notice, drained once.
+    #[test]
+    fn pruned_backups_queue_a_notice() {
+        let mut s = AppState::default();
+        let mut info = BackupInfo {
+            dir: "/b/new".into(),
+            reason: "t".into(),
+            created: String::new(),
+            files: vec![],
+            seq: 3,
+            prune_warning: None,
+            pruned: vec![],
+        };
+        s.apply(Event::BackupCreated(info.clone()));
+        assert!(s.drain_notices().is_empty());
+        info.pruned = vec!["/b/1".into(), "/b/2".into()];
+        s.apply(Event::BackupCreated(info.clone()));
+        info.pruned = vec!["/b/3".into()];
+        s.apply(Event::BackupCreated(info));
+        s.apply(Event::Done("Collection deleted".into()));
+        assert_eq!(
+            s.drain_notices(),
+            ["Removed 2 old backups", "Removed 1 old backup"]
+        );
+        assert!(s.drain_notices().is_empty());
+        assert_eq!(s.status, "Collection deleted");
+    }
+
     /// A finished import becomes a status message; closing the file drops the report.
     #[test]
     fn import_done_status_and_reset() {
@@ -568,6 +659,7 @@ mod tests {
             duplicates: 1,
             conflicts: vec!["x".into()],
             failed: vec![],
+            no_secret: 0,
         };
         assert_eq!(
             import_summary(&report),
