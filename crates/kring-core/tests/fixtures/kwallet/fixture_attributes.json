@@ -1,0 +1,50 @@
+{
+    "$fdo_created": "1794752450",
+    "$fdo_modified": "1794752450",
+    "Apps/Fixture carol": {
+        "$fdo_created": "1794752450",
+        "$fdo_mime_type": "text/plain",
+        "$fdo_modified": "1794752450",
+        "attributes": {
+            "service": "fixture",
+            "user": "carol"
+        }
+    },
+    "Secret Service/Fixture bob": {
+        "$fdo_created": "1794752450",
+        "$fdo_mime_type": "text/plain",
+        "$fdo_modified": "1794752450",
+        "attributes": {
+            "service": "fixture",
+            "user": "bob"
+        }
+    },
+    "Secret Service/Fixture bob__0_": {
+        "$fdo_created": "1794752450",
+        "$fdo_mime_type": "text/plain",
+        "$fdo_modified": "1794752450",
+        "attributes": {
+            "service": "fixture",
+            "user": "bob-alt"
+        }
+    },
+    "Secret Service/Fixture map": {
+        "$fdo_created": "1794752450",
+        "$fdo_mime_type": "text/plain",
+        "$fdo_modified": "1794752450",
+        "attributes": {
+            "service": "fixture",
+            "type": "map",
+            "user": "dave"
+        }
+    },
+    "Streams/blob": {
+        "$fdo_created": "1794752450",
+        "$fdo_modified": "1794752450",
+        "attributes": {
+            "server": "Streams",
+            "type": "binary",
+            "user": "blob"
+        }
+    }
+}

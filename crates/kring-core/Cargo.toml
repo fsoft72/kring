@@ -26,4 +26,6 @@ dev = []
 # Enables the `dev` feature for this crate's integration tests and examples.
 kring-core = { path = ".", features = ["dev"] }
 tempfile = "3"
+# PBKDF2 key derivation for the KWallet fixture generator.
+pbkdf2 = "0.13"
 tokio = { version = "1", features = ["macros", "rt"] }

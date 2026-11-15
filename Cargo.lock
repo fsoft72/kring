@@ -2360,6 +2360,7 @@ dependencies = [
  "hex",
  "kring-core",
  "oo7",
+ "pbkdf2 0.13.0",
  "serde",
  "serde_json",
  "sha2 0.11.1",
