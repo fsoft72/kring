@@ -366,6 +366,12 @@ where
             let run = handle(&out, store, provider.as_ref(), &config, &mut plans, cmd);
             run_guarded(&out, &runtime, run);
         }
+        // The store (oo7 Service) spawns a Tokio task in its Drop to close its
+        // D-Bus session, so it must be dropped while the runtime is still
+        // alive and entered; otherwise the thread panics on shutdown.
+        let _context = runtime.enter();
+        drop(plans);
+        drop(store);
     });
     WorkerHandle {
         tx: cmd_tx,
