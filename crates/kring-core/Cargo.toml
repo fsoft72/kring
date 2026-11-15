@@ -1,0 +1,11 @@
+[package]
+name = "kring-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+oo7 = { version = "0.7.1", default-features = false, features = ["tokio", "native_crypto", "unstable"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+async-trait = "0.1"
+thiserror = "2"
+zeroize = "1.9"

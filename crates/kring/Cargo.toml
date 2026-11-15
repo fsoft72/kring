@@ -1,0 +1,10 @@
+[package]
+name = "kring"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kring-core = { path = "../kring-core" }
+eframe = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+arboard = "3.7"
