@@ -1158,6 +1158,7 @@ mod tests {
         let retired = RetireBatchReport {
             backup: None,
             removed: vec!["a".into(), "b".into()],
+            without_backup: vec![],
             kept: vec![("c".into(), "not empty".into())],
         };
         let rows = outcome_rows(&report, Some(&retired));

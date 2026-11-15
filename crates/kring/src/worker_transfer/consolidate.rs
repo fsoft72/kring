@@ -282,7 +282,7 @@ where
         candidates,
         &config.keyrings_dir,
         &live,
-        passphrase,
+        Some(passphrase),
     ) {
         Ok(report) => {
             if let Some(backup) = report.backup.clone() {

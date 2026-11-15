@@ -1665,6 +1665,7 @@ mod tests {
         let retired = RetireBatchReport {
             backup: None,
             removed: vec!["a".into()],
+            without_backup: vec!["a".into()],
             kept: vec![],
         };
         assert_eq!(

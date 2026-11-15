@@ -906,19 +906,20 @@ fn orphan_batch_runs_after_consolidation() {
         .iter()
         .filter(|ev| matches!(ev, Event::BackupCreated(_)))
         .count();
-    assert_eq!(backups, 2);
+    assert_eq!(backups, 1, "the empty orphan needs no backup");
     match events.last() {
         Some(Event::ConsolidationDone(report, Some(retired))) => {
             assert!(report.completed);
             assert_eq!(retired.removed, ["orphan"]);
-            assert!(retired.backup.is_some());
+            assert_eq!(retired.without_backup, ["orphan"]);
+            assert!(retired.backup.is_none());
         }
         other => panic!("expected ConsolidationDone with a retire report, got {other:?}"),
     }
     assert!(!e.keyring("orphan").exists());
     assert!(e.keyring("full").exists());
     assert!(!e.has_collection(&e.other));
-    assert_eq!(e.backup_count(), 2);
+    assert_eq!(e.backup_count(), 1);
 }
 
 /// A consolidation that stops (an empty collection got an item after the
