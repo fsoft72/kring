@@ -134,7 +134,8 @@ fn summarize(
 pub(super) struct Passphrases<'a> {
     /// For the backup of the keyring set.
     pub(super) backup: Option<&'a SecretValue>,
-    /// For the encrypted backup of the retired orphan files.
+    /// For the encrypted backup of orphan files that got items since the
+    /// scan (none in practice: the candidates are empty on a fresh scan).
     pub(super) orphan_files: Option<&'a SecretValue>,
 }
 

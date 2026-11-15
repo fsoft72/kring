@@ -36,13 +36,15 @@ pub fn asks_passphrase(kind: &DialogKind) -> bool {
         | DialogKind::UnlockMany { .. }
         | DialogKind::FilePassword { .. }
         | DialogKind::WalletPassword { .. }
-        | DialogKind::RetireFile { .. }
         | DialogKind::ExportCollection { .. }
         | DialogKind::ImportArchive { .. }
         | DialogKind::ApplyPassphrase { .. }
         | DialogKind::ConsolidatePassphrases { .. }
         | DialogKind::Passphrase { .. } => true,
-        DialogKind::DeleteFile { spec, backup, .. } => *backup && spec.needs_passphrase,
+        DialogKind::RetireFile { empty, .. } => !empty,
+        DialogKind::DeleteFile { spec, backup, .. } => {
+            *backup && spec.needs_passphrase && !spec.empty
+        }
         DialogKind::RestoreBackup { mode, .. } => *mode != RestorePassphrase::NotNeeded,
         DialogKind::ImportWallet { target, .. } => *target == Some(WalletTarget::Create),
         DialogKind::Ssh(dialog) => dialog.asks_passphrase(),
@@ -318,6 +320,7 @@ mod tests {
                 needs_passphrase,
                 passphrase_note: "",
                 backup_optional: true,
+                empty: false,
             },
         )
     }
@@ -334,6 +337,15 @@ mod tests {
         )));
         assert!(uses_remembered(&delete_file(true)));
         assert!(!asks_passphrase(&delete_file(false)));
+        assert!(!asks_passphrase(&DialogKind::retire_empty_file(
+            "e".into(),
+            vec![]
+        )));
+        let mut empty = delete_file(true);
+        if let DialogKind::DeleteFile { spec, .. } = &mut empty {
+            spec.empty = true;
+        }
+        assert!(!asks_passphrase(&empty), "an empty keyring needs no backup");
         let mut no_backup = delete_file(true);
         if let DialogKind::DeleteFile { backup, .. } = &mut no_backup {
             *backup = false;

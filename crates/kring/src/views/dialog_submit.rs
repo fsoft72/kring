@@ -52,7 +52,7 @@ pub fn delete_dialog_blocked(kind: &DialogKind) -> Option<&'static str> {
     else {
         return None;
     };
-    if *backup {
+    if *backup || spec.empty {
         return None;
     }
     if !spec.backup_optional {
@@ -142,6 +142,10 @@ pub fn with_backup_passphrase(cmd: Command, passphrase: SecretValue) -> Command 
         Command::DeleteFile { name, backup, .. } => Command::DeleteFile {
             name,
             backup,
+            backup_passphrase: Some(passphrase),
+        },
+        Command::RetireFile { name, .. } => Command::RetireFile {
+            name,
             backup_passphrase: Some(passphrase),
         },
         Command::RestoreBackup { dir, files, .. } => Command::RestoreBackup {
@@ -358,10 +362,14 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             name,
             passphrase,
             confirm,
+            empty,
             ..
         } => Command::RetireFile {
             name: name.clone(),
-            backup_passphrase: Some(_new_password(passphrase, confirm)?),
+            backup_passphrase: match empty {
+                true => None,
+                false => Some(_new_password(passphrase, confirm)?),
+            },
         },
         DialogKind::DeleteFile {
             name,
@@ -374,13 +382,16 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             if let Some(reason) = delete_dialog_blocked(kind) {
                 return Err(reason.into());
             }
-            let backup_passphrase = match (*backup, spec.needs_passphrase) {
-                (true, true) => Some(_new_password(passphrase, confirm)?),
+            // An empty keyring is sent with the backup on and no passphrase:
+            // the worker skips the backup, or asks one if it is not empty.
+            let backup = *backup || spec.empty;
+            let backup_passphrase = match (backup, spec.needs_passphrase, spec.empty) {
+                (true, true, false) => Some(_new_password(passphrase, confirm)?),
                 _ => None,
             };
             Command::DeleteFile {
                 name: name.clone(),
-                backup: *backup,
+                backup,
                 backup_passphrase,
             }
         }
@@ -801,6 +812,7 @@ mod tests {
             needs_passphrase,
             passphrase_note: "note",
             backup_optional,
+            empty: false,
         }
     }
 
@@ -836,6 +848,57 @@ mod tests {
             "Default_keyring_3.keyring",
             "Default_keyring_3"
         ));
+    }
+
+    /// An empty keyring is sent with the backup on and no passphrase, even
+    /// with the backup unchecked and no name typed (the worker skips the
+    /// backup, or asks a passphrase when it is not empty after all).
+    #[test]
+    fn delete_empty_sends_backup_without_passphrase() {
+        let empty = crate::views::dialogs::DeleteSpec {
+            empty: true,
+            ..spec(true, false)
+        };
+        let mut kind = DialogKind::delete_file("e".into(), empty);
+        fill_delete(&mut kind, false, "", ("", ""));
+        assert_eq!(delete_dialog_blocked(&kind), None);
+        match command_for(&kind).unwrap() {
+            Command::DeleteFile {
+                name,
+                backup,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, "e");
+                assert!(backup);
+                assert!(backup_passphrase.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// An empty file is retired without a passphrase; the passphrase
+    /// dialog of a resend sets it on the retire command.
+    #[test]
+    fn retire_empty_sends_no_passphrase() {
+        let kind = DialogKind::retire_empty_file("e".into(), vec![]);
+        let cmd = command_for(&kind).unwrap();
+        let Command::RetireFile {
+            backup_passphrase, ..
+        } = &cmd
+        else {
+            panic!("unexpected {cmd:?}");
+        };
+        assert!(backup_passphrase.is_none());
+        match with_backup_passphrase(cmd, SecretValue::from_text("pp")) {
+            Command::RetireFile {
+                name,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, "e");
+                assert_eq!(backup_passphrase.unwrap().as_text(), Some("pp"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     /// The backup checkbox starts checked; a binary file needs no passphrase.

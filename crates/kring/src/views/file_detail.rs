@@ -2,7 +2,9 @@
 
 use eframe::egui::{self, RichText};
 use kring_core::keyring_file::textual::{ParseWarning, WarningKind};
-use kring_core::keyring_file::{KeyringFileInfo, KeyringFormat, RetireMode, retire_mode};
+use kring_core::keyring_file::{
+    KeyringFileInfo, KeyringFormat, RetireMode, retire_mode, scanned_empty,
+};
 use kring_core::model::{CollectionId, CollectionInfo};
 
 use crate::app_state::AppState;
@@ -114,24 +116,31 @@ pub fn import_blocked(state: &AppState, info: &KeyringFileInfo) -> Option<&'stat
     None
 }
 
-/// Returns the body lines of the retire confirmation for `mode`.
-pub fn retire_dialog_text(mode: &RetireMode, info: &KeyringFileInfo) -> Vec<String> {
-    let mut lines = match mode {
-        RetireMode::DeleteFile => vec![format!(
+/// Returns the body lines of the retire confirmation for `mode`; `empty`
+/// (no items in the last listing) words it without a backup.
+pub fn retire_dialog_text(mode: &RetireMode, info: &KeyringFileInfo, empty: bool) -> Vec<String> {
+    let label = info.display_name.as_deref().unwrap_or(&info.name);
+    let mut lines = match (mode, empty) {
+        (RetireMode::DeleteFile, true) => vec![format!(
+            "\"{}.keyring\" holds no items: it is deleted from disk.",
+            info.name
+        )],
+        (RetireMode::DeleteFile, false) => vec![format!(
             "\"{}.keyring\" is backed up, encrypted with the passphrase below, then \
              deleted from disk.",
             info.name
         )],
-        RetireMode::DeleteLiveCollection(_) => {
-            let label = info.display_name.as_deref().unwrap_or(&info.name);
-            vec![
-                format!(
-                    "gnome-keyring has this file loaded: this will delete the live keyring \
-                     '{label}' with backup."
-                ),
-                "The backup is encrypted with the passphrase below.".to_string(),
-            ]
-        }
+        (RetireMode::DeleteLiveCollection(_), true) => vec![format!(
+            "gnome-keyring has this file loaded: this will delete the live keyring \
+             '{label}', it holds no items."
+        )],
+        (RetireMode::DeleteLiveCollection(_), false) => vec![
+            format!(
+                "gnome-keyring has this file loaded: this will delete the live keyring \
+                 '{label}' with backup."
+            ),
+            "The backup is encrypted with the passphrase below.".to_string(),
+        ],
     };
     if let Some(n) = info.item_count.filter(|n| *n > 0) {
         let noun = if n == 1 { "item" } else { "items" };
@@ -141,6 +150,17 @@ pub fn retire_dialog_text(mode: &RetireMode, info: &KeyringFileInfo) -> Vec<Stri
         ));
     }
     lines
+}
+
+/// Returns true when the keyring of `info` held no items in the last
+/// listing: the live collection serving it (locked or not, gnome-keyring
+/// reports the item count of locked keyrings), else the scanned file. The
+/// worker decides again on fresh data.
+pub fn holds_no_items(state: &AppState, info: &KeyringFileInfo) -> bool {
+    match live_collection(info, &state.collections) {
+        Some(c) => c.item_count == 0,
+        None => scanned_empty(info),
+    }
 }
 
 /// Returns the command to send when file `name` is selected: textual files are read right away.
@@ -155,7 +175,12 @@ pub fn select_command(state: &AppState, name: &str) -> Option<Command> {
 /// Returns the retire dialog of `info`, computing the mode from the live collections.
 pub fn retire_dialog(state: &AppState, info: &KeyringFileInfo) -> DialogKind {
     let mode = retire_mode(info, &state.collections);
-    DialogKind::retire_file(info.name.clone(), retire_dialog_text(&mode, info))
+    let empty = holds_no_items(state, info);
+    let lines = retire_dialog_text(&mode, info, empty);
+    match empty {
+        true => DialogKind::retire_empty_file(info.name.clone(), lines),
+        false => DialogKind::retire_file(info.name.clone(), lines),
+    }
 }
 
 /// Returns why Delete is disabled: a live file is deleted through the
@@ -189,24 +214,35 @@ pub fn live_note(c: &CollectionInfo) -> String {
 ///
 /// A file the daemon does not serve is deleted from disk, the backup
 /// optional. A live one is deleted through the daemon after a backup of all
-/// keyrings (needing a passphrase when any listed file is plaintext); the
-/// backup may be skipped only when the keyring holds no items.
+/// keyrings (needing a passphrase when any listed file is plaintext). A
+/// keyring holding no items (live or not, locked or not) needs no backup:
+/// the spec is `empty` and the dialog shows no backup choice.
 pub fn delete_spec(state: &AppState, info: &KeyringFileInfo) -> DeleteSpec {
     let Some(c) = live_collection(info, &state.collections) else {
-        return DeleteSpec {
-            lines: vec![format!(
+        let empty = scanned_empty(info);
+        let line = match empty {
+            true => format!(
+                "\"{}.keyring\" is not loaded by gnome-keyring and holds no items: it is \
+                 deleted from disk.",
+                info.name
+            ),
+            false => format!(
                 "\"{}.keyring\" is not loaded by gnome-keyring and is deleted from disk.",
                 info.name
-            )],
+            ),
+        };
+        return DeleteSpec {
+            lines: vec![line],
             needs_passphrase: info.plaintext,
             passphrase_note: MSG_DELETE_PLAINTEXT,
             backup_optional: true,
+            empty,
         };
     };
     let key = collection_key(&c.id);
     let label = _label_part(c);
-    // Fail closed: a locked keyring never counts as empty.
-    let empty = !c.locked && c.item_count == 0;
+    // gnome-keyring reports the item count of locked keyrings too.
+    let empty = c.item_count == 0;
     let line = if empty {
         format!(
             "\"{key}\" is loaded by gnome-keyring{label} and holds no items: it will be \
@@ -222,7 +258,8 @@ pub fn delete_spec(state: &AppState, info: &KeyringFileInfo) -> DeleteSpec {
         lines: vec![line],
         needs_passphrase: state.files.iter().any(|f| f.plaintext),
         passphrase_note: MSG_DELETE_LIVE_PLAINTEXT,
-        backup_optional: empty,
+        backup_optional: false,
+        empty,
     }
 }
 
@@ -593,7 +630,7 @@ mod tests {
     fn retire_text_by_mode() {
         let f = textual("Default_keyring", 3, false);
         assert_eq!(
-            retire_dialog_text(&RetireMode::DeleteFile, &f),
+            retire_dialog_text(&RetireMode::DeleteFile, &f, false),
             [
                 "\"Default_keyring.keyring\" is backed up, encrypted with the passphrase \
                  below, then deleted from disk.",
@@ -604,7 +641,7 @@ mod tests {
         let live = RetireMode::DeleteLiveCollection(CollectionId("/c/x".into()));
         let empty = textual("Default_1", 0, true);
         assert_eq!(
-            retire_dialog_text(&live, &empty),
+            retire_dialog_text(&live, &empty, false),
             [
                 "gnome-keyring has this file loaded: this will delete the live keyring \
                  'Label' with backup.",
@@ -678,20 +715,70 @@ mod tests {
         live.item_count = 0;
         s.apply(Event::Collections(vec![live.clone()]));
         let spec = delete_spec(&s, &b);
-        assert!(
-            spec.backup_optional,
-            "an empty loaded keyring may skip the backup"
-        );
+        assert!(spec.empty, "an empty loaded keyring needs no backup");
+        assert!(!spec.backup_optional, "no checkbox: nothing to choose");
         assert!(spec.lines[0].contains("holds no items"));
 
         live.locked = true;
         s.apply(Event::Collections(vec![live]));
         let spec = delete_spec(&s, &b);
         assert!(
-            !spec.backup_optional,
-            "a locked keyring never counts as empty"
+            spec.empty,
+            "gnome-keyring reports the items of a locked keyring"
         );
-        assert!(spec.lines[0].ends_with("after a backup."));
+        assert!(spec.lines[0].contains("holds no items"));
+    }
+
+    /// A file the daemon does not serve is empty when its scan found a
+    /// textual keyring without items.
+    #[test]
+    fn delete_spec_of_empty_file() {
+        let mut s = AppState::default();
+        let empty = textual("loose", 0, true);
+        let full = textual("full", 2, true);
+        s.apply(Event::Files(vec![empty.clone(), full.clone()]));
+        let spec = delete_spec(&s, &empty);
+        assert!(spec.empty);
+        assert!(spec.lines[0].contains("holds no items"), "{:?}", spec.lines);
+        assert!(!delete_spec(&s, &full).empty);
+    }
+
+    /// The retire dialog of an empty file asks no passphrase.
+    #[test]
+    fn retire_dialog_of_empty_file() {
+        let mut s = AppState::default();
+        let empty = textual("loose", 0, true);
+        let full = textual("full", 2, true);
+        s.apply(Event::Files(vec![empty.clone(), full.clone()]));
+        match retire_dialog(&s, &empty) {
+            DialogKind::RetireFile { empty, lines, .. } => {
+                assert!(empty);
+                assert_eq!(
+                    lines,
+                    ["\"loose.keyring\" holds no items: it is deleted from disk."]
+                );
+            }
+            _ => panic!("expected RetireFile"),
+        }
+        assert!(matches!(
+            retire_dialog(&s, &full),
+            DialogKind::RetireFile { empty: false, .. }
+        ));
+        let live = col("/org/freedesktop/secrets/collection/loose", "Loose", true);
+        s.apply(Event::Collections(vec![live]));
+        match retire_dialog(&s, &empty) {
+            DialogKind::RetireFile { empty, lines, .. } => {
+                assert!(empty, "the loaded keyring holds no items");
+                assert_eq!(
+                    lines,
+                    [
+                        "gnome-keyring has this file loaded: this will delete the live keyring \
+                      'Label', it holds no items."
+                    ]
+                );
+            }
+            _ => panic!("expected RetireFile"),
+        }
     }
 
     /// The live note names the keyring id and its label.

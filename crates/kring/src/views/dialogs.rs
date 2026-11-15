@@ -59,6 +59,10 @@ pub struct DeleteSpec {
     pub passphrase_note: &'static str,
     /// The backup may be skipped (the checkbox is shown).
     pub backup_optional: bool,
+    /// The keyring held no items in the last listing: no backup is needed,
+    /// the checkbox and passphrase are hidden (the worker re-checks and asks
+    /// a passphrase when it turns out not empty).
+    pub empty: bool,
 }
 
 /// A keyring offered as import target.
@@ -163,6 +167,9 @@ pub enum DialogKind {
         lines: Vec<String>,
         passphrase: Zeroizing<String>,
         confirm: Zeroizing<String>,
+        /// The file held no items in the last listing: no backup passphrase
+        /// is asked (the worker re-checks and asks when it turns out not empty).
+        empty: bool,
     },
     /// Confirm deleting a keyring file (a live one through the daemon).
     DeleteFile {
@@ -400,6 +407,18 @@ impl DialogKind {
             lines,
             passphrase: new_buffer(),
             confirm: new_buffer(),
+            empty: false,
+        }
+    }
+
+    /// Retire confirmation of the empty file `name`: no backup passphrase.
+    pub fn retire_empty_file(name: String, lines: Vec<String>) -> Self {
+        Self::RetireFile {
+            name,
+            lines,
+            passphrase: new_buffer(),
+            confirm: new_buffer(),
+            empty: true,
         }
     }
 
