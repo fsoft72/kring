@@ -21,6 +21,8 @@ const FDO_FIELD_PREFIX: &str = "$fdo_";
 const FIELD_CREATED: &str = "$fdo_created";
 /// Entry field holding the modification time.
 const FIELD_MODIFIED: &str = "$fdo_modified";
+/// Entry field holding the content type of the secret.
+const FIELD_MIME_TYPE: &str = "$fdo_mime_type";
 /// Entry field holding the attribute map.
 const FIELD_ATTRIBUTES: &str = "attributes";
 
@@ -33,6 +35,8 @@ pub struct FdoMeta {
     pub created: u64,
     /// Last modification time, unix seconds (0 when missing).
     pub modified: u64,
+    /// Content type of the secret (`$fdo_mime_type`), when the record has one.
+    pub mime_type: Option<String>,
 }
 
 /// Parses an attributes JSON into metadata keyed by `(folder, key)`.
@@ -71,6 +75,11 @@ pub fn read_attributes(json: &[u8]) -> Result<HashMap<(String, String), FdoMeta>
             attributes,
             created: _seconds(record.get(FIELD_CREATED)),
             modified: _seconds(record.get(FIELD_MODIFIED)),
+            mime_type: record
+                .get(FIELD_MIME_TYPE)
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string),
         };
         out.insert((folder.to_string(), key.to_string()), meta);
     }
@@ -110,6 +119,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         assert_eq!(bob.attributes, want);
+        assert_eq!(bob.mime_type.as_deref(), Some("text/plain"));
         assert!(meta.contains_key(&_k("Streams", "blob")));
         assert!(meta.contains_key(&_k("Secret Service", "Fixture bob__0_")));
     }
@@ -118,9 +128,12 @@ mod tests {
     #[test]
     fn tolerant_parsing() {
         let json = br#"{"$fdo_created":"1","x":"y","noslash":{},"F/a/b":{"$fdo_modified":7,
-            "extra":1,"attributes":{"k":"v","n":3}},"F/c":5,"G/d":{"$fdo_created":"bad"}}"#;
+            "extra":1,"attributes":{"k":"v","n":3}},"F/c":5,"G/d":{"$fdo_created":"bad"},
+            "H/e":{"$fdo_mime_type":"image/png"},"H/f":{"$fdo_mime_type":5}}"#;
         let meta = read_attributes(json).expect("parse");
-        assert_eq!(meta.len(), 2);
+        assert_eq!(meta.len(), 4);
+        assert_eq!(meta[&_k("H", "e")].mime_type.as_deref(), Some("image/png"));
+        assert_eq!(meta[&_k("H", "f")].mime_type, None);
         let ab = &meta[&_k("F", "a/b")];
         assert_eq!((ab.created, ab.modified), (0, 7));
         assert_eq!(ab.attributes.len(), 1);

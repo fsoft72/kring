@@ -34,7 +34,10 @@
 //!
 //! Values: Password -> text secret, Map -> JSON object text
 //! (`application/json`, keys sorted), Stream -> bytes
-//! (`application/octet-stream`). Unknown entry types have no value and are
+//! (`application/octet-stream`). App entries use the record's
+//! `$fdo_mime_type` as content type when present (the daemon reports
+//! `text/plain` for items created through the Secret Service API, so
+//! libsecret `get_text` keeps working); native entries are unchanged. Unknown entry types have no value and are
 //! skipped.
 
 use std::collections::{BTreeMap, HashMap};
@@ -106,12 +109,18 @@ pub fn to_incoming(
         let record = meta.get(&(entry.folder.clone(), entry.key.clone()));
         let app_attributes =
             record.filter(|m| !m.attributes.is_empty() && !_is_synthesized(entry, m));
+        let mut secret = secret;
         let (label, attributes, modified) = match app_attributes {
-            Some(m) => (
-                _compat_label(&entry.folder, &entry.key),
-                m.attributes.clone(),
-                m.modified,
-            ),
+            Some(m) => {
+                if let Some(mime) = &m.mime_type {
+                    secret.content_type = mime.clone();
+                }
+                (
+                    _compat_label(&entry.folder, &entry.key),
+                    m.attributes.clone(),
+                    m.modified,
+                )
+            }
             None => (
                 format!("{}/{}", entry.folder, entry.key),
                 _native_attributes(entry, kind),
@@ -337,6 +346,35 @@ mod tests {
         assert_eq!(blob.secret.content_type, "application/octet-stream");
         assert_eq!(items.len(), 7);
         assert!(items.iter().all(|i| !i.secret_missing));
+    }
+
+    /// App entries take the record's content type, native ones keep theirs.
+    #[test]
+    fn app_entries_use_fdo_mime_type() {
+        let (entries, items) = _fixture_items();
+        let map = _find(&entries, &items, "Secret Service", "Fixture map");
+        assert_eq!(map.secret.content_type, "text/plain");
+        let bob = _find(&entries, &items, "Secret Service", "Fixture bob");
+        assert_eq!(bob.secret.content_type, "text/plain");
+        let blob = _find(&entries, &items, "Streams", "blob");
+        assert_eq!(blob.secret.content_type, "application/octet-stream");
+        let entry = WalletEntry {
+            folder: "Apps".into(),
+            key: "s".into(),
+            value: EntryValue::Stream(SecretValue::new(vec![1, 2], "application/octet-stream")),
+        };
+        let mut meta = HashMap::new();
+        meta.insert(
+            ("Apps".to_string(), "s".to_string()),
+            FdoMeta {
+                attributes: _attrs(&[("a", "b")]),
+                mime_type: Some("text/plain".into()),
+                ..FdoMeta::default()
+            },
+        );
+        let items = to_incoming(&[entry], &meta);
+        assert_eq!(items[0].secret.content_type, "text/plain");
+        assert_eq!(items[0].secret.as_bytes(), &[1, 2]);
     }
 
     /// Unique-name suffixes are removed only in the exact `__N_` form.
