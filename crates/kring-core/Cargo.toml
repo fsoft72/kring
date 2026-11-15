@@ -20,6 +20,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 blowfish = { version = "0.10.0", features = ["zeroize"] }
 sha1 = "0.11"
 pbkdf2 = "0.13"
+libc = "0.2"
 # SSH key files (OpenSSH formats); no GUI or system crypto libraries.
 ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "p256", "p384", "rsa", "encryption", "getrandom"] }
 

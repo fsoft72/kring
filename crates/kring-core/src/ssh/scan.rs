@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use ssh_key::public::KeyData;
@@ -14,6 +15,12 @@ use crate::error::{KringError, Result};
 const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 /// Header of the OpenSSH private key format.
 const OPENSSH_HEADER: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+/// Bytes read first from every candidate file to decide whether it is worth reading.
+const PROBE_BYTES: usize = 128;
+/// Start of a PEM block.
+const PEM_PREFIX: &str = "-----BEGIN ";
+/// Leading tokens of an OpenSSH public key line.
+const PUBLIC_TOKENS: [&str; 3] = ["ssh-", "ecdsa-", "sk-"];
 /// Suffix of public key files.
 const PUBLIC_SUFFIX: &str = ".pub";
 /// Algorithm name used for legacy keys without a readable `.pub`.
@@ -57,6 +64,9 @@ pub struct SshKeyInfo {
     pub encrypted: Option<bool>,
     /// True for PEM / PKCS#8 private keys (read-only for kring).
     pub legacy_format: bool,
+    /// True when the private key and the `.pub` hold different public keys.
+    /// Algorithm, bits, fingerprint and comment then describe the private key.
+    pub pub_mismatch: bool,
 }
 
 /// Parsed view of a private key file.
@@ -82,7 +92,9 @@ struct PublicProbe {
 /// Everything else (`authorized_keys`, `known_hosts`, `config`, ...) is ignored.
 /// For OpenSSH private keys the algorithm and fingerprint come from the key
 /// itself (the public part is readable even when encrypted); for legacy keys
-/// they come from the paired `.pub`. A missing directory yields an empty list.
+/// they come from the paired `.pub`. If an OpenSSH private key and its `.pub`
+/// hold different public keys, the private key wins and `pub_mismatch` is set.
+/// An unreadable file is skipped; only a failing `read_dir` is an error. A missing directory yields an empty list.
 pub fn scan_keys(dir: &Path) -> Result<Vec<SshKeyInfo>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -90,7 +102,8 @@ pub fn scan_keys(dir: &Path) -> Result<Vec<SshKeyInfo>> {
     let mut privates: BTreeMap<String, PrivateProbe> = BTreeMap::new();
     let mut publics: BTreeMap<String, PublicProbe> = BTreeMap::new();
     for entry in read_dir(dir)? {
-        let entry = entry.map_err(|e| io_err(dir, &e))?;
+        // An unreadable directory entry must not hide the other keys.
+        let Ok(entry) = entry else { continue };
         let is_regular = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
         if !is_regular {
             continue;
@@ -98,10 +111,10 @@ pub fn scan_keys(dir: &Path) -> Result<Vec<SshKeyInfo>> {
         let file_name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         if let Some(stem) = file_name.strip_suffix(PUBLIC_SUFFIX) {
-            if let Some(key) = probe_public(&path)? {
+            if let Some(key) = probe_public(&path) {
                 publics.insert(stem.to_string(), PublicProbe { path, key });
             }
-        } else if let Some(probe) = probe_private(&path)? {
+        } else if let Some(probe) = probe_private(&path) {
             privates.insert(file_name, probe);
         }
     }
@@ -127,61 +140,91 @@ fn io_err(path: &Path, e: &std::io::Error) -> KringError {
     }
 }
 
-/// Reads at most [`MAX_KEY_FILE_BYTES`] of a regular file as UTF-8 text.
+/// Reads a candidate file as UTF-8 text, in two steps.
 ///
-/// Returns `None` for oversized or non-UTF-8 files (never keys).
-fn read_bounded(path: &Path) -> Result<Option<String>> {
-    let file = fs::File::open(path).map_err(|e| io_err(path, &e))?;
-    let len = file.metadata().map_err(|e| io_err(path, &e))?.len();
-    if len > MAX_KEY_FILE_BYTES {
-        return Ok(None);
+/// Opens without following symlinks, skips files over [`MAX_KEY_FILE_BYTES`],
+/// reads a [`PROBE_BYTES`] prefix and reads the rest only if `wanted(prefix)`.
+/// Any open or read error, or non-UTF-8 content, yields `None`: a single
+/// unreadable file never aborts a scan.
+fn read_candidate(path: &Path, wanted: impl Fn(&str) -> bool) -> Option<String> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_KEY_FILE_BYTES {
+        return None;
     }
+    let mut file = file;
     let mut bytes = Vec::new();
-    file.take(MAX_KEY_FILE_BYTES)
+    (&mut file)
+        .take(PROBE_BYTES as u64)
         .read_to_end(&mut bytes)
-        .map_err(|e| io_err(path, &e))?;
-    Ok(String::from_utf8(bytes).ok())
+        .ok()?;
+    note_bytes_read(bytes.len());
+    // A prefix cut inside a multi-byte character is fine for the ASCII checks.
+    if !wanted(&String::from_utf8_lossy(&bytes)) {
+        return None;
+    }
+    let before = bytes.len();
+    file.take(MAX_KEY_FILE_BYTES).read_to_end(&mut bytes).ok()?;
+    note_bytes_read(bytes.len() - before);
+    String::from_utf8(bytes).ok()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Bytes read by [`read_candidate`] on this thread (test instrumentation).
+    static BYTES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Adds to the test-only read counter.
+#[cfg(test)]
+fn note_bytes_read(n: usize) {
+    BYTES_READ.with(|c| c.set(c.get() + n));
+}
+
+/// No-op outside tests.
+#[cfg(not(test))]
+fn note_bytes_read(_n: usize) {}
+
 /// Parses a `.pub` file; `None` when it is not an OpenSSH public key.
-fn probe_public(path: &Path) -> Result<Option<PublicKey>> {
-    let Some(text) = read_bounded(path)? else {
-        return Ok(None);
-    };
-    Ok(PublicKey::from_openssh(text.trim()).ok())
+fn probe_public(path: &Path) -> Option<PublicKey> {
+    let text = read_candidate(path, |prefix| {
+        let head = prefix.trim_start();
+        PUBLIC_TOKENS.iter().any(|t| head.starts_with(t))
+    })?;
+    PublicKey::from_openssh(text.trim()).ok()
 }
 
 /// Cheap header check, then parse; `None` when the file is not a private key.
-fn probe_private(path: &Path) -> Result<Option<PrivateProbe>> {
-    let Some(text) = read_bounded(path)? else {
-        return Ok(None);
-    };
+fn probe_private(path: &Path) -> Option<PrivateProbe> {
+    let text = read_candidate(path, |prefix| prefix.trim_start().starts_with(PEM_PREFIX))?;
     let head = text.trim_start();
     if head.starts_with(OPENSSH_HEADER) {
-        let Ok(key) = PrivateKey::from_openssh(&text) else {
-            return Ok(None);
-        };
-        return Ok(Some(PrivateProbe {
+        let key = PrivateKey::from_openssh(&text).ok()?;
+        return Some(PrivateProbe {
             path: path.to_path_buf(),
             encrypted: key.is_encrypted(),
             legacy: false,
             public: Some(key.public_key().clone()),
-        }));
+        });
     }
     let first_line = head.lines().next().unwrap_or("");
     let is_pem_private =
         first_line.starts_with("-----BEGIN ") && first_line.contains("PRIVATE KEY-----");
     if !is_pem_private {
-        return Ok(None);
+        return None;
     }
     // "Proc-Type: 4,ENCRYPTED" (traditional PEM) or PKCS#8 "ENCRYPTED PRIVATE KEY".
     let encrypted = first_line.contains("ENCRYPTED") || text.contains("Proc-Type: 4,ENCRYPTED");
-    Ok(Some(PrivateProbe {
+    Some(PrivateProbe {
         path: path.to_path_buf(),
         encrypted,
         legacy: true,
         public: None,
-    }))
+    })
 }
 
 /// Combines the probes of one name into an [`SshKeyInfo`].
@@ -209,8 +252,17 @@ fn build_info(
             )
         })?,
     };
+    let pub_mismatch = match (
+        private.as_ref().and_then(|p| p.public.as_ref()),
+        public.as_ref(),
+    ) {
+        (Some(from_private), Some(from_pub)) => from_private.key_data() != from_pub.key.key_data(),
+        _ => false,
+    };
+    // On a mismatch the .pub describes another key: its comment is not ours.
     let comment = public
         .as_ref()
+        .filter(|_| !pub_mismatch)
         .map(|p| p.key.comment().to_string())
         .filter(|c| !c.is_empty())
         .or_else(|| key.map(|k| k.comment().to_string()))
@@ -219,6 +271,7 @@ fn build_info(
         name: name.to_string(),
         encrypted: private.as_ref().map(|p| p.encrypted),
         legacy_format: private.as_ref().is_some_and(|p| p.legacy),
+        pub_mismatch,
         private_path: private.map(|p| p.path),
         public_path: public.map(|p| p.path),
         algorithm,
@@ -258,5 +311,22 @@ fn bits_of(data: &KeyData) -> Option<u32> {
             u32::try_from(bits).ok()
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A big non-key file is only probed (prefix), never read in full.
+    #[test]
+    fn non_key_files_are_only_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("decoy"), "x".repeat(60 * 1024)).unwrap();
+        fs::write(dir.path().join("decoy.pub"), "y".repeat(60 * 1024)).unwrap();
+        BYTES_READ.with(|c| c.set(0));
+        assert!(scan_keys(dir.path()).unwrap().is_empty());
+        let read = BYTES_READ.with(|c| c.get());
+        assert!(read <= 2 * PROBE_BYTES, "read {read} bytes");
     }
 }

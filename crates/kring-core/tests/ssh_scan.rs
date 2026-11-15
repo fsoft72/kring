@@ -210,3 +210,59 @@ fn missing_dir_is_empty() {
     let dir = tempfile::tempdir().unwrap();
     assert!(scan_keys(&dir.path().join("nope")).unwrap().is_empty());
 }
+
+/// An unreadable file is skipped; the other keys are still listed.
+#[test]
+fn unreadable_file_is_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = copy_fixtures(&["id_ed25519", "id_ed25519.pub", "id_rsa"]);
+    let locked = dir.path().join("id_rsa");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&locked).is_ok() {
+        eprintln!("skipped: running as root, mode 000 is readable");
+        return;
+    }
+    let keys = scan_keys(dir.path()).unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].name, "id_ed25519");
+}
+
+/// Names with dots pair correctly and do not clash with the base name.
+#[test]
+fn dotted_names_pair_by_full_name() {
+    let dir = copy_fixtures(&["id_ed25519", "id_ed25519.pub"]);
+    fs::copy(fixtures().join("id_rsa"), dir.path().join("id_ed25519.old")).unwrap();
+    fs::copy(
+        fixtures().join("id_rsa.pub"),
+        dir.path().join("id_ed25519.old.pub"),
+    )
+    .unwrap();
+    let keys = scan_keys(dir.path()).unwrap();
+    assert_eq!(keys.len(), 2);
+    let base = find(&keys, "id_ed25519");
+    assert_eq!(base.algorithm, SshAlgorithm::Ed25519);
+    let old = find(&keys, "id_ed25519.old");
+    assert_eq!(old.algorithm, SshAlgorithm::Rsa);
+    assert_eq!(old.public_path, Some(dir.path().join("id_ed25519.old.pub")));
+}
+
+/// A `.pub` holding another key is flagged; the private key wins.
+#[test]
+fn mismatched_pub_is_flagged() {
+    let dir = copy_fixtures(&["id_ed25519", "id_ed25519.pub"]);
+    fs::copy(
+        fixtures().join("id_rsa.pub"),
+        dir.path().join("id_ed25519.pub"),
+    )
+    .unwrap();
+    let keys = scan_keys(dir.path()).unwrap();
+    let k = find(&keys, "id_ed25519");
+    assert!(k.pub_mismatch);
+    assert_eq!(k.algorithm, SshAlgorithm::Ed25519);
+    assert_eq!(
+        k.fingerprint,
+        "SHA256:nn+sXDCeTItgzR4iEno+KHj3w0HTbYHTbgBq7FihJ0Y"
+    );
+    assert_eq!(k.comment, "fixture@kring");
+    assert!(!find(&scan_keys(&fixtures()).unwrap(), "id_ed25519").pub_mismatch);
+}

@@ -125,3 +125,4 @@
 - Plan 4 final review fixes: a typed password of a dialog that reopens when wrong (wallet, keyring file) is remembered only when its command finishes without a wrong-password error (`SessionSecret::remember_if_correct`), so a wrong one no longer replaces a good remembered value. KWallet app entries take the content type from the record's `$fdo_mime_type` (`FdoMeta::mime_type`), e.g. `text/plain` for Map or Stream backed app items; native entries are unchanged.
 - Added implementation plan 5 (SSH keys and ssh-agent).
 - Added SSH key scanning (`kring_core::ssh::scan_keys`, `SshKeyInfo`, `SshAlgorithm`) via `ssh-key` 0.6 (pure Rust), with `ssh-keygen` fixtures in `crates/kring-core/tests/fixtures/ssh/` (ed25519 plain/encrypted, RSA 3072, ECDSA P-256, legacy PEM, orphan `.pub`, decoys).
+  Scanning skips unreadable files, probes a 128 byte prefix before reading, opens with O_NOFOLLOW and flags a `.pub` that does not match its private key (`pub_mismatch`).

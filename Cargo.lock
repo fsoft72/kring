@@ -2460,6 +2460,7 @@ dependencies = [
  "blowfish 0.10.0",
  "hex",
  "kring-core",
+ "libc",
  "oo7",
  "pbkdf2 0.13.0",
  "serde",
