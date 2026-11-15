@@ -1,0 +1,118 @@
+# Build, test and release kring.
+#
+# - Push / pull request: tests, clippy, GUI toolkit guard and the release
+#   binaries (kept as workflow artifacts).
+# - Tag v<version>: the same binaries attached to a GitHub Release.
+#
+# Binaries are linked against glibc 2.28 through cargo-zigbuild, so they run
+# on most current distributions. A static musl binary is not an option: it
+# cannot dlopen libwayland, libX11 and libEGL/libGL, which winit and glutin
+# load at runtime, so the window would never open.
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Oldest glibc the binaries require.
+  GLIBC_VERSION: "2.28"
+
+jobs:
+  check:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnupg openssh-client
+      - name: GUI toolkit guard
+        run: bash scripts/check-no-gui-toolkits.sh
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+      - name: Read version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "kring") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check tag matches version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "v${{ steps.version.outputs.version }}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo version ${{ steps.version.outputs.version }}" >&2
+            exit 1
+          fi
+      - name: Build
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+        run: cargo zigbuild --release -p kring --target ${{ matrix.target }}.${GLIBC_VERSION}
+      - name: Package
+        id: package
+        run: |
+          name="kring-${{ steps.version.outputs.version }}-${{ matrix.arch }}"
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/kring" "dist/$name"
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          file "dist/$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
