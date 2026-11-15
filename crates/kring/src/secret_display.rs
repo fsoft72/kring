@@ -1,14 +1,31 @@
 //! Decides how a secret is shown in the UI.
 
-use kring_core::model::SecretValue;
+use std::fmt;
 
-/// How a secret is rendered.
-#[derive(Clone, Debug, PartialEq, Eq)]
+use kring_core::model::SecretValue;
+use zeroize::Zeroizing;
+
+/// Lowercase hex digits.
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// How a secret is rendered. Contents are zeroized on drop and redacted in `Debug`.
 pub enum SecretView {
     /// Printable UTF-8 text.
-    Text(String),
+    Text(Zeroizing<String>),
     /// Non-text bytes, shown as lowercase hex.
-    Binary { len: usize, hex: String },
+    Binary { len: usize, hex: Zeroizing<String> },
+}
+
+impl fmt::Debug for SecretView {
+    /// Prints only the length, never the content.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(t) => write!(f, "Text(<redacted, {} bytes>)", t.len()),
+            Self::Binary { len, .. } => {
+                write!(f, "Binary {{ len: {len}, hex: <redacted> }}")
+            }
+        }
+    }
 }
 
 /// Returns true for control characters that make text unfit for display.
@@ -19,9 +36,13 @@ fn _is_junk(c: char) -> bool {
 /// Builds the view of a secret: text when valid UTF-8 without junk, hex otherwise.
 pub fn secret_display(s: &SecretValue) -> SecretView {
     if let Some(text) = s.as_text().filter(|t| !t.chars().any(_is_junk)) {
-        return SecretView::Text(text.to_string());
+        return SecretView::Text(Zeroizing::new(String::from(text)));
     }
-    let hex = s.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let mut hex = Zeroizing::new(String::with_capacity(s.len() * 2));
+    for b in s.as_bytes() {
+        hex.push(HEX_DIGITS[usize::from(b >> 4)] as char);
+        hex.push(HEX_DIGITS[usize::from(b & 0x0f)] as char);
+    }
     SecretView::Binary { len: s.len(), hex }
 }
 
@@ -41,13 +62,7 @@ mod tests {
             vec![0xff, 0x00],
             "application/octet-stream",
         ));
-        assert_eq!(
-            v,
-            SecretView::Binary {
-                len: 2,
-                hex: "ff00".into()
-            }
-        );
+        assert!(matches!(&v, SecretView::Binary { len: 2, hex } if hex.as_str() == "ff00"));
         assert!(!can_copy(&v));
     }
 
@@ -55,7 +70,7 @@ mod tests {
     #[test]
     fn utf8_secret_is_text() {
         let v = secret_display(&SecretValue::from_text("pass\nword\t"));
-        assert_eq!(v, SecretView::Text("pass\nword\t".into()));
+        assert!(matches!(&v, SecretView::Text(t) if t.as_str() == "pass\nword\t"));
         assert!(can_copy(&v));
     }
 
@@ -63,12 +78,17 @@ mod tests {
     #[test]
     fn control_chars_are_binary() {
         let v = secret_display(&SecretValue::new(vec![b'a', 0x00, b'b'], "text/plain"));
-        assert_eq!(
-            v,
-            SecretView::Binary {
-                len: 3,
-                hex: "610062".into()
-            }
-        );
+        assert!(matches!(&v, SecretView::Binary { len: 3, hex } if hex.as_str() == "610062"));
+    }
+
+    /// Debug output contains neither the secret nor its hex.
+    #[test]
+    fn secret_view_debug_is_redacted() {
+        let text = secret_display(&SecretValue::from_text("hunter2"));
+        let out = format!("{text:?}");
+        assert!(!out.contains("hunter2") && !out.contains("68756e74657232"));
+        let bin = secret_display(&SecretValue::new(vec![0xde, 0xad], "x"));
+        let out = format!("{bin:?}");
+        assert!(!out.contains("dead"));
     }
 }
