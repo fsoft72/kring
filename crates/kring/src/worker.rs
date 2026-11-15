@@ -10,8 +10,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use kring_core::backup::{
     BACKUP_KEEP, BackupInfo, BackupManager, RestoreReport, keyring_backup_set,
 };
-use kring_core::keyring_file::KeyringFileInfo;
 use kring_core::keyring_file::textual::{OfflineItem, ParseWarning};
+use kring_core::keyring_file::{KeyringFileInfo, RetireBatchReport};
 use kring_core::model::{
     CollectionId, CollectionInfo, ItemId, ItemInfo, ItemUpdate, NewItem, SecretValue,
     decode_path_segment,
@@ -19,15 +19,21 @@ use kring_core::model::{
 use kring_core::pam::{PamStatus, pam_status};
 use kring_core::paths;
 use kring_core::provider::ProviderInfo;
+use kring_core::transfer::apply::{TransferMode, TransferReport};
+use kring_core::transfer::consolidate::PLANNED_ID_PREFIX;
+use kring_core::transfer::consolidate_apply::ConsolidationReport;
 use kring_core::transfer::import::ImportReport;
+use kring_core::transfer::plan::{Choice, TransferCounts};
 use kring_core::{KringError, MasterPasswordStore, SecretStore};
 
 use crate::worker_offline;
+use crate::worker_transfer::{self, PlanState};
+pub use crate::worker_transfer::{ConflictView, ConsolidationSummary, StepSummary};
 
 /// Default PAM configuration directory.
 const PAM_DIR: &str = "/etc/pam.d";
 /// Message used when the provider forbids an operation.
-const MSG_UNSUPPORTED: &str = "Not supported on this provider";
+pub(crate) const MSG_UNSUPPORTED: &str = "Not supported on this provider";
 /// Message used when no provider is running.
 pub(crate) const MSG_NO_PROVIDER: &str = "No Secret Service provider running";
 /// Object path prefix of Secret Service collections.
@@ -36,6 +42,8 @@ const COLLECTION_PATH_PREFIX: &str = "/org/freedesktop/secrets/collection/";
 const SESSION_COLLECTION: &str = "session";
 /// Suffix of refusals to delete without a backup.
 const MSG_NO_BACKUP: &str = "refusing to delete without a backup";
+/// Message for a secret request on an item that a plan has not created yet.
+const MSG_PLANNED_ITEM: &str = "This item does not exist yet, it is created by the plan";
 
 /// A request from the UI to the worker.
 #[derive(Clone, Debug)]
@@ -95,7 +103,8 @@ pub enum Command {
         name: String,
         password: Option<SecretValue>,
     },
-    /// Copy the items of a keyring file into a collection.
+    /// Copy the items of a keyring file into a collection: same as
+    /// [`Command::PlanFileImport`] (applied directly when there are no conflicts).
     ImportFile {
         name: String,
         password: Option<SecretValue>,
@@ -120,12 +129,54 @@ pub enum Command {
         path: PathBuf,
         passphrase: SecretValue,
     },
-    /// Import the items of an archive into a collection.
+    /// Import the items of an archive into a collection: same as
+    /// [`Command::PlanArchiveImport`] (applied directly when there are no conflicts).
     ImportArchive {
         path: PathBuf,
         passphrase: SecretValue,
         target: CollectionId,
     },
+    /// Plan copying or moving live items into a collection; answers with
+    /// [`Event::TransferPreview`].
+    PlanTransfer {
+        items: Vec<ItemId>,
+        target: CollectionId,
+        mode: TransferMode,
+    },
+    /// Plan importing a keyring file: applied directly (copy, no backup) when
+    /// there are no conflicts, otherwise answered with [`Event::TransferPreview`].
+    PlanFileImport {
+        name: String,
+        password: Option<SecretValue>,
+        target: CollectionId,
+    },
+    /// Plan importing an archive, with the same rule as [`Command::PlanFileImport`].
+    PlanArchiveImport {
+        path: PathBuf,
+        passphrase: SecretValue,
+        target: CollectionId,
+    },
+    /// Apply the pending transfer plan with one choice per previewed conflict.
+    ApplyTransfer {
+        plan_id: u64,
+        choices: Vec<Choice>,
+        backup_passphrase: Option<SecretValue>,
+    },
+    /// Plan merging every readable collection into `target`; answers with
+    /// [`Event::ConsolidationPreview`].
+    PlanConsolidation {
+        target: CollectionId,
+        include_orphan_files: bool,
+    },
+    /// Apply the pending consolidation plan with choices per move step.
+    ApplyConsolidation {
+        plan_id: u64,
+        choices: Vec<Vec<Choice>>,
+        backup_passphrase: Option<SecretValue>,
+        orphan_files_passphrase: Option<SecretValue>,
+    },
+    /// Drop the pending plan.
+    DiscardPlan,
 }
 
 /// A notification from the worker to the UI.
@@ -163,6 +214,25 @@ pub enum Event {
     Backups(Vec<BackupInfo>),
     /// A restore finished.
     RestoreDone(RestoreReport),
+    /// A transfer plan waiting for [`Command::ApplyTransfer`] (no secrets).
+    TransferPreview {
+        plan_id: u64,
+        target: CollectionId,
+        mode: TransferMode,
+        counts: TransferCounts,
+        conflicts: Vec<ConflictView>,
+    },
+    /// A transfer finished.
+    TransferDone(TransferReport),
+    /// A consolidation plan waiting for [`Command::ApplyConsolidation`] (no secrets).
+    ConsolidationPreview {
+        plan_id: u64,
+        summary: ConsolidationSummary,
+    },
+    /// Steps of the running consolidation done so far.
+    ConsolidationProgress { done: usize, total: usize },
+    /// A consolidation finished, with the orphan file retire report when one ran.
+    ConsolidationDone(ConsolidationReport, Option<RetireBatchReport>),
     /// An operation finished with a message.
     Done(String),
     /// An operation failed with a message.
@@ -245,8 +315,10 @@ where
         };
         let first = startup(&out, store.as_deref(), provider.as_ref(), &config);
         run_guarded(&out, &runtime, first);
+        let mut plans = PlanState::default();
         while let Ok(cmd) = cmd_rx.recv() {
-            let run = handle(&out, store.as_deref(), provider.as_ref(), &config, cmd);
+            let store = store.as_deref();
+            let run = handle(&out, store, provider.as_ref(), &config, &mut plans, cmd);
             run_guarded(&out, &runtime, run);
         }
     });
@@ -317,7 +389,7 @@ pub(crate) async fn load_items<S: SecretStore, N: Fn()>(
 }
 
 /// Returns the parent object path of an item (its collection).
-fn collection_of(item: &ItemId) -> CollectionId {
+pub(crate) fn collection_of(item: &ItemId) -> CollectionId {
     let parent = item.0.rsplit_once('/').map_or("", |(parent, _)| parent);
     CollectionId(parent.to_string())
 }
@@ -329,10 +401,10 @@ fn collection_of(item: &ItemId) -> CollectionId {
 /// The in-memory `session` collection yields `Ok(None)`. A path that is not a
 /// collection path, a malformed escape, or a decoded name that is empty, `.`, `..`
 /// or contains `/` is an error message (the delete stays refused).
-fn keyring_name(collection: &CollectionId) -> Result<Option<String>, String> {
+fn keyring_name(collection: &CollectionId, refusal: &str) -> Result<Option<String>, String> {
     let refuse = || {
         format!(
-            "Cannot find the keyring file of {}: {MSG_NO_BACKUP}",
+            "Cannot find the keyring file of {}: {refusal}",
             collection.0
         )
     };
@@ -351,12 +423,34 @@ fn keyring_name(collection: &CollectionId) -> Result<Option<String>, String> {
 }
 
 /// Result of the backup step before a destructive operation.
-enum BackupStep {
+pub(crate) enum BackupStep {
     /// Go ahead; carries the backup directory (`None` when no backup was needed).
     Proceed(Option<PathBuf>),
-    /// The command was answered (passphrase requested or error reported) and must not run.
+    /// A passphrase was requested with [`Event::PassphraseNeeded`]; must not run yet.
+    AwaitingPassphrase,
+    /// An error was reported; must not run.
     Stop,
 }
+
+/// Wording of backup refusals for one kind of operation.
+pub(crate) struct BackupWording {
+    /// Suffix of a refusal, such as `refusing to delete without a backup`.
+    refusal: &'static str,
+    /// Prefix of a backup failure, such as `Backup failed, nothing was deleted`.
+    failed: &'static str,
+}
+
+/// Wording for deletes.
+const DELETE_WORDING: BackupWording = BackupWording {
+    refusal: MSG_NO_BACKUP,
+    failed: "Backup failed, nothing was deleted",
+};
+
+/// Wording for transfers and consolidations (overwrites, moves, deletes).
+pub(crate) const CHANGE_WORDING: BackupWording = BackupWording {
+    refusal: "refusing to change without a backup",
+    failed: "Backup failed, nothing was changed",
+};
 
 /// Backs up all keyrings before deleting from `collection`, failing closed.
 ///
@@ -370,26 +464,63 @@ fn backup_before<N: Fn()>(
     passphrase: Option<&SecretValue>,
     original: &Command,
 ) -> BackupStep {
-    let name = match keyring_name(collection) {
-        Ok(Some(name)) => name,
-        Ok(None) => return BackupStep::Proceed(None),
-        Err(message) => {
-            out.error(message);
-            return BackupStep::Stop;
+    let collections = std::slice::from_ref(collection);
+    backup_collections(
+        out,
+        config,
+        collections,
+        reason,
+        passphrase,
+        original,
+        &DELETE_WORDING,
+    )
+}
+
+/// Takes ONE backup of all keyrings before changing `collections`, failing closed.
+///
+/// Every named collection except the in-memory `session` one must have its
+/// `<decoded name>.keyring` in the backup set, otherwise nothing is backed up
+/// and the operation is refused. When only `session` is named no backup is
+/// needed. A missing passphrase emits [`Event::PassphraseNeeded`] with `original`.
+pub(crate) fn backup_collections<N: Fn()>(
+    out: &Emitter<N>,
+    config: &WorkerConfig,
+    collections: &[CollectionId],
+    reason: &str,
+    passphrase: Option<&SecretValue>,
+    original: &Command,
+    wording: &BackupWording,
+) -> BackupStep {
+    let mut names: Vec<String> = Vec::new();
+    for collection in collections {
+        match keyring_name(collection, wording.refusal) {
+            Ok(Some(name)) if !names.contains(&name) => names.push(name),
+            Ok(_) => {}
+            Err(message) => {
+                out.error(message);
+                return BackupStep::Stop;
+            }
         }
-    };
+    }
+    if names.is_empty() {
+        return BackupStep::Proceed(None);
+    }
     let files = match keyring_backup_set(&config.keyrings_dir) {
         Ok(files) => files,
         Err(e) => {
-            out.error(format!("Backup failed, nothing was deleted: {e}"));
+            out.error(format!("{}: {e}", wording.failed));
             return BackupStep::Stop;
         }
     };
-    let target = config.keyrings_dir.join(format!("{name}.keyring"));
-    if !files.contains(&target) {
+    for name in &names {
+        let file = config.keyrings_dir.join(format!("{name}.keyring"));
+        if files.contains(&file) {
+            continue;
+        }
         let dir = config.keyrings_dir.display();
         out.error(format!(
-            "No keyring file found for '{name}' in {dir}: {MSG_NO_BACKUP}"
+            "No keyring file found for '{name}' in {dir}: {}",
+            wording.refusal
         ));
         return BackupStep::Stop;
     }
@@ -407,10 +538,10 @@ fn backup_before<N: Fn()>(
         }
         Err(KringError::PassphraseRequired) => {
             out.emit(Event::PassphraseNeeded(Box::new(original.clone())));
-            BackupStep::Stop
+            BackupStep::AwaitingPassphrase
         }
         Err(e) => {
-            out.error(format!("Backup failed, nothing was deleted: {e}"));
+            out.error(format!("{}: {e}", wording.failed));
             BackupStep::Stop
         }
     }
@@ -448,17 +579,26 @@ fn gate<N: Fn()>(out: &Emitter<N>, provider: Option<&ProviderInfo>, cmd: &Comman
 
 /// Handles one command and emits the resulting events.
 ///
-/// Offline commands (files, backups, archives) are routed to [`worker_offline`].
+/// Plans, imports and applies go to [`worker_transfer`]; any other command
+/// that may change keyring data drops the pending plan first. Offline
+/// commands (files, backups, archives) are routed to [`worker_offline`].
 async fn handle<S, N>(
     out: &Emitter<N>,
     store: Option<&S>,
     provider: Option<&ProviderInfo>,
     config: &WorkerConfig,
+    plans: &mut PlanState,
     cmd: Command,
 ) where
     S: SecretStore + MasterPasswordStore,
     N: Fn(),
 {
+    if worker_transfer::is_transfer(&cmd) {
+        return worker_transfer::handle(out, store, provider, config, plans, cmd).await;
+    }
+    if worker_transfer::invalidates_plan(&cmd) {
+        plans.clear();
+    }
     if worker_offline::is_offline(&cmd) {
         return worker_offline::handle(out, store, provider, config, cmd).await;
     }
@@ -520,6 +660,9 @@ where
             return Ok(());
         }
         Command::RevealSecret(id) => {
+            if id.0.starts_with(PLANNED_ID_PREFIX) {
+                return Err(KringError::InvalidInput(MSG_PLANNED_ITEM.into()));
+            }
             let secret = store.read_secret(id).await?;
             out.emit(Event::Secret(id.clone(), secret));
             return Ok(());
@@ -604,9 +747,16 @@ where
         | Command::ListBackups
         | Command::RestoreBackup { .. }
         | Command::ExportCollection { .. }
-        | Command::ImportArchive { .. } => {
+        | Command::ImportArchive { .. }
+        | Command::PlanTransfer { .. }
+        | Command::PlanFileImport { .. }
+        | Command::PlanArchiveImport { .. }
+        | Command::ApplyTransfer { .. }
+        | Command::PlanConsolidation { .. }
+        | Command::ApplyConsolidation { .. }
+        | Command::DiscardPlan => {
             return Err(KringError::InvalidInput(
-                "Offline command sent to the store path".into(),
+                "Offline or transfer command sent to the store path".into(),
             ));
         }
     };

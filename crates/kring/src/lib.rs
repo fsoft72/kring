@@ -13,3 +13,4 @@ pub mod ui;
 pub mod views;
 pub mod worker;
 mod worker_offline;
+mod worker_transfer;

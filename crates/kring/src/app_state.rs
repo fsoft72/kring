@@ -1,14 +1,17 @@
 //! UI-side application state, updated by worker events.
 
 use kring_core::backup::{BackupInfo, RestoreReport};
-use kring_core::keyring_file::KeyringFileInfo;
 use kring_core::keyring_file::textual::{OfflineItem, ParseWarning};
+use kring_core::keyring_file::{KeyringFileInfo, RetireBatchReport};
 use kring_core::model::{CollectionId, CollectionInfo, ItemId, ItemInfo, SecretValue};
 use kring_core::pam::PamStatus;
 use kring_core::provider::ProviderInfo;
+use kring_core::transfer::apply::{TransferMode, TransferReport};
+use kring_core::transfer::consolidate_apply::{ConsolidationReport, StepOutcome};
 use kring_core::transfer::import::ImportReport;
+use kring_core::transfer::plan::TransferCounts;
 
-use crate::worker::{Command, Event};
+use crate::worker::{Command, ConflictView, ConsolidationSummary, Event};
 
 /// Maximum number of error messages kept.
 const MAX_ERRORS: usize = 20;
@@ -41,6 +44,71 @@ pub fn import_summary(report: &ImportReport) -> String {
         text.push_str(&format!(", {} failed", report.failed.len()));
     }
     text
+}
+
+/// Returns the toast text of a finished transfer, e.g.
+/// `Transferred 2 items, 1 already there, 0 replaced, 1 kept`, followed by
+/// the non-zero extras (removed from / left in the source, without secret,
+/// skipped in batch, failed).
+pub fn transfer_summary(report: &TransferReport) -> String {
+    let mut text = format!(
+        "Transferred {}, {} already there, {} replaced, {} kept",
+        _count(report.created, "item"),
+        report.duplicates,
+        report.replaced,
+        report.kept_target,
+    );
+    let extras = [
+        (report.source_deleted, "removed from the source"),
+        (report.source_kept.len(), "left in the source"),
+        (report.no_secret, "without secret"),
+        (report.same_batch_skipped, "skipped in batch"),
+        (report.failed.len(), "failed"),
+    ];
+    for (n, what) in extras {
+        if n > 0 {
+            text.push_str(&format!(", {n} {what}"));
+        }
+    }
+    text
+}
+
+/// Returns the toast text of a finished consolidation: `Consolidation
+/// complete` (plus the retired orphan files) or the step it stopped at.
+pub fn consolidation_status(
+    report: &ConsolidationReport,
+    retired: Option<&RetireBatchReport>,
+) -> String {
+    if !report.completed {
+        return match report.outcomes.last() {
+            Some(StepOutcome::Failed { step, error }) => {
+                format!("Consolidation stopped at {step}: {error}")
+            }
+            _ => "Consolidation stopped".to_string(),
+        };
+    }
+    match retired {
+        Some(r) => format!(
+            "Consolidation complete, retired {}",
+            _count(r.removed.len(), "orphan file")
+        ),
+        None => "Consolidation complete".to_string(),
+    }
+}
+
+/// A transfer preview waiting for the user's choices (no secrets).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferPreview {
+    /// Plan id to send back with `ApplyTransfer`.
+    pub plan_id: u64,
+    /// Target collection.
+    pub target: CollectionId,
+    /// Copy or move.
+    pub mode: TransferMode,
+    /// Planned action counts.
+    pub counts: TransferCounts,
+    /// Conflicts, one choice each, in this order.
+    pub conflicts: Vec<ConflictView>,
 }
 
 /// Formats `n noun`, adding `s` unless `n` is 1.
@@ -83,6 +151,16 @@ pub struct AppState {
     pub last_import: Option<ImportReport>,
     /// Outcome of the last restore.
     pub last_restore: Option<RestoreReport>,
+    /// Transfer preview waiting for `ApplyTransfer`.
+    pub transfer_preview: Option<TransferPreview>,
+    /// Outcome of the last transfer.
+    pub last_transfer: Option<TransferReport>,
+    /// Consolidation preview `(plan id, summary)` waiting for `ApplyConsolidation`.
+    pub consolidation_preview: Option<(u64, ConsolidationSummary)>,
+    /// Progress `(done, total)` of the running consolidation.
+    pub consolidation_progress: Option<(usize, usize)>,
+    /// Outcome of the last consolidation, with the orphan file retire report.
+    pub last_consolidation: Option<(ConsolidationReport, Option<RetireBatchReport>)>,
     /// Set when a backup was created or restored since the last listing.
     backups_stale: bool,
     /// Notices shown as toasts besides `status` (e.g. pruned backups).
@@ -165,6 +243,40 @@ impl AppState {
                 self.last_restore = Some(report);
                 self.backups_stale = true;
             }
+            Event::TransferPreview {
+                plan_id,
+                target,
+                mode,
+                counts,
+                conflicts,
+            } => {
+                self.transfer_preview = Some(TransferPreview {
+                    plan_id,
+                    target,
+                    mode,
+                    counts,
+                    conflicts,
+                });
+            }
+            Event::TransferDone(report) => {
+                self.status = transfer_summary(&report);
+                self.last_transfer = Some(report);
+                self.transfer_preview = None;
+            }
+            Event::ConsolidationPreview { plan_id, summary } => {
+                self.consolidation_preview = Some((plan_id, summary));
+                self.consolidation_progress = None;
+                self.last_consolidation = None;
+            }
+            Event::ConsolidationProgress { done, total } => {
+                self.consolidation_progress = Some((done, total));
+            }
+            Event::ConsolidationDone(report, retired) => {
+                self.status = consolidation_status(&report, retired.as_ref());
+                self.consolidation_preview = None;
+                self.consolidation_progress = None;
+                self.last_consolidation = Some((report, retired));
+            }
             Event::Done(msg) => self.status = msg,
             Event::Error(msg) => {
                 // The pending file command survives unrelated errors; it is
@@ -229,6 +341,11 @@ impl AppState {
                 (name, password.is_none().then_some(FileAction::Open))
             }
             Command::ImportFile {
+                name,
+                password,
+                target,
+            }
+            | Command::PlanFileImport {
                 name,
                 password,
                 target,
@@ -740,5 +857,97 @@ mod tests {
         }
         assert_eq!(s.errors.len(), 20);
         assert_eq!(s.errors[0], "e5");
+    }
+
+    /// A transfer preview is kept until the transfer is done.
+    #[test]
+    fn transfer_preview_cleared_when_done() {
+        let mut s = AppState::default();
+        s.apply(Event::TransferPreview {
+            plan_id: 7,
+            target: CollectionId("/c/t".into()),
+            mode: TransferMode::Copy,
+            counts: TransferCounts::default(),
+            conflicts: vec![],
+        });
+        assert_eq!(s.transfer_preview.as_ref().map(|p| p.plan_id), Some(7));
+        s.apply(Event::Error("unrelated".into()));
+        assert!(s.transfer_preview.is_some());
+        let report = TransferReport {
+            created: 2,
+            duplicates: 1,
+            source_deleted: 3,
+            ..TransferReport::default()
+        };
+        s.apply(Event::TransferDone(report));
+        assert!(s.transfer_preview.is_none());
+        assert_eq!(
+            s.status,
+            "Transferred 2 items, 1 already there, 0 replaced, 0 kept, 3 removed from the source"
+        );
+    }
+
+    /// Consolidation preview, progress and result replace each other.
+    #[test]
+    fn consolidation_events_flow() {
+        let mut s = AppState::default();
+        let summary = ConsolidationSummary {
+            target: CollectionId("/c/t".into()),
+            steps: vec![],
+            delete_empty: vec![],
+            skipped: vec![],
+            locked_count: 0,
+            set_default: false,
+            conflict_count: 0,
+            orphan_files: vec![],
+        };
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 3,
+            summary,
+        });
+        s.apply(Event::ConsolidationProgress { done: 1, total: 4 });
+        assert_eq!(s.consolidation_progress, Some((1, 4)));
+        let failed = ConsolidationReport {
+            outcomes: vec![StepOutcome::Failed {
+                step: "Move Work".into(),
+                error: "boom".into(),
+            }],
+            completed: false,
+        };
+        s.apply(Event::ConsolidationDone(failed, None));
+        assert!(s.consolidation_preview.is_none() && s.consolidation_progress.is_none());
+        assert_eq!(s.status, "Consolidation stopped at Move Work: boom");
+        let done = ConsolidationReport {
+            outcomes: vec![],
+            completed: true,
+        };
+        let retired = RetireBatchReport {
+            backup: None,
+            removed: vec!["a".into()],
+            kept: vec![],
+        };
+        assert_eq!(
+            consolidation_status(&done, Some(&retired)),
+            "Consolidation complete, retired 1 orphan file"
+        );
+    }
+
+    /// A file import planned without a password resends the same target.
+    #[test]
+    fn plan_file_import_tracked() {
+        let target = CollectionId("/c/t".into());
+        let mut s = tracked(
+            "a",
+            Command::PlanFileImport {
+                name: "a".into(),
+                password: None,
+                target: target.clone(),
+            },
+        );
+        s.apply(Event::PasswordNeeded("a".into()));
+        assert_eq!(
+            s.take_password_request(),
+            Some(("a".to_string(), FileAction::Import { target }))
+        );
     }
 }

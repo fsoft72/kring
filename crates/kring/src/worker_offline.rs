@@ -1,5 +1,8 @@
 //! Worker handlers for offline features: keyring files, backups and archives.
 //!
+//! Importing files and archives is planned in [`crate::worker_transfer`],
+//! which reads them through [`resolve_file`] and [`read_file`].
+//!
 //! Keyring files are addressed by name only (`<name>.keyring` inside
 //! [`WorkerConfig::keyrings_dir`]); the path is always taken from a fresh scan,
 //! never from the UI. Backups are addressed by a directory that must be among
@@ -15,14 +18,11 @@ use kring_core::keyring_file::{
 };
 use kring_core::model::{CollectionId, SecretValue};
 use kring_core::provider::ProviderInfo;
-use kring_core::transfer::archive::{ExportedItem, read_archive, write_archive};
-use kring_core::transfer::import::import_items;
+use kring_core::transfer::archive::{ExportedItem, write_archive};
 use kring_core::{KringError, MasterPasswordStore, Result, SecretStore};
 use zeroize::Zeroizing;
 
-use crate::worker::{
-    Command, Emitter, Event, MSG_NO_PROVIDER, WorkerConfig, load_items, refresh, run_store_command,
-};
+use crate::worker::{Command, Emitter, Event, MSG_NO_PROVIDER, WorkerConfig, run_store_command};
 
 /// Message for a file name that could escape the keyrings directory.
 const MSG_BAD_NAME: &str = "Invalid keyring file name";
@@ -43,19 +43,17 @@ pub(crate) fn is_offline(cmd: &Command) -> bool {
         cmd,
         Command::ScanFiles
             | Command::OpenFile { .. }
-            | Command::ImportFile { .. }
             | Command::RetireFile { .. }
             | Command::ListBackups
             | Command::RestoreBackup { .. }
             | Command::ExportCollection { .. }
-            | Command::ImportArchive { .. }
     )
 }
 
 /// Handles one offline command and reports a failure as [`Event::Error`].
 ///
-/// `ImportFile`, `ImportArchive` and `ExportCollection` need a store (any
-/// provider); the other commands work without one.
+/// `ExportCollection` needs a store (any provider); the other commands work
+/// without one.
 pub(crate) async fn handle<S, N>(
     out: &Emitter<N>,
     store: Option<&S>,
@@ -100,18 +98,6 @@ where
             });
             Ok(())
         }
-        Command::ImportFile {
-            name,
-            password,
-            target,
-        } => {
-            let store = require_store(store)?;
-            let info = resolve_file(config, name)?;
-            let Some((items, _)) = read_file(out, &info, password.as_ref()).await? else {
-                return Ok(());
-            };
-            import_into(out, store, target, items).await
-        }
         Command::RetireFile {
             name,
             backup_passphrase,
@@ -130,18 +116,6 @@ where
             path,
             passphrase,
         } => export(out, require_store(store)?, collection, path, passphrase).await,
-        Command::ImportArchive {
-            path,
-            passphrase,
-            target,
-        } => {
-            let store = require_store(store)?;
-            let items = read_archive(path, passphrase)?
-                .into_iter()
-                .map(|e| e.item)
-                .collect();
-            import_into(out, store, target, items).await
-        }
         _ => Err(KringError::InvalidInput(
             "Store command sent to the offline path".into(),
         )),
@@ -150,12 +124,7 @@ where
 
 /// Returns true for offline commands that cannot run without a store.
 fn needs_store(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::ImportFile { .. }
-            | Command::ImportArchive { .. }
-            | Command::ExportCollection { .. }
-    )
+    matches!(cmd, Command::ExportCollection { .. })
 }
 
 /// Returns the store, or an error when no provider is running.
@@ -178,7 +147,7 @@ fn emit_files<N: Fn()>(out: &Emitter<N>, config: &WorkerConfig) -> Result<()> {
 ///
 /// The name must be non-empty, contain no `/` and not be `.` or `..`; the
 /// entry must be the regular (non-symlink) file `<keyrings_dir>/<name>.keyring`.
-fn resolve_file(config: &WorkerConfig, name: &str) -> Result<KeyringFileInfo> {
+pub(crate) fn resolve_file(config: &WorkerConfig, name: &str) -> Result<KeyringFileInfo> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(invalid(MSG_BAD_NAME));
     }
@@ -200,7 +169,7 @@ fn resolve_file(config: &WorkerConfig, name: &str) -> Result<KeyringFileInfo> {
 ///
 /// A binary file without `password` emits [`Event::PasswordNeeded`] and
 /// returns `None`; an unknown format is an error.
-async fn read_file<N: Fn()>(
+pub(crate) async fn read_file<N: Fn()>(
     out: &Emitter<N>,
     info: &KeyringFileInfo,
     password: Option<&SecretValue>,
@@ -226,20 +195,6 @@ async fn read_file<N: Fn()>(
             info.name
         ))),
     }
-}
-
-/// Imports items into `target`, then emits the report, the target items and the collections.
-async fn import_into<S: SecretStore, N: Fn()>(
-    out: &Emitter<N>,
-    store: &S,
-    target: &CollectionId,
-    items: Vec<OfflineItem>,
-) -> Result<()> {
-    let report = import_items(store, target, items).await?;
-    out.emit(Event::ImportDone(report));
-    load_items(out, store, target).await;
-    refresh(out, store).await;
-    Ok(())
 }
 
 /// Retires plaintext keyring file `name`; any other file is refused first.
@@ -293,7 +248,7 @@ where
 }
 
 /// Emits [`Event::BackupCreated`] and, if pruning failed, a warning.
-fn emit_backup<N: Fn()>(out: &Emitter<N>, backup: BackupInfo) {
+pub(crate) fn emit_backup<N: Fn()>(out: &Emitter<N>, backup: BackupInfo) {
     let warning = backup.prune_warning.clone();
     out.emit(Event::BackupCreated(backup));
     if let Some(w) = warning {

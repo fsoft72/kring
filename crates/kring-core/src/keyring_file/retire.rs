@@ -98,7 +98,7 @@ fn precheck(
 }
 
 /// Outcome of [`retire_files_batch`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RetireBatchReport {
     /// The single backup holding every file that passed the pre-checks.
     ///
@@ -117,7 +117,8 @@ pub struct RetireBatchReport {
 /// backed up together, then each is verified in the manifest (encrypted and
 /// sha256) and unlinked after a final unchanged check; a file failing either
 /// step is kept and listed, the others proceed. A backup failure is returned
-/// as an error and nothing is removed.
+/// as an error and nothing is removed. Entries are de-duplicated by path
+/// (the first one wins).
 ///
 /// # Errors
 ///
@@ -133,8 +134,15 @@ pub fn retire_files_batch(
         return Err(invalid("No files to retire"));
     }
     let mut kept = Vec::new();
-    let mut accepted = Vec::new();
-    for info in infos {
+    let mut accepted: Vec<(&KeyringFileInfo, String)> = Vec::new();
+    for (index, info) in infos.iter().enumerate() {
+        // The same path listed twice is retired once: the first entry wins.
+        if infos[..index]
+            .iter()
+            .any(|earlier| earlier.path == info.path)
+        {
+            continue;
+        }
         match precheck(info, keyrings_dir, live) {
             Ok(digest) => accepted.push((info, digest)),
             Err(e) => kept.push((info.name.clone(), e.to_string())),
@@ -543,6 +551,17 @@ mod tests {
         assert_eq!(r.kept[0].0, "b");
         assert!(r.kept[0].1.contains("File changed since scan"));
         assert!(infos[1].path.exists());
+    }
+
+    /// The same file listed twice is retired once (first entry wins).
+    #[test]
+    fn batch_dedupes_by_path() {
+        let (_t, infos, mgr) = batch_fixture(&[("a.keyring", PLAIN.as_bytes())]);
+        let twice = vec![infos[0].clone(), infos[0].clone()];
+        let r = batch(&mgr, &twice, &[]).unwrap();
+        assert_eq!(r.removed, vec!["a"]);
+        assert!(r.kept.is_empty(), "{:?}", r.kept);
+        assert_eq!(r.backup.unwrap().files.len(), 1);
     }
 
     /// A failing backup removes nothing; empty input is refused.

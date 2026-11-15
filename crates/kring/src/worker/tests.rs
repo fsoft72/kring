@@ -595,19 +595,42 @@ fn mutations_report_done() {
 #[test]
 fn keyring_name_from_collection_path() {
     let id = |p: &str| CollectionId(p.into());
-    let ok = keyring_name(&id("/org/freedesktop/secrets/collection/login"));
+    let ok = keyring_name(
+        &id("/org/freedesktop/secrets/collection/login"),
+        MSG_NO_BACKUP,
+    );
     assert_eq!(ok, Ok(Some("login".to_string())));
-    let session = keyring_name(&id("/org/freedesktop/secrets/collection/session"));
+    let session = keyring_name(
+        &id("/org/freedesktop/secrets/collection/session"),
+        MSG_NO_BACKUP,
+    );
     assert_eq!(session, Ok(None));
-    assert!(keyring_name(&id("/org/freedesktop/secrets/aliases/default")).is_err());
-    assert!(keyring_name(&id("/org/freedesktop/secrets/collection/")).is_err());
-    assert!(keyring_name(&id("/org/freedesktop/secrets/collection/a/b")).is_err());
+    assert!(
+        keyring_name(
+            &id("/org/freedesktop/secrets/aliases/default"),
+            MSG_NO_BACKUP
+        )
+        .is_err()
+    );
+    assert!(keyring_name(&id("/org/freedesktop/secrets/collection/"), MSG_NO_BACKUP).is_err());
+    assert!(
+        keyring_name(
+            &id("/org/freedesktop/secrets/collection/a/b"),
+            MSG_NO_BACKUP
+        )
+        .is_err()
+    );
 }
 
 /// Escaped object path names decode to the raw keyring file name.
 #[test]
 fn keyring_name_decodes_escapes() {
-    let name = |n: &str| keyring_name(&CollectionId(format!("{COLLECTION_PATH_PREFIX}{n}")));
+    let name = |n: &str| {
+        keyring_name(
+            &CollectionId(format!("{COLLECTION_PATH_PREFIX}{n}")),
+            MSG_NO_BACKUP,
+        )
+    };
     assert_eq!(name("My_5fKeys"), Ok(Some("My_Keys".to_string())));
     assert_eq!(
         name("Default_5fkeyring"),
