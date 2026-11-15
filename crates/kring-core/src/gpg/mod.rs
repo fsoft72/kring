@@ -2,12 +2,20 @@
 //!
 //! [`GpgRunner`] runs gpg with captured output, timeouts and passphrases over a
 //! pipe (loopback pinentry); [`list_keys`] lists public keys with their secret
-//! state, parsed from the colon format.
+//! state, parsed from the colon format. The key operations ([`create_key`],
+//! [`import_keys`], [`export_public`], [`export_secret`], [`change_passphrase`],
+//! [`delete_key`]) back keys up before changing or deleting them.
 
 mod colons;
+mod ops;
 mod runner;
 
 pub use colons::{GpgAlgorithm, GpgKey, GpgSubkey, GpgUid, parse_listing};
+pub use ops::{
+    GpgAlgo, ImportReport, MSG_GPG_PASSPHRASE_REQUIRED, MSG_LOOPBACK_REFUSED,
+    MSG_PRIMARY_SECRET_UNAVAILABLE, MSG_WRONG_GPG_PASSPHRASE, change_passphrase, create_key,
+    delete_key, export_public, export_secret, import_keys,
+};
 pub use runner::{
     GPG_CONNECT_AGENT, GpgOutput, GpgRunner, MAX_OUTPUT, MSG_GPG_NOT_FOUND, MSG_PASSPHRASE_NEWLINE,
     Reply, TIMEOUT_DEFAULT, TIMEOUT_KEYGEN,
@@ -36,10 +44,16 @@ pub fn list_keys(runner: &GpgRunner) -> Result<Vec<GpgKey>> {
 }
 
 /// Runs one colon listing command and returns its stdout.
+///
+/// An agent refusing loopback pinentry fails the secret listing too; that is
+/// reported as `MSG_LOOPBACK_REFUSED`.
 fn listing(runner: &GpgRunner, command: &str) -> Result<Zeroizing<Vec<u8>>> {
     let mut args: Vec<&str> = LIST_OPTIONS.to_vec();
     args.push(command);
     let out = runner.run(args, None, None, TIMEOUT_DEFAULT)?;
+    if ops::loopback_refused(&out) {
+        return Err(KringError::InvalidInput(MSG_LOOPBACK_REFUSED.into()));
+    }
     if !out.success() {
         return Err(KringError::Gpg(format!(
             "{command} failed ({}): {}",

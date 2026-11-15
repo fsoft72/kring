@@ -175,6 +175,13 @@ pub fn write_archive(path: &Path, items: &[ExportedItem], passphrase: &SecretVal
     publish_file(path, &encrypted, |from, to| fs::hard_link(from, to))
 }
 
+/// Writes `bytes` to a new file `path` (mode 0600) without ever overwriting one.
+///
+/// See [`publish_file`]; an existing destination is `InvalidInput("... already exists")`.
+pub(crate) fn write_new_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    publish_file(path, bytes, |from, to| fs::hard_link(from, to))
+}
+
 /// Writes `bytes` to `path` without ever overwriting an existing file.
 ///
 /// The data goes to a temporary sibling first and is hard linked into place.

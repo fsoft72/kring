@@ -1,77 +1,21 @@
 //! gpg runner and key listing against the real `gpg` binary in temp home directories.
 //!
-//! Every test uses its own 0700 home directory (`--homedir` and `GNUPGHOME`), and its
-//! gpg-agent is killed with `gpgconf --homedir <dir> --kill all` on drop, so the
+//! Every test uses its own 0700 home directory ([`gpg_home::TempGnupgHome`]), so the
 //! user's `~/.gnupg` and agent are never touched.
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
+mod gpg_home;
 
 use kring_core::KringError;
-use kring_core::gpg::{GpgAlgorithm, GpgRunner, TIMEOUT_DEFAULT, TIMEOUT_KEYGEN, list_keys};
+use kring_core::gpg::{GpgAlgorithm, TIMEOUT_DEFAULT, TIMEOUT_KEYGEN, list_keys};
 use kring_core::model::SecretValue;
+
+use gpg_home::{TempGnupgHome, kill_daemons, remove_socket_dir};
 
 /// Passphrase of generated test keys.
 const FIXTURE_PW: &str = "fixture-pw";
 
 /// User id of the generated test key.
 const TEST_UID: &str = "Kring Test <kring-test@example.invalid>";
-
-/// A temp GnuPG home whose agent is killed on drop.
-struct TempGnupgHome {
-    /// Runner bound to this home.
-    runner: GpgRunner,
-    /// The home directory.
-    dir: tempfile::TempDir,
-}
-
-impl TempGnupgHome {
-    /// Creates a 0700 home; `None` when gpg is not installed.
-    fn new() -> Option<Self> {
-        let runner = GpgRunner::locate().ok()?;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let runner = runner.with_homedir(dir.path().to_path_buf());
-        Some(Self { runner, dir })
-    }
-}
-
-impl Drop for TempGnupgHome {
-    /// Stops every GnuPG daemon started for this home.
-    fn drop(&mut self) {
-        let gpgconf = self.runner.gpg().with_file_name("gpgconf");
-        kill_daemons(&gpgconf, self.dir.path());
-    }
-}
-
-/// Runs `gpgconf --homedir <dir> --kill all` scoped to `dir`.
-///
-/// Failures cannot fail a test from `Drop`, so they are reported on stderr.
-fn kill_daemons(gpgconf: &Path, dir: &Path) {
-    let status = Command::new(gpgconf)
-        .arg("--homedir")
-        .arg(dir)
-        .args(["--kill", "all"])
-        .env("GNUPGHOME", dir)
-        .env_remove("GPG_AGENT_INFO")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "WARNING: {} --kill all for {} exited with {s}",
-            gpgconf.display(),
-            dir.display()
-        ),
-        Err(e) => eprintln!(
-            "WARNING: cannot run {} to stop the daemons of {}: {e}",
-            gpgconf.display(),
-            dir.display()
-        ),
-    }
-}
 
 /// A generated key is listed with its secret; its public export imported elsewhere is not.
 #[test]
@@ -159,7 +103,8 @@ fn listing_in_a_missing_home_fails() {
     let missing = home.dir.path().join("absent");
     let runner = home.runner.clone().with_homedir(missing.clone());
     let r = list_keys(&runner);
-    kill_daemons(&home.runner.gpg().with_file_name("gpgconf"), &missing);
+    kill_daemons(&home.gpgconf(), &missing);
+    remove_socket_dir(&home.gpgconf(), &missing);
     assert!(
         matches!(&r, Err(KringError::Gpg(m)) if m.starts_with("--list-keys failed")),
         "{r:?}"
