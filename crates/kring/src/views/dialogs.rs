@@ -9,6 +9,7 @@ use kring_core::transfer::plan::Choice;
 use zeroize::Zeroizing;
 
 use crate::app_state::FileAction;
+use crate::session_secret::MSG_WRONG_TRY_AGAIN;
 use crate::ui::password_field::{forget_fields, new_buffer};
 use crate::ui::theme;
 use crate::ui::widgets::{danger_button, primary_button, secondary_button};
@@ -69,6 +70,7 @@ pub struct ImportTarget {
 }
 
 /// The content of a dialog. Password buffers are zeroized when it is dropped.
+#[derive(Clone)]
 pub enum DialogKind {
     /// Unlock a collection with its password.
     Unlock {
@@ -481,6 +483,10 @@ pub struct Dialog {
     remember: bool,
     /// Remembered passphrase used instead of the passphrase fields.
     remembered: Option<SecretValue>,
+    /// Reopened after a wrong remembered passphrase.
+    retry: bool,
+    /// The last successful submit used the remembered passphrase.
+    used_remembered: bool,
 }
 
 impl Dialog {
@@ -491,7 +497,26 @@ impl Dialog {
             error: None,
             remember: false,
             remembered: None,
+            retry: false,
+            used_remembered: false,
         }
+    }
+
+    /// Reopens a dialog after the remembered passphrase was wrong: its
+    /// fields are shown (the remembered value is not used) under the error
+    /// "Wrong passphrase, try again".
+    pub fn retry(kind: DialogKind) -> Self {
+        Self {
+            error: Some(MSG_WRONG_TRY_AGAIN.to_string()),
+            retry: true,
+            ..Self::new(kind)
+        }
+    }
+
+    /// Returns the dialog to reopen (passphrase fields empty) if the last
+    /// submit used the remembered passphrase and it proves wrong.
+    pub fn retry_kind(&self) -> Option<DialogKind> {
+        self.used_remembered.then(|| self.kind.clone())
     }
 
     /// Opens a dialog that uses `remembered` instead of its passphrase
@@ -520,8 +545,9 @@ impl Dialog {
 
     /// Validates the fields and builds the command to send; the remembered
     /// passphrase (when used) fills the passphrase fields for this check
-    /// only, they are emptied again when it fails.
+    /// only, they are emptied again afterwards.
     pub fn submit(&mut self) -> Result<Command, String> {
+        self.used_remembered = false;
         let Some(secret) = self
             .remembered
             .as_ref()
@@ -531,9 +557,8 @@ impl Dialog {
         };
         fill_passphrases(&mut self.kind, secret);
         let result = command_for(&self.kind);
-        if result.is_err() {
-            fill_passphrases(&mut self.kind, &SecretValue::from_text(""));
-        }
+        fill_passphrases(&mut self.kind, &SecretValue::from_text(""));
+        self.used_remembered = result.is_ok();
         result
     }
 
@@ -544,7 +569,7 @@ impl Dialog {
         let response = styled_modal(ctx, MODAL_ID).show(ctx, |ui| {
             ui.set_width(DIALOG_WIDTH);
             let hide = self._uses_remembered();
-            let main = body(ui, &mut self.kind, hide);
+            let main = body(ui, &mut self.kind, hide, self.retry);
             if hide {
                 if remembered_row(ui) {
                     self.remembered = None;
@@ -1027,5 +1052,46 @@ mod tests {
             panic!("expected the import dialog");
         };
         assert!(passphrase.is_empty());
+    }
+
+    /// A submit with the remembered value offers the dialog to reopen with
+    /// empty fields; one with typed fields does not.
+    #[test]
+    fn retry_kind_after_remembered_submit() {
+        let secret = SecretValue::from_text("kept");
+        let kind = DialogKind::retire_file("p".into(), vec![]);
+        let mut d = Dialog::with_remembered(kind, Some(&secret));
+        assert!(d.retry_kind().is_none());
+        d.submit().unwrap();
+        let Some(DialogKind::RetireFile {
+            passphrase,
+            confirm,
+            ..
+        }) = d.retry_kind()
+        else {
+            panic!("expected the retire dialog");
+        };
+        assert!(passphrase.is_empty() && confirm.is_empty());
+        let mut typed = Dialog::new(DialogKind::retire_file("p".into(), vec![]));
+        if let DialogKind::RetireFile {
+            passphrase,
+            confirm,
+            ..
+        } = &mut typed.kind
+        {
+            *passphrase = buf("x");
+            *confirm = buf("x");
+        }
+        typed.submit().unwrap();
+        assert!(typed.retry_kind().is_none());
+    }
+
+    /// The reopened dialog shows its fields and the wrong passphrase error.
+    #[test]
+    fn retry_dialog_shows_fields() {
+        let d = Dialog::retry(DialogKind::retire_file("p".into(), vec![]));
+        assert!(!d._uses_remembered());
+        assert_eq!(d.error.as_deref(), Some(MSG_WRONG_TRY_AGAIN));
+        assert!(d.retry);
     }
 }

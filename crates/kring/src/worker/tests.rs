@@ -68,10 +68,7 @@ fn fixture_with(provider: Option<ProviderInfo>, label: &str, keep: usize) -> Fix
 impl Fixture {
     /// Receives the next event, failing after 5 seconds.
     fn next(&self) -> Event {
-        self.handle
-            .rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("event expected")
+        next_event(&self.handle, Duration::from_secs(5))
     }
 
     /// Consumes the three startup events.
@@ -149,7 +146,7 @@ fn no_provider_emits_unavailable() {
         pam_dir: dir.path().join("p"),
     };
     let h = spawn::<FakeStore>(None, None, config, || {});
-    let next = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let next = || next_event(&h, Duration::from_secs(5));
     assert!(matches!(next(), Event::ProviderUnavailable));
     assert!(matches!(next(), Event::Pam(_)));
     h.tx.send(Command::Refresh).unwrap();
@@ -369,7 +366,7 @@ fn panic_worker(dir: &tempfile::TempDir, on_collections: bool) -> (WorkerHandle,
 fn startup_panic_reports_error_and_worker_survives() {
     let dir = tempfile::tempdir().unwrap();
     let (h, _) = panic_worker(&dir, true);
-    let next = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let next = || next_event(&h, Duration::from_secs(5));
     assert!(matches!(next(), Event::Provider(_)));
     assert!(matches!(next(), Event::Pam(_)));
     match next() {
@@ -385,7 +382,7 @@ fn startup_panic_reports_error_and_worker_survives() {
 fn store_panic_reports_error_and_worker_survives() {
     let dir = tempfile::tempdir().unwrap();
     let (h, id) = panic_worker(&dir, false);
-    let next = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let next = || next_event(&h, Duration::from_secs(5));
     for _ in 0..3 {
         next();
     }
@@ -396,6 +393,37 @@ fn store_panic_reports_error_and_worker_survives() {
     }
     h.tx.send(Command::Refresh).unwrap();
     assert!(matches!(next(), Event::Collections(_)));
+}
+
+/// Every command, also a failing or panicking one, ends with exactly one
+/// `CommandFinished`, numbered from 0 in the order received; startup has none.
+#[test]
+fn command_finished_once_per_command_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, id) = panic_worker(&dir, false);
+    let raw = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    for _ in 0..3 {
+        assert!(
+            !matches!(raw(), Event::CommandFinished(_)),
+            "no startup finish"
+        );
+    }
+    h.tx.send(Command::Refresh).unwrap();
+    h.tx.send(Command::LoadItems(id)).unwrap(); // panics in the store
+    h.tx.send(Command::Lock(CollectionId("/nope".into())))
+        .unwrap();
+    h.tx.send(Command::Refresh).unwrap();
+    let mut finished = Vec::new();
+    while finished.len() < 4 {
+        if let Event::CommandFinished(n) = raw() {
+            finished.push(n);
+        }
+    }
+    assert_eq!(finished, [0, 1, 2, 3]);
+    assert!(
+        h.rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "nothing after the last command"
+    );
 }
 
 /// An unusable backups root aborts the delete and keeps the item.

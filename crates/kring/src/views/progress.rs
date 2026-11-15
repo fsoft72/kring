@@ -30,7 +30,15 @@ fn _color(status: StepStatus) -> egui::Color32 {
         StepStatus::Running => theme::TEXT,
         StepStatus::Ok => theme::OK,
         StepStatus::Failed => theme::ERROR,
-        StepStatus::Skipped => theme::MUTED,
+        StepStatus::Skipped | StepStatus::Warning => theme::MUTED,
+    }
+}
+
+/// Returns the colour of a step dot (a warning keeps muted text with a TERTIARY dot).
+fn _dot_color(status: StepStatus) -> egui::Color32 {
+    match status {
+        StepStatus::Warning => theme::TERTIARY,
+        other => _color(other),
     }
 }
 
@@ -48,7 +56,7 @@ fn _step(ui: &mut egui::Ui, step: &Step) {
         } else {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             ui.painter()
-                .circle_filled(rect.center(), DOT_RADIUS, _color(step.status));
+                .circle_filled(rect.center(), DOT_RADIUS, _dot_color(step.status));
         }
         ui.add(egui::Label::new(RichText::new(&step.text).color(_color(step.status))).wrap());
     });

@@ -79,3 +79,11 @@
   result from the first `Done`/`TransferDone`/`Error`; steps aside for passphrase requests) and disable
   every destructive action (`Gates::busy`) until closed. Dev preset `KRING_DEV_DIALOG=delete-item-now`
   and `KRING_DEV_REMEMBER=1`.
+- Plan 4 Task UX fix round 1: the worker ends every command with `Event::CommandFinished(seq)` (numbered from
+  0, none for startup) and the UI numbers its sent commands the same way; the progress modal and the
+  remembered-passphrase follow-ups judge only their own command's events on its `CommandFinished` (a Done
+  wins, later errors become warning lines; a stray Done/Error of another command is ignored). A wrong
+  remembered passphrase in a user dialog (restore, archive import, ...) or an automatic resend reopens the
+  dialog with its fields and "Wrong passphrase, try again"; a successful automatic unlock shows "Used the
+  remembered passphrase". Waiting operations without a dialog are dropped, a stopped worker fails the
+  running operation, the quick Retire of the files list is disabled while an operation is open.

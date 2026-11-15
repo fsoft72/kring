@@ -149,8 +149,10 @@ fn _target_combo(ui: &mut egui::Ui, targets: &[ImportTarget], target: &mut Optio
 }
 
 /// Renders the fields of a dialog and returns its main action; `hide`
-/// leaves out the passphrase fields (the remembered passphrase is used).
-pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool) -> MainAction {
+/// leaves out the passphrase fields (the remembered passphrase is used);
+/// `retry` (reopened after a wrong remembered passphrase) drops the
+/// new-passphrase wording of the backup passphrase dialog.
+pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -> MainAction {
     match kind {
         DialogKind::Unlock {
             label, password, ..
@@ -453,7 +455,9 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool) -> MainAction 
             } else {
                 "Backup contains plaintext keyrings, choose a passphrase"
             };
-            ui.label(RichText::new(text).color(theme::TERTIARY));
+            if !retry {
+                ui.label(RichText::new(text).color(theme::TERTIARY));
+            }
             _password_field(ui, hide, "Passphrase", FIELD_PASSWORD, passphrase);
             _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _primary("Continue")

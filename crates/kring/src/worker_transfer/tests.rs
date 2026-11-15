@@ -122,11 +122,7 @@ impl Env {
     /// Receives the next event, failing after 10 seconds; every event goes
     /// through [`assert_secret_free`].
     fn next(&self) -> Event {
-        let event = self
-            .handle
-            .rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("event expected");
+        let event = crate::worker::next_event(&self.handle, Duration::from_secs(10));
         assert_secret_free(&event);
         event
     }
@@ -291,7 +287,8 @@ fn may_carry_secret(event: &Event) -> bool {
         | Event::ConsolidationProgress { .. }
         | Event::ConsolidationDone(..)
         | Event::Done(_)
-        | Event::Error(_) => false,
+        | Event::Error(_)
+        | Event::CommandFinished(_) => false,
     }
 }
 

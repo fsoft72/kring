@@ -257,6 +257,12 @@ pub enum Event {
     Done(String),
     /// An operation failed with a message.
     Error(String),
+    /// Every event of command number `0` was emitted (also after a panic).
+    ///
+    /// Commands are numbered in the order they are received, from 0 for the
+    /// first one; the startup events are not followed by one. The UI counts
+    /// its sent commands the same way to attribute events to a command.
+    CommandFinished(u64),
 }
 
 /// Filesystem locations used by the worker.
@@ -379,10 +385,15 @@ where
         let first = startup(&out, store.as_deref(), provider.as_ref(), &config);
         run_guarded(&out, &runtime, first);
         let mut plans = PlanState::default();
+        // Sequence number of the command being handled: the UI counts its
+        // sent commands the same way, from 0 for the first one.
+        let mut seq: u64 = 0;
         while let Ok(cmd) = cmd_rx.recv() {
             let store = store.as_deref();
             let run = handle(&out, store, provider.as_ref(), &config, &mut plans, cmd);
             run_guarded(&out, &runtime, run);
+            out.emit(Event::CommandFinished(seq));
+            seq += 1;
         }
         // The store (oo7 Service) spawns a Tokio task in its Drop to close its
         // D-Bus session, so it must be dropped while the runtime is still
@@ -840,6 +851,18 @@ where
     }
     out.emit(Event::Done(done));
     Ok(())
+}
+
+/// Receives the next event of `handle` other than [`Event::CommandFinished`]
+/// (tests asserting the event sequence of a command), failing after `timeout`.
+#[cfg(test)]
+pub(crate) fn next_event(handle: &WorkerHandle, timeout: std::time::Duration) -> Event {
+    loop {
+        match handle.rx.recv_timeout(timeout).expect("event expected") {
+            Event::CommandFinished(_) => continue,
+            event => return event,
+        }
+    }
 }
 
 #[cfg(test)]

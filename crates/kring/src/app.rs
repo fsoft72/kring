@@ -12,6 +12,7 @@ use crate::clipboard::ArboardClipboard;
 use crate::copy_flow::SecretCopier;
 #[cfg(debug_assertions)]
 use crate::dev_preset::DevPreset;
+use crate::operation::MSG_WORKER_STOPPED;
 use crate::session_secret::{FollowUp, MSG_USED_REMEMBERED};
 use crate::ui::theme;
 use crate::ui::toasts::{ToastKind, Toasts, kind_for_status, user_message};
@@ -78,6 +79,9 @@ pub struct KringApp {
     toasts: Toasts,
     /// The forget confirmation of the remembered passphrase is open.
     forget_confirm: bool,
+    /// Number of the next command sent; the worker numbers the commands it
+    /// receives the same way, from 0 (see [`Event::CommandFinished`]).
+    next_seq: u64,
     /// Screenshot preset (debug builds, isolated session only).
     #[cfg(debug_assertions)]
     dev: DevPreset,
@@ -105,6 +109,7 @@ impl KringApp {
             keyrings_dir: kring_core::paths::keyrings_dir(),
             toasts: Toasts::default(),
             forget_confirm: false,
+            next_seq: 0,
             #[cfg(debug_assertions)]
             dev: DevPreset::default(),
         }
@@ -123,7 +128,8 @@ impl KringApp {
             match self.worker.rx.try_recv() {
                 Ok(event) => {
                     self.awaiting_reply = false;
-                    let follow = self.state.session.observe(&event);
+                    let running = self.state.running_command();
+                    let follow = self.state.session.observe(&event, running);
                     if matches!(event, Event::Error(_)) {
                         self.copier.cancel();
                     }
@@ -138,22 +144,31 @@ impl KringApp {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.worker_stopped = true;
+                    if let Some(op) = &mut self.state.operation {
+                        op.fail(MSG_WORKER_STOPPED);
+                    }
                     break;
                 }
             }
         }
     }
 
-    /// Opens the dialog asked after an automatic use of the remembered
-    /// passphrase failed (it is not answered automatically again).
+    /// Acts on the judgement of an automatic use of the remembered
+    /// passphrase: reopens the dialog it answered (wrong passphrase), opens
+    /// the password dialog of a failed unlock, or announces a used one.
     fn _follow_up(&mut self, follow: FollowUp) {
-        match follow {
-            FollowUp::Passphrase(echo) => self.state.pending_passphrase = Some(echo),
+        let dialog = match follow {
+            FollowUp::Dialog(kind) => Dialog::retry(*kind),
             FollowUp::Unlock { collection, label } => {
-                if self.dialog.is_none() {
-                    self.dialog = Some(Dialog::new(DialogKind::unlock(collection, label)));
-                }
+                Dialog::new(DialogKind::unlock(collection, label))
             }
+            FollowUp::UsedRemembered => {
+                let text = MSG_USED_REMEMBERED.to_string();
+                return self.toasts.push(ToastKind::Info, text, Instant::now());
+            }
+        };
+        if self.dialog.is_none() {
+            self.dialog = Some(dialog);
         }
     }
 
@@ -174,7 +189,7 @@ impl KringApp {
         let unlock = match &kind {
             DialogKind::Unlock {
                 collection, label, ..
-            } => self.state.session.unlock(collection, label),
+            } => self.state.session.unlock(collection, label, self.next_seq),
             _ => None,
         };
         if let Some(cmd) = unlock {
@@ -198,16 +213,21 @@ impl KringApp {
         }
     }
 
-    /// Sends a command to the worker.
+    /// Sends a command to the worker as command number `next_seq`.
     fn _send(&mut self, cmd: Command) {
+        let id = self.next_seq;
         self.state.track_file_command(&cmd);
         self.state.track_transfer_command(&cmd);
-        self.state.track_operation(&cmd);
+        self.state.track_operation(&cmd, id);
         self.consolidate_view.remember(&cmd);
         if self.worker.tx.send(cmd).is_err() {
             self.worker_stopped = true;
+            if let Some(op) = &mut self.state.operation {
+                op.fail(MSG_WORKER_STOPPED);
+            }
             return;
         }
+        self.next_seq += 1;
         self.awaiting_reply = true;
     }
 
@@ -374,7 +394,7 @@ impl KringApp {
         let Some(cmd) = self.state.pending_passphrase.take() else {
             return;
         };
-        if let Some(full) = self.state.session.resend(&cmd) {
+        if let Some(full) = self.state.session.resend(&cmd, self.next_seq) {
             return self._send_remembered(full);
         }
         self.dialog = Some(Dialog::new(DialogKind::passphrase(cmd)));
@@ -396,7 +416,11 @@ impl KringApp {
             self.state.pending_apply_passphrases = None;
             self.consolidate_view.sync(&self.state);
             let (backup, orphan_files) = self.consolidate_view.kept(asked.plan_id);
-            if let Some(secret) = self.state.session.apply_passphrase(asked.plan_id) {
+            if let Some(secret) = self
+                .state
+                .session
+                .apply_passphrase(asked.plan_id, self.next_seq)
+            {
                 let pick = |asked: bool, kept: Option<SecretValue>| match asked {
                     true => Some(secret.clone()),
                     false => kept,
@@ -429,7 +453,11 @@ impl KringApp {
         }
         self.state.pending_apply_passphrases = None;
         let choices = self.transfer_view.choices.clone();
-        if let Some(secret) = self.state.session.apply_passphrase(asked.plan_id) {
+        if let Some(secret) = self
+            .state
+            .session
+            .apply_passphrase(asked.plan_id, self.next_seq)
+        {
             let cmd = Command::ApplyTransfer {
                 plan_id: asked.plan_id,
                 choices,
@@ -486,8 +514,13 @@ impl KringApp {
                 if let Some(value) = dialog.to_remember(&cmd) {
                     self.state.session.remember(value);
                 }
+                let retry = dialog.retry_kind();
                 self.dialog = None;
+                let id = self.next_seq;
                 self._send(cmd);
+                if let Some(kind) = retry {
+                    self.state.session.used_in_dialog(kind, id);
+                }
             }
         }
     }
@@ -605,6 +638,7 @@ impl eframe::App for KringApp {
         self._open_passphrase_dialog();
         self._open_file_password_dialog();
         self._open_apply_passphrase_dialog();
+        self.state.drop_stuck_operation(self.dialog.is_some());
         let gates = Gates::from_provider(self.state.provider.as_ref())
             .with_operation(self.state.operation_open());
         let action = self._panels(ui, gates);

@@ -215,10 +215,7 @@ impl Env {
 
 /// Receives the next event of a handle, failing after 10 seconds.
 fn recv(handle: &WorkerHandle) -> Event {
-    handle
-        .rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("event expected")
+    crate::worker::next_event(handle, Duration::from_secs(10))
 }
 
 /// Returns the text secret of the offline item labelled `label`.

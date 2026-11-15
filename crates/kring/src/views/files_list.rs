@@ -7,9 +7,9 @@ use crate::app_state::AppState;
 use crate::ui::glyphs::Ico;
 use crate::ui::theme;
 use crate::ui::widgets::{chip, ico_button, muted, muted_text, search_box, semibold};
-use crate::views::Action;
 use crate::views::file_detail::{is_empty_orphan, live_collection, retire_dialog};
 use crate::views::sidebar::row_background;
+use crate::views::{Action, MSG_OPERATION_RUNNING};
 use crate::worker::Command;
 
 /// Height of a file row.
@@ -132,8 +132,15 @@ enum RowClick {
     Retire,
 }
 
-/// Renders one file row; `orphan` adds the quick Retire button.
-fn _row(ui: &mut Ui, info: &KeyringFileInfo, selected: bool, orphan: bool) -> RowClick {
+/// Renders one file row; `orphan` adds the quick Retire button, disabled
+/// with `busy` as tooltip while an operation is shown.
+fn _row(
+    ui: &mut Ui,
+    info: &KeyringFileInfo,
+    selected: bool,
+    orphan: bool,
+    busy: Option<&str>,
+) -> RowClick {
     let mut retire = false;
     let size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -148,7 +155,7 @@ fn _row(ui: &mut Ui, info: &KeyringFileInfo, selected: bool, orphan: bool) -> Ro
     ui.scope_builder(builder, |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         if orphan {
-            retire = ico_button(ui, Ico::Trash, MSG_QUICK_RETIRE, None, true);
+            retire = ico_button(ui, Ico::Trash, MSG_QUICK_RETIRE, busy, true);
         }
         ui.label(muted_text(format_size(info.size)));
         ui.add_space(4.0);
@@ -175,6 +182,7 @@ fn _row(ui: &mut Ui, info: &KeyringFileInfo, selected: bool, orphan: bool) -> Ro
 /// Renders the keyring files list panel and returns the requested action.
 pub fn show(ui: &mut Ui, state: &AppState, filter: &mut String) -> Option<Action> {
     let mut action = None;
+    let busy = state.operation_open().then_some(MSG_OPERATION_RUNNING);
     ui.horizontal(|ui| {
         ui.label(semibold("Keyring files", 18.0));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -195,7 +203,7 @@ pub fn show(ui: &mut Ui, state: &AppState, filter: &mut String) -> Option<Action
             for info in state.files.iter().filter(|f| file_matches(f, filter)) {
                 let selected = state.selected_file.as_ref() == Some(&info.name);
                 let live = live_collection(info, &state.collections).is_some();
-                match _row(ui, info, selected, is_empty_orphan(info, live)) {
+                match _row(ui, info, selected, is_empty_orphan(info, live), busy) {
                     RowClick::Select if !selected => {
                         action = Some(Action::SelectFile(info.name.clone()));
                     }

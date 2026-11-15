@@ -217,6 +217,10 @@ pub struct AppState {
     pub session: SessionSecret,
     /// Destructive operation in flight (or finished, until its modal is closed).
     pub operation: Option<Operation>,
+    /// Number of the command the worker is handling: every command before it
+    /// sent [`Event::CommandFinished`] (events before the first one, such as
+    /// the startup ones, count for command 0).
+    running: u64,
 }
 
 /// Sort key: login first, then default alias, then label (case-insensitive).
@@ -229,9 +233,10 @@ impl AppState {
     /// Applies a worker event to the state.
     pub fn apply(&mut self, event: Event) {
         if let Some(op) = &mut self.operation {
-            op.observe(&event);
+            op.observe(&event, self.running);
         }
         match event {
+            Event::CommandFinished(id) => self.running = id + 1,
             Event::Provider(p) => {
                 self.provider = Some(p);
                 self.provider_unavailable = false;
@@ -658,9 +663,24 @@ impl AppState {
 
     /// Records a sent command for the progress modal: a destructive one
     /// starts an operation (or resumes the one waiting for its passphrase).
-    pub fn track_operation(&mut self, cmd: &Command) {
-        let started = operation::describe(cmd, self);
+    pub fn track_operation(&mut self, cmd: &Command, id: u64) {
+        let started = operation::describe(cmd, self, id);
         operation::track(&mut self.operation, started);
+    }
+
+    /// Drops an operation waiting for a passphrase when no dialog asks for
+    /// it (`dialog_open` false after the passphrase dialogs had their
+    /// chance, e.g. a request of another plan that opens nothing).
+    pub fn drop_stuck_operation(&mut self, dialog_open: bool) {
+        let waiting = self.operation.as_ref().is_some_and(|op| op.is_waiting());
+        if waiting && !dialog_open {
+            self.operation = None;
+        }
+    }
+
+    /// Returns the number of the command the current events belong to.
+    pub fn running_command(&self) -> u64 {
+        self.running
     }
 
     /// Returns true while a destructive operation is shown (running or
@@ -1701,16 +1721,52 @@ mod tests {
     #[test]
     fn operation_follows_events() {
         let mut s = AppState::default();
-        s.track_operation(&Command::Refresh);
+        s.track_operation(&Command::Refresh, 0);
         assert!(!s.operation_open());
-        s.track_operation(&Command::DeleteFile {
-            name: "old".into(),
-            backup: false,
-            backup_passphrase: None,
-        });
+        s.track_operation(
+            &Command::DeleteFile {
+                name: "old".into(),
+                backup: false,
+                backup_passphrase: None,
+            },
+            1,
+        );
         assert!(s.operation_open());
+        // The Done of command 0 is not the delete's.
+        s.apply(Event::Done("Refreshed".into()));
+        s.apply(Event::CommandFinished(0));
+        assert!(!s.operation.as_ref().unwrap().is_finished());
+        assert_eq!(s.running_command(), 1);
         s.apply(Event::Done("File old deleted".into()));
+        s.apply(Event::CommandFinished(1));
         let op = s.operation.as_ref().unwrap();
         assert!(op.is_finished() && !op.is_failed());
+        s.drop_stuck_operation(false);
+        assert!(s.operation_open(), "a finished operation waits for Close");
+    }
+
+    /// An operation waiting for a passphrase that no dialog asks for is dropped.
+    #[test]
+    fn stuck_waiting_operation_dropped() {
+        let mut s = AppState::default();
+        s.track_operation(
+            &Command::DeleteFile {
+                name: "p".into(),
+                backup: true,
+                backup_passphrase: None,
+            },
+            0,
+        );
+        s.apply(Event::ApplyPassphrasesNeeded {
+            plan_id: 9,
+            backup: true,
+            orphan_files: false,
+        });
+        s.apply(Event::CommandFinished(0));
+        assert!(s.operation.as_ref().unwrap().is_waiting());
+        s.drop_stuck_operation(true);
+        assert!(s.operation_open(), "kept while its dialog is open");
+        s.drop_stuck_operation(false);
+        assert!(!s.operation_open());
     }
 }
