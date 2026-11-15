@@ -18,7 +18,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 
 [features]
 fake = []
+# Session guard for integration tests and dev tools.
+dev = []
 
 [dev-dependencies]
+# Enables the `dev` feature for this crate's integration tests and examples.
+kring-core = { path = ".", features = ["dev"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }

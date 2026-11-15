@@ -1,7 +1,9 @@
 //! Views of the main window and the actions they request.
 
+pub mod attr_diff;
 pub mod collection;
 pub mod dialog_body;
+pub mod dialog_submit;
 pub mod dialogs;
 pub mod item_detail;
 pub mod sidebar;

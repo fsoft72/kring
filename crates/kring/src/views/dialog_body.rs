@@ -73,12 +73,18 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> &'static str {
             "Change password"
         }
         DialogKind::DeleteCollection {
-            label, item_count, ..
+            label,
+            item_count,
+            warnings,
+            ..
         } => {
             ui.heading("Delete collection");
             ui.label(format!(
                 "Delete the collection \"{label}\" and its {item_count} item(s)?"
             ));
+            for warning in warnings.iter() {
+                ui.colored_label(ui.visuals().warn_fg_color, *warning);
+            }
             ui.label("A backup of the keyring files is created first.");
             "Delete"
         }
@@ -104,6 +110,14 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> &'static str {
                 _password_row(ui, "New secret", FIELD_SECRET, secret);
             });
             ui.weak("Leave the secret empty to keep the current one.");
+            "Save"
+        }
+        DialogKind::SaveAttributes { label, changes, .. } => {
+            ui.heading("Save attributes");
+            ui.label(format!("Replace the attributes of \"{label}\":"));
+            for change in changes.iter() {
+                ui.monospace(change);
+            }
             "Save"
         }
         DialogKind::DeleteItem { label, .. } => {

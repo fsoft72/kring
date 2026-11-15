@@ -4,11 +4,10 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use kring_core::model::ItemId;
 
 use crate::app_state::AppState;
-use crate::clipboard::{ArboardClipboard, CLIPBOARD_CLEAR_AFTER, ClipboardGuard};
-use crate::secret_display::{SecretView, secret_display};
+use crate::clipboard::ArboardClipboard;
+use crate::copy_flow::SecretCopier;
 use crate::views::dialogs::{Dialog, DialogKind, Outcome};
 use crate::views::item_detail::AttrEditor;
 use crate::views::{Action, Gates, collection, item_detail, sidebar};
@@ -20,8 +19,6 @@ const CLIPBOARD_REPAINT: Duration = Duration::from_secs(1);
 const MSG_WORKER_STOPPED: &str = "Background worker stopped, restart kring";
 /// Banner shown when no provider owns the Secret Service name.
 const MSG_NO_PROVIDER: &str = "No Secret Service provider running";
-/// Error shown when copying a binary secret.
-const MSG_BINARY: &str = "Binary secrets cannot be copied";
 /// Default width of the sidebar.
 const SIDEBAR_WIDTH: f32 = 200.0;
 
@@ -49,12 +46,10 @@ pub struct KringApp {
     worker_stopped: bool,
     /// True from sending a command until the next event arrives.
     awaiting_reply: bool,
-    clipboard: ClipboardGuard<ArboardClipboard>,
+    copier: SecretCopier<ArboardClipboard>,
     dialog: Option<Dialog>,
     editor: AttrEditor,
     filter: String,
-    /// Item whose secret is copied (and hidden again) as soon as it is revealed.
-    copy_after_reveal: Option<ItemId>,
 }
 
 impl KringApp {
@@ -65,11 +60,10 @@ impl KringApp {
             worker,
             worker_stopped: false,
             awaiting_reply: false,
-            clipboard: ClipboardGuard::new(ArboardClipboard::new()),
+            copier: SecretCopier::new(ArboardClipboard::new()),
             dialog: None,
             editor: AttrEditor::default(),
             filter: String::new(),
-            copy_after_reveal: None,
         }
     }
 
@@ -80,7 +74,7 @@ impl KringApp {
                 Ok(event) => {
                     self.awaiting_reply = false;
                     if matches!(event, Event::Error(_)) {
-                        self.copy_after_reveal = None;
+                        self.copier.cancel();
                     }
                     self.state.apply(event);
                 }
@@ -108,59 +102,21 @@ impl KringApp {
             Action::Send(cmd) => self._send(cmd),
             Action::SelectCollection(id) => {
                 self.state.select_collection(id.clone());
-                self.copy_after_reveal = None;
+                self.copier.cancel();
                 self._send(Command::LoadItems(id));
             }
             Action::SelectItem(id) => {
                 self.state.select_item(id);
-                self.copy_after_reveal = None;
+                self.copier.cancel();
             }
             Action::HideSecret => self.state.hide_secret(),
-            Action::CopySecret => self._copy_selected(),
+            Action::CopySecret => {
+                if let Some(cmd) = self.copier.request(&mut self.state) {
+                    self._send(cmd);
+                }
+            }
             Action::Open(kind) => self.dialog = Some(Dialog::new(kind)),
         }
-    }
-
-    /// Copies the selected secret, revealing it first when needed.
-    fn _copy_selected(&mut self) {
-        let Some(id) = self.state.selected_item.clone() else {
-            return;
-        };
-        if self.state.revealed.as_ref().is_some_and(|(r, _)| *r == id) {
-            return self._copy_revealed();
-        }
-        self.copy_after_reveal = Some(id.clone());
-        self._send(Command::RevealSecret(id));
-    }
-
-    /// Copies the revealed secret (text only) and schedules its removal.
-    fn _copy_revealed(&mut self) {
-        let Some((_, secret)) = &self.state.revealed else {
-            return;
-        };
-        let SecretView::Text(text) = secret_display(secret) else {
-            return self.state.apply(Event::Error(MSG_BINARY.into()));
-        };
-        match self.clipboard.copy(&text, Instant::now()) {
-            Ok(()) => {
-                let secs = CLIPBOARD_CLEAR_AFTER.as_secs();
-                self.state.status = format!("Copied, clipboard clears in {secs} s");
-            }
-            Err(e) => self.state.apply(Event::Error(e)),
-        }
-    }
-
-    /// Finishes a copy requested while the secret was hidden.
-    fn _finish_pending_copy(&mut self) {
-        let Some(id) = &self.copy_after_reveal else {
-            return;
-        };
-        if !self.state.revealed.as_ref().is_some_and(|(r, _)| r == id) {
-            return;
-        }
-        self.copy_after_reveal = None;
-        self._copy_revealed();
-        self.state.hide_secret();
     }
 
     /// Drops a revealed secret whose item is now locked.
@@ -275,11 +231,10 @@ impl eframe::App for KringApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self._drain_events();
-        self._finish_pending_copy();
+        self.copier.finish(&mut self.state);
         self._hide_locked_secret();
         self._auto_select();
-        self.clipboard.tick(Instant::now());
-        if self.clipboard.has_pending() {
+        if self.copier.tick(Instant::now()) {
             ctx.request_repaint_after(CLIPBOARD_REPAINT);
         }
         self._open_passphrase_dialog();

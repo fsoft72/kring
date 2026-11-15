@@ -1,11 +1,11 @@
 //! Seeds a throwaway gnome-keyring with sample data for manual UI testing.
 //!
-//! Dev only: run through `scripts/dev-session.sh`. It refuses to run unless
-//! `KRING_IT_RUNTIME` equals `XDG_RUNTIME_DIR` and the session bus is private,
-//! so the user's real keyring is never touched.
+//! Dev only: run through `scripts/dev-session.sh`. It refuses to run outside the
+//! private session (`kring_core::dev_guard`), so the user's real keyring is never touched.
 
 use std::process::ExitCode;
 
+use kring_core::dev_guard::private_session_violation;
 use kring_core::model::{Attributes, CollectionId, LOGIN_COLLECTION_PATH, NewItem, SecretValue};
 use kring_core::secret_service::SecretServiceBackend;
 use kring_core::{MasterPasswordStore, SecretStore};
@@ -16,26 +16,6 @@ const WORK: (&str, &str) = ("Work", "work");
 const DEFAULT_1: (&str, &str) = ("Default_1", "d1");
 /// Content type of the binary sample secret.
 const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
-
-/// Returns why seeding must not run here, or `None` inside a private session.
-fn _unsafe_environment() -> Option<String> {
-    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-    let expected = std::env::var("KRING_IT_RUNTIME").unwrap_or_default();
-    if runtime.is_empty() || runtime != expected {
-        return Some(format!(
-            "XDG_RUNTIME_DIR ({runtime:?}) != KRING_IT_RUNTIME ({expected:?})"
-        ));
-    }
-    let Ok(address) = std::env::var("DBUS_SESSION_BUS_ADDRESS") else {
-        return Some("DBUS_SESSION_BUS_ADDRESS is unset".into());
-    };
-    // Drop transport options such as `,guid=...` before inspecting the path.
-    let transport = address.split(',').next().unwrap_or("");
-    if transport.ends_with("/bus") || address.contains("/run/user/") {
-        return Some(format!("{address} looks like the real user bus"));
-    }
-    None
-}
 
 /// Builds attributes from key/value pairs.
 fn _attrs(pairs: &[(&str, &str)]) -> Attributes {
@@ -102,7 +82,7 @@ async fn _seed() -> kring_core::Result<()> {
 /// Seeds the keyring after checking the environment.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    if let Some(reason) = _unsafe_environment() {
+    if let Some(reason) = private_session_violation() {
         eprintln!("seed_dev: refusing to run outside a private session: {reason}");
         return ExitCode::FAILURE;
     }

@@ -2481,6 +2481,7 @@ dependencies = [
  "age",
  "async-trait",
  "hex",
+ "kring-core",
  "oo7",
  "serde",
  "serde_json",

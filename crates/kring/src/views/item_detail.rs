@@ -1,11 +1,13 @@
 //! Detail of the selected item: secret and editable attributes.
 
 use eframe::egui;
-use kring_core::model::{ItemId, ItemInfo, ItemUpdate};
+use kring_core::model::{ItemId, ItemInfo};
 use kring_core::validate;
 
 use crate::app_state::AppState;
 use crate::secret_display::{SecretView, can_copy, secret_display};
+use crate::views::attr_diff::attribute_diff;
+use crate::views::dialogs::DialogKind;
 use crate::views::{Action, Gates, gated_button};
 use crate::worker::Command;
 
@@ -13,6 +15,8 @@ use crate::worker::Command;
 const MASK: &str = "********";
 /// Tooltip of secret actions on a locked item.
 const MSG_LOCKED: &str = "Unlock the collection first";
+/// Error shown when saving unchanged attributes.
+const MSG_NO_CHANGES: &str = "No attribute changes";
 /// Tooltip of Copy for binary secrets.
 const MSG_BINARY: &str = "Binary secrets cannot be copied";
 
@@ -41,18 +45,18 @@ impl AttrEditor {
         self.error = None;
     }
 
-    /// Validates the rows and builds the update command.
-    pub fn save_command(&self) -> Result<Command, String> {
-        let Some(item) = &self.item else {
-            return Err("no item selected".into());
-        };
+    /// Validates the rows and builds the confirmation listing every attribute change.
+    pub fn confirm_dialog(&self, item: &ItemInfo) -> Result<DialogKind, String> {
         let attributes = validate::attributes(&self.rows).map_err(|e| e.to_string())?;
-        Ok(Command::UpdateItem {
-            item: item.clone(),
-            update: ItemUpdate {
-                attributes: Some(attributes),
-                ..ItemUpdate::default()
-            },
+        let diff = attribute_diff(&item.attributes, &attributes);
+        if diff.is_empty() {
+            return Err(MSG_NO_CHANGES.into());
+        }
+        Ok(DialogKind::SaveAttributes {
+            item: item.id.clone(),
+            label: item.label.clone(),
+            attributes,
+            changes: diff.lines(),
         })
     }
 }
@@ -134,10 +138,10 @@ pub fn show(
     }
     let blocked = gates.write.or(item.locked.then_some(MSG_LOCKED));
     if gated_button(ui, "Save attributes", blocked) {
-        match editor.save_command() {
-            Ok(cmd) => {
+        match editor.confirm_dialog(item) {
+            Ok(kind) => {
                 editor.error = None;
-                action = Some(Action::Send(cmd));
+                action = Some(Action::Open(kind));
             }
             Err(e) => editor.error = Some(e),
         }
@@ -179,21 +183,30 @@ mod tests {
         assert_eq!(e.rows[0].1, "z");
     }
 
-    /// Saving validates keys and updates only the attributes.
+    /// Saving opens a confirmation listing the changes; no changes is an error.
     #[test]
-    fn save_validates_and_updates_attributes_only() {
+    fn confirm_lists_changes() {
+        let it = item("/c/a/1", 1, "v");
         let mut e = AttrEditor::default();
-        e.sync(&item("/c/a/1", 1, "v"));
+        e.sync(&it);
+        assert_eq!(e.confirm_dialog(&it).err().as_deref(), Some(MSG_NO_CHANGES));
         e.rows.push((" ".into(), "x".into()));
-        assert!(e.save_command().is_err());
+        assert!(e.confirm_dialog(&it).is_err());
         e.rows.pop();
-        match e.save_command().unwrap() {
-            Command::UpdateItem { item, update } => {
-                assert_eq!(item, ItemId("/c/a/1".into()));
-                assert!(update.label.is_none() && update.secret.is_none());
-                assert_eq!(update.attributes.unwrap().get("k").unwrap(), "v");
+        e.rows[0].1 = "w".into();
+        e.rows.push(("n".into(), "1".into()));
+        match e.confirm_dialog(&it).unwrap() {
+            DialogKind::SaveAttributes {
+                item,
+                attributes,
+                changes,
+                ..
+            } => {
+                assert_eq!(item, it.id);
+                assert_eq!(attributes.get("k").unwrap(), "w");
+                assert_eq!(changes, ["Changed: k: v -> w", "Added: n = 1"]);
             }
-            other => panic!("unexpected {other:?}"),
+            _ => panic!("expected SaveAttributes"),
         }
     }
 }

@@ -1,11 +1,11 @@
 //! Modal dialogs: password prompts, forms and confirmations.
 
 use eframe::egui;
-use kring_core::model::{CollectionId, ItemId, ItemUpdate, NewItem, SecretValue};
-use kring_core::validate;
+use kring_core::model::{Attributes, CollectionId, ItemId};
 use zeroize::Zeroizing;
 
 use crate::views::dialog_body::{FIELD_WIDTH, body};
+use crate::views::dialog_submit::command_for;
 use crate::widgets::password_field::{forget_fields, new_buffer};
 use crate::worker::Command;
 
@@ -46,6 +46,8 @@ pub enum DialogKind {
         collection: CollectionId,
         label: String,
         item_count: usize,
+        /// Extra warnings (login or default keyring).
+        warnings: Vec<&'static str>,
     },
     /// Create an item.
     NewItem {
@@ -59,6 +61,13 @@ pub enum DialogKind {
         item: ItemId,
         label: String,
         secret: Zeroizing<String>,
+    },
+    /// Confirm replacing the attributes of an item, listing every change.
+    SaveAttributes {
+        item: ItemId,
+        label: String,
+        attributes: Attributes,
+        changes: Vec<String>,
     },
     /// Confirm the deletion of an item.
     DeleteItem { item: ItemId, label: String },
@@ -145,44 +154,6 @@ pub struct Dialog {
     error: Option<String>,
 }
 
-/// Rejects a blank item label.
-fn _item_label(label: &str) -> Result<(), String> {
-    if label.trim().is_empty() {
-        return Err("label must not be empty".into());
-    }
-    Ok(())
-}
-
-/// Returns `cmd` with its backup passphrase set (only delete commands carry one).
-pub fn with_backup_passphrase(cmd: Command, passphrase: SecretValue) -> Command {
-    match cmd {
-        Command::DeleteItem { item, .. } => Command::DeleteItem {
-            item,
-            backup_passphrase: Some(passphrase),
-        },
-        Command::DeleteCollection { collection, .. } => Command::DeleteCollection {
-            collection,
-            backup_passphrase: Some(passphrase),
-        },
-        other => other,
-    }
-}
-
-/// Converts an edited password buffer to a secret.
-fn _secret(buffer: &Zeroizing<String>) -> SecretValue {
-    SecretValue::from_text(buffer)
-}
-
-/// Validates a new password and its confirmation.
-fn _new_password(
-    new: &Zeroizing<String>,
-    confirm: &Zeroizing<String>,
-) -> Result<SecretValue, String> {
-    let new = _secret(new);
-    validate::new_password(&new, &_secret(confirm)).map_err(|e| e.to_string())?;
-    Ok(new)
-}
-
 impl Dialog {
     /// Opens a dialog.
     pub fn new(kind: DialogKind) -> Self {
@@ -191,95 +162,7 @@ impl Dialog {
 
     /// Validates the fields and builds the command to send.
     pub fn submit(&self) -> Result<Command, String> {
-        let invalid = |e: kring_core::KringError| e.to_string();
-        let cmd = match &self.kind {
-            DialogKind::Unlock {
-                collection,
-                password,
-                ..
-            } => Command::Unlock {
-                collection: collection.clone(),
-                password: _secret(password),
-            },
-            DialogKind::CreateCollection {
-                label,
-                password,
-                confirm,
-            } => {
-                validate::collection_label(label).map_err(invalid)?;
-                Command::CreateCollection {
-                    label: label.trim().to_string(),
-                    password: _new_password(password, confirm)?,
-                }
-            }
-            DialogKind::Rename { collection, label } => {
-                validate::collection_label(label).map_err(invalid)?;
-                Command::RenameCollection {
-                    collection: collection.clone(),
-                    label: label.trim().to_string(),
-                }
-            }
-            DialogKind::ChangePassword {
-                collection,
-                old,
-                new,
-                confirm,
-                ..
-            } => Command::ChangePassword {
-                collection: collection.clone(),
-                old: _secret(old),
-                new: _new_password(new, confirm)?,
-            },
-            DialogKind::DeleteCollection { collection, .. } => Command::DeleteCollection {
-                collection: collection.clone(),
-                backup_passphrase: None,
-            },
-            DialogKind::NewItem {
-                collection,
-                label,
-                secret,
-                rows,
-            } => {
-                _item_label(label)?;
-                Command::CreateItem {
-                    collection: collection.clone(),
-                    item: NewItem {
-                        label: label.trim().to_string(),
-                        attributes: validate::attributes(rows).map_err(invalid)?,
-                        secret: _secret(secret),
-                        replace: false,
-                    },
-                }
-            }
-            DialogKind::EditItem {
-                item,
-                label,
-                secret,
-            } => {
-                _item_label(label)?;
-                Command::UpdateItem {
-                    item: item.clone(),
-                    update: ItemUpdate {
-                        label: Some(label.trim().to_string()),
-                        attributes: None,
-                        secret: (!secret.is_empty()).then(|| _secret(secret)),
-                    },
-                }
-            }
-            DialogKind::DeleteItem { item, .. } => Command::DeleteItem {
-                item: item.clone(),
-                backup_passphrase: None,
-            },
-            DialogKind::Passphrase {
-                command,
-                passphrase,
-                confirm,
-            } => {
-                let passphrase = _new_password(passphrase, confirm)?;
-                with_backup_passphrase((**command).clone(), passphrase)
-            }
-        };
-        Ok(cmd)
+        command_for(&self.kind)
     }
 
     /// Renders the dialog and reports whether it closed.
@@ -321,6 +204,8 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::dialog_submit::with_backup_passphrase;
+    use kring_core::model::SecretValue;
 
     /// Fills a zeroizing buffer with text.
     fn buf(text: &str) -> Zeroizing<String> {
@@ -439,6 +324,25 @@ mod tests {
             Command::DeleteCollection {
                 backup_passphrase, ..
             } => assert_eq!(backup_passphrase.unwrap().as_text(), Some("pp")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Confirming attribute changes updates only the attributes.
+    #[test]
+    fn save_attributes_updates_attributes_only() {
+        let d = Dialog::new(DialogKind::SaveAttributes {
+            item: ItemId("/c/a/1".into()),
+            label: "x".into(),
+            attributes: [("k".to_string(), "v".to_string())].into(),
+            changes: vec!["Added: k = v".into()],
+        });
+        match d.submit().unwrap() {
+            Command::UpdateItem { item, update } => {
+                assert_eq!(item, ItemId("/c/a/1".into()));
+                assert!(update.label.is_none() && update.secret.is_none());
+                assert_eq!(update.attributes.unwrap().get("k").unwrap(), "v");
+            }
             other => panic!("unexpected {other:?}"),
         }
     }

@@ -24,6 +24,11 @@ const MSG_PAM_MISSING: &str = "PAM does not unlock this keyring at login";
 const MSG_LOGIN_PASSWORD: &str =
     "Auto-unlock works only if this keyring password equals your login password";
 
+/// Delete warning for the login keyring.
+const MSG_DELETE_LOGIN: &str = "This is your login keyring, unlocked at login";
+/// Delete warning for the default keyring.
+const MSG_DELETE_DEFAULT: &str = "This is the default keyring";
+
 /// Returns the badges of a collection header.
 pub fn badges(c: &CollectionInfo) -> Vec<&'static str> {
     let flags = [
@@ -43,6 +48,18 @@ pub fn display_name(c: &CollectionInfo) -> String {
         return c.label.clone();
     }
     c.id.0.rsplit('/').next().unwrap_or_default().to_string()
+}
+
+/// Returns the extra warnings of the delete confirmation (login and default keyring).
+pub fn delete_warnings(c: &CollectionInfo) -> Vec<&'static str> {
+    let flags = [
+        (c.is_login, MSG_DELETE_LOGIN),
+        (is_default(c), MSG_DELETE_DEFAULT),
+    ];
+    flags
+        .into_iter()
+        .filter_map(|(on, warning)| on.then_some(warning))
+        .collect()
 }
 
 /// Returns true when the collection is the default one.
@@ -134,6 +151,7 @@ fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> O
                 collection: c.id.clone(),
                 label: display_name(c),
                 item_count: c.item_count,
+                warnings: delete_warnings(c),
             }));
         }
     });
@@ -264,6 +282,19 @@ mod tests {
         assert_eq!(s.chars().count(), MAX_SUMMARY_CHARS + 3);
         assert!(s.ends_with("..."));
         assert_eq!(attributes_summary(&Attributes::new()), "");
+    }
+
+    /// Login and default collections get their warnings, others none.
+    #[test]
+    fn delete_warnings_for_login_and_default() {
+        let login = col(LOGIN_COLLECTION_PATH, &["default"], false);
+        assert_eq!(
+            delete_warnings(&login),
+            [MSG_DELETE_LOGIN, MSG_DELETE_DEFAULT]
+        );
+        let def = col("/c/w", &["default"], false);
+        assert_eq!(delete_warnings(&def), [MSG_DELETE_DEFAULT]);
+        assert!(delete_warnings(&col("/c/w", &[], false)).is_empty());
     }
 
     /// Blank labels (such as the session collection) fall back to the path segment.
