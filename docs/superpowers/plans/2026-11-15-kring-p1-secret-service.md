@@ -31,7 +31,7 @@
 - Binary keyring magic: `b"GnomeKeyring\n\r\0\n"`; any `.keyring` not starting with it is plaintext and must be stored as `<name>.age` (age scrypt passphrase).
 - Clipboard auto-clear after 30 s, only if clipboard still holds the copied text.
 - Integration tests never touch the user's real keyring: they run only inside `scripts/it-session.sh` (private `dbus-run-session`, temp `HOME`/`XDG_DATA_HOME`, `gnome-keyring-daemon --unlock --components=secrets` fed password `test`) and are `#[ignore]` unless `KRING_IT=1`.
-- Code style (user rules): English identifiers and comments, doc comment on every function, early-return guards at top, constants UPPER_SNAKE_CASE, files end with newline, never the `—` character. Update `CHANGES.md` and commit at the end of each task (no AI attribution, no `--no-verify`, no push).
+- Code style (user rules): English identifiers and comments, doc comment on every function, early-return guards at top, constants UPPER_SNAKE_CASE, files end with newline, never the long dash character (U+2014). Update `CHANGES.md` and commit at the end of each task (no AI attribution, no `--no-verify`, no push).
 
 ## Review Focus
 
