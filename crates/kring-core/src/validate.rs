@@ -18,10 +18,14 @@ pub fn attributes(rows: &[(String, String)]) -> Result<Attributes> {
     for (key, value) in rows {
         let key = key.trim();
         if key.is_empty() {
-            return Err(KringError::InvalidInput("attribute key must not be empty".into()));
+            return Err(KringError::InvalidInput(
+                "attribute key must not be empty".into(),
+            ));
         }
         if out.insert(key.to_string(), value.clone()).is_some() {
-            return Err(KringError::InvalidInput(format!("duplicate attribute key: {key}")));
+            return Err(KringError::InvalidInput(format!(
+                "duplicate attribute key: {key}"
+            )));
         }
     }
     Ok(out)
@@ -30,10 +34,14 @@ pub fn attributes(rows: &[(String, String)]) -> Result<Attributes> {
 /// Checks a new password and its confirmation: non-empty and equal.
 pub fn new_password(new: &SecretValue, confirm: &SecretValue) -> Result<()> {
     if new.is_empty() {
-        return Err(KringError::InvalidInput("password must not be empty".into()));
+        return Err(KringError::InvalidInput(
+            "password must not be empty".into(),
+        ));
     }
     if new.as_bytes() != confirm.as_bytes() {
-        return Err(KringError::InvalidInput("password and confirmation do not match".into()));
+        return Err(KringError::InvalidInput(
+            "password and confirmation do not match".into(),
+        ));
     }
     Ok(())
 }
@@ -45,7 +53,10 @@ mod tests {
     /// Blank labels are rejected.
     #[test]
     fn rejects_empty_label() {
-        assert!(matches!(collection_label("  "), Err(KringError::InvalidInput(_))));
+        assert!(matches!(
+            collection_label("  "),
+            Err(KringError::InvalidInput(_))
+        ));
         assert!(collection_label(" ok ").is_ok());
     }
 

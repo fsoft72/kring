@@ -6,7 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{KringError, Result};
 use crate::model::{
-    CollectionId, CollectionInfo, ItemId, ItemInfo, ItemUpdate, NewItem, SecretValue, is_login_collection,
+    CollectionId, CollectionInfo, ItemId, ItemInfo, ItemUpdate, NewItem, SecretValue,
+    is_login_collection,
 };
 use crate::store::{MasterPasswordStore, SecretStore};
 
@@ -46,7 +47,10 @@ pub struct FakeStore {
 
 /// Returns the current unix time in seconds.
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Builds a `NotFound` error for an object path.
@@ -57,12 +61,18 @@ fn not_found(path: &str) -> KringError {
 impl State {
     /// Finds a collection by id.
     fn collection(&self, id: &CollectionId) -> Result<&FakeCollection> {
-        self.collections.iter().find(|c| &c.id == id).ok_or_else(|| not_found(&id.0))
+        self.collections
+            .iter()
+            .find(|c| &c.id == id)
+            .ok_or_else(|| not_found(&id.0))
     }
 
     /// Finds a collection by id, mutably.
     fn collection_mut(&mut self, id: &CollectionId) -> Result<&mut FakeCollection> {
-        self.collections.iter_mut().find(|c| &c.id == id).ok_or_else(|| not_found(&id.0))
+        self.collections
+            .iter_mut()
+            .find(|c| &c.id == id)
+            .ok_or_else(|| not_found(&id.0))
     }
 
     /// Fails with `Locked` unless the collection exists and is unlocked.
@@ -75,7 +85,10 @@ impl State {
 
     /// Returns the index of an item by id.
     fn item_index(&self, id: &ItemId) -> Result<usize> {
-        self.items.iter().position(|i| &i.info.id == id).ok_or_else(|| not_found(&id.0))
+        self.items
+            .iter()
+            .position(|i| &i.info.id == id)
+            .ok_or_else(|| not_found(&id.0))
     }
 
     /// Adds a collection, making its path unique, and returns its id.
@@ -129,7 +142,12 @@ impl SecretStore for FakeStore {
                 label: c.label.clone(),
                 locked: c.locked,
                 item_count: s.items.iter().filter(|i| i.info.collection == c.id).count(),
-                aliases: s.aliases.iter().filter(|(_, v)| **v == c.id).map(|(k, _)| k.clone()).collect(),
+                aliases: s
+                    .aliases
+                    .iter()
+                    .filter(|(_, v)| **v == c.id)
+                    .map(|(k, _)| k.clone())
+                    .collect(),
                 is_login: is_login_collection(&c.id),
                 created: c.created,
                 modified: c.modified,
@@ -144,7 +162,10 @@ impl SecretStore for FakeStore {
         Ok(s.items
             .iter()
             .filter(|i| &i.info.collection == collection)
-            .map(|i| ItemInfo { locked, ..i.info.clone() })
+            .map(|i| ItemInfo {
+                locked,
+                ..i.info.clone()
+            })
             .collect())
     }
 
@@ -163,7 +184,11 @@ impl SecretStore for FakeStore {
         let ts = now();
         let existing = item
             .replace
-            .then(|| s.items.iter().position(|i| &i.info.collection == collection && i.info.attributes == item.attributes))
+            .then(|| {
+                s.items.iter().position(|i| {
+                    &i.info.collection == collection && i.info.attributes == item.attributes
+                })
+            })
             .flatten();
         if let Some(idx) = existing {
             let entry = &mut s.items[idx];
@@ -183,7 +208,10 @@ impl SecretStore for FakeStore {
             created: ts,
             modified: ts,
         };
-        s.items.push(FakeItem { info, secret: item.secret });
+        s.items.push(FakeItem {
+            info,
+            secret: item.secret,
+        });
         s.collection_mut(collection)?.modified = ts;
         Ok(id)
     }
@@ -260,28 +288,49 @@ impl SecretStore for FakeStore {
 #[async_trait::async_trait]
 impl MasterPasswordStore for FakeStore {
     /// Creates an unlocked collection protected by `password`.
-    async fn create_with_password(&self, label: &str, password: &SecretValue) -> Result<CollectionId> {
-        let text = password.as_text().ok_or_else(|| KringError::InvalidInput("password must be UTF-8".into()))?;
+    async fn create_with_password(
+        &self,
+        label: &str,
+        password: &SecretValue,
+    ) -> Result<CollectionId> {
+        let text = password
+            .as_text()
+            .ok_or_else(|| KringError::InvalidInput("password must be UTF-8".into()))?;
         Ok(self.state().add_collection(label, text, false))
     }
 
     /// Unlocks a collection when the password matches.
-    async fn unlock_with_password(&self, collection: &CollectionId, password: &SecretValue) -> Result<()> {
+    async fn unlock_with_password(
+        &self,
+        collection: &CollectionId,
+        password: &SecretValue,
+    ) -> Result<()> {
         let mut s = self.state();
         let c = s.collection_mut(collection)?;
         if c.password != password.as_bytes() {
-            return Err(KringError::Dbus { context: "unlock".into(), message: "invalid password".into() });
+            return Err(KringError::Dbus {
+                context: "unlock".into(),
+                message: "invalid password".into(),
+            });
         }
         c.locked = false;
         Ok(())
     }
 
     /// Changes the password when `old` matches.
-    async fn change_password(&self, collection: &CollectionId, old: &SecretValue, new: &SecretValue) -> Result<()> {
+    async fn change_password(
+        &self,
+        collection: &CollectionId,
+        old: &SecretValue,
+        new: &SecretValue,
+    ) -> Result<()> {
         let mut s = self.state();
         let c = s.collection_mut(collection)?;
         if c.password != old.as_bytes() {
-            return Err(KringError::Dbus { context: "change_password".into(), message: "invalid password".into() });
+            return Err(KringError::Dbus {
+                context: "change_password".into(),
+                message: "invalid password".into(),
+            });
         }
         c.password = new.as_bytes().to_vec();
         c.modified = now();
@@ -300,7 +349,12 @@ mod tests {
     fn new_item(label: &str, secret: &str) -> NewItem {
         let mut attributes = Attributes::new();
         attributes.insert("k".into(), label.into());
-        NewItem { label: label.into(), attributes, secret: SecretValue::from_text(secret), replace: false }
+        NewItem {
+            label: label.into(),
+            attributes,
+            secret: SecretValue::from_text(secret),
+            replace: false,
+        }
     }
 
     /// A locked collection refuses to reveal secrets.
@@ -311,7 +365,10 @@ mod tests {
         let id = store.create_item(&c, new_item("x", "s3")).await.unwrap();
         assert_eq!(store.read_secret(&id).await.unwrap().as_bytes(), b"s3");
         store.lock(&c).await.unwrap();
-        assert!(matches!(store.read_secret(&id).await, Err(KringError::Locked(_))));
+        assert!(matches!(
+            store.read_secret(&id).await,
+            Err(KringError::Locked(_))
+        ));
     }
 
     /// A wrong password gives a D-Bus unlock error.
@@ -319,9 +376,15 @@ mod tests {
     async fn unlock_with_wrong_password_fails() {
         let store = FakeStore::new();
         let c = store.add_collection("a", "pw", true);
-        let err = store.unlock_with_password(&c, &SecretValue::from_text("bad")).await.unwrap_err();
+        let err = store
+            .unlock_with_password(&c, &SecretValue::from_text("bad"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, KringError::Dbus { ref context, .. } if context == "unlock"));
-        store.unlock_with_password(&c, &SecretValue::from_text("pw")).await.unwrap();
+        store
+            .unlock_with_password(&c, &SecretValue::from_text("pw"))
+            .await
+            .unwrap();
         assert!(!store.list_collections().await.unwrap()[0].locked);
     }
 
@@ -343,7 +406,10 @@ mod tests {
     #[tokio::test]
     async fn delete_unknown_item_is_not_found() {
         let store = FakeStore::new();
-        let err = store.delete_item(&ItemId("/nope/1".into())).await.unwrap_err();
+        let err = store
+            .delete_item(&ItemId("/nope/1".into()))
+            .await
+            .unwrap_err();
         assert!(matches!(err, KringError::NotFound(_)));
     }
 
@@ -364,14 +430,28 @@ mod tests {
 
         let wrong = SecretValue::from_text("nope");
         let new_pw = SecretValue::from_text("pw2");
-        let err = store.change_password(&c, &wrong, &new_pw).await.unwrap_err();
-        assert!(matches!(err, KringError::Dbus { ref context, .. } if context == "change_password"));
-        store.change_password(&c, &SecretValue::from_text("pw"), &new_pw).await.unwrap();
+        let err = store
+            .change_password(&c, &wrong, &new_pw)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KringError::Dbus { ref context, .. } if context == "change_password")
+        );
+        store
+            .change_password(&c, &SecretValue::from_text("pw"), &new_pw)
+            .await
+            .unwrap();
 
         store.lock(&c).await.unwrap();
         assert!(store.list_items(&c).await.unwrap().iter().all(|i| i.locked));
-        assert!(matches!(store.create_item(&c, new_item("y", "z")).await, Err(KringError::Locked(_))));
-        assert!(matches!(store.update_item(&first, ItemUpdate::default()).await, Err(KringError::Locked(_))));
+        assert!(matches!(
+            store.create_item(&c, new_item("y", "z")).await,
+            Err(KringError::Locked(_))
+        ));
+        assert!(matches!(
+            store.update_item(&first, ItemUpdate::default()).await,
+            Err(KringError::Locked(_))
+        ));
 
         store.set_alias("default", &c).await.unwrap();
         store.delete_collection(&c).await.unwrap();

@@ -32,7 +32,10 @@ pub struct SecretValue {
 impl SecretValue {
     /// Creates a secret from raw bytes and a content type.
     pub fn new(bytes: Vec<u8>, content_type: &str) -> Self {
-        Self { bytes: Zeroizing::new(bytes), content_type: content_type.to_string() }
+        Self {
+            bytes: Zeroizing::new(bytes),
+            content_type: content_type.to_string(),
+        }
     }
 
     /// Creates a `text/plain` secret from text.
@@ -134,8 +137,12 @@ mod tests {
     /// Only the login path is the login collection.
     #[test]
     fn login_path_detected() {
-        assert!(is_login_collection(&CollectionId(LOGIN_COLLECTION_PATH.into())));
-        assert!(!is_login_collection(&CollectionId("/org/freedesktop/secrets/collection/Default_3".into())));
+        assert!(is_login_collection(&CollectionId(
+            LOGIN_COLLECTION_PATH.into()
+        )));
+        assert!(!is_login_collection(&CollectionId(
+            "/org/freedesktop/secrets/collection/Default_3".into()
+        )));
     }
 
     /// Non-UTF-8 bytes give no text; clones keep the bytes.

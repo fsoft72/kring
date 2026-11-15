@@ -1,7 +1,9 @@
 //! Storage abstraction over a Secret Service provider.
 
 use crate::error::Result;
-use crate::model::{CollectionId, CollectionInfo, ItemId, ItemInfo, ItemUpdate, NewItem, SecretValue};
+use crate::model::{
+    CollectionId, CollectionInfo, ItemId, ItemInfo, ItemUpdate, NewItem, SecretValue,
+};
 
 /// Operations available on any Secret Service provider.
 #[async_trait::async_trait]
@@ -34,9 +36,22 @@ pub trait SecretStore: Send + Sync {
 #[async_trait::async_trait]
 pub trait MasterPasswordStore: Send + Sync {
     /// Creates an unlocked collection protected by `password`.
-    async fn create_with_password(&self, label: &str, password: &SecretValue) -> Result<CollectionId>;
+    async fn create_with_password(
+        &self,
+        label: &str,
+        password: &SecretValue,
+    ) -> Result<CollectionId>;
     /// Unlocks a collection with its password.
-    async fn unlock_with_password(&self, collection: &CollectionId, password: &SecretValue) -> Result<()>;
+    async fn unlock_with_password(
+        &self,
+        collection: &CollectionId,
+        password: &SecretValue,
+    ) -> Result<()>;
     /// Changes the password of a collection.
-    async fn change_password(&self, collection: &CollectionId, old: &SecretValue, new: &SecretValue) -> Result<()>;
+    async fn change_password(
+        &self,
+        collection: &CollectionId,
+        old: &SecretValue,
+        new: &SecretValue,
+    ) -> Result<()>;
 }

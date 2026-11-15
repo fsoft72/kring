@@ -41,9 +41,15 @@ mod tests {
     /// Error messages include their context.
     #[test]
     fn display_includes_context() {
-        let e = KringError::Dbus { context: "listing".into(), message: "boom".into() };
+        let e = KringError::Dbus {
+            context: "listing".into(),
+            message: "boom".into(),
+        };
         assert_eq!(e.to_string(), "D-Bus error while listing: boom");
-        let e = KringError::Io { path: "/x/y".into(), message: "denied".into() };
+        let e = KringError::Io {
+            path: "/x/y".into(),
+            message: "denied".into(),
+        };
         assert_eq!(e.to_string(), "I/O error on /x/y: denied");
     }
 }
