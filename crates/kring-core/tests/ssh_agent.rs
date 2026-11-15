@@ -3,6 +3,7 @@
 //! The agent listens on a socket in a temp dir and is killed at the end.
 //! `SSH_AUTH_SOCK` is never read, so the user's real agent is never touched.
 
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -43,9 +44,13 @@ impl PrivateAgent {
             sock,
             _dir: dir,
         };
+        // The socket file appears before the agent accepts: wait until a connect succeeds.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !agent.sock.exists() {
-            assert!(Instant::now() < deadline, "ssh-agent socket did not appear");
+        while UnixStream::connect(&agent.sock).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "ssh-agent did not accept connections"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         Some(agent)

@@ -98,6 +98,8 @@ fn env_with(competitors: &[&str]) -> Env {
         keyrings_dir: keyrings,
         pam_dir: pam,
         kwallet_dir: kwallet.clone(),
+        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_agent_sock: None,
     };
     let store = Arc::new(FakeStore::new());
     let main = store.add_collection("Main", "pw", false);
@@ -502,6 +504,8 @@ fn create_wallet_collection_gated() {
         keyrings_dir: dir.path().join("keyrings"),
         pam_dir: dir.path().join("pam"),
         kwallet_dir: kwallet,
+        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_agent_sock: None,
     };
     let mut info = provider(&[]).unwrap();
     info.has_master_password_iface = false;
@@ -632,6 +636,8 @@ fn created_keyring_done_despite_rescan_error() {
         keyrings_dir: dir.path().join("keyrings"),
         pam_dir: dir.path().join("pam"),
         kwallet_dir: not_a_dir,
+        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_agent_sock: None,
     };
     let store = FakeStore::new();
     store.add_collection(FIXTURE, "pw", false);

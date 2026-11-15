@@ -15,5 +15,6 @@ pub mod ui;
 pub mod views;
 pub mod worker;
 mod worker_offline;
+mod worker_ssh;
 mod worker_transfer;
 mod worker_wallet;

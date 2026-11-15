@@ -1,7 +1,10 @@
 //! Filesystem locations used by kring and gnome-keyring.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
+/// Environment variable naming the ssh-agent socket.
+const SSH_AUTH_SOCK_VAR: &str = "SSH_AUTH_SOCK";
 /// Directory of the KWallet wallets inside the data home (`ksecretd`, `kwalletd`).
 const KWALLET_DIR_NAME: &str = "kwalletd";
 
@@ -43,6 +46,28 @@ pub fn backups_dir() -> PathBuf {
     data_home().join("kring").join("backups")
 }
 
+/// Resolves the SSH key directory `$HOME/.ssh` from an explicit HOME (pure, testable).
+pub fn ssh_dir_from(home: Option<&str>) -> PathBuf {
+    PathBuf::from(home.filter(|v| !v.is_empty()).unwrap_or("/")).join(".ssh")
+}
+
+/// Returns the user's SSH key directory, `$HOME/.ssh`.
+pub fn ssh_dir() -> PathBuf {
+    ssh_dir_from(std::env::var("HOME").ok().as_deref())
+}
+
+/// Resolves the ssh-agent socket from an `SSH_AUTH_SOCK` value; empty means unset.
+pub fn agent_sock_from(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Returns the ssh-agent socket named by `SSH_AUTH_SOCK`, if set.
+///
+/// Read once at startup by the application; library code never calls it.
+pub fn agent_sock() -> Option<PathBuf> {
+    agent_sock_from(std::env::var_os(SSH_AUTH_SOCK_VAR))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +92,25 @@ mod tests {
             kwallet_dir_from(Some(""), Some("/home/u")),
             PathBuf::from("/home/u/.local/share/kwalletd")
         );
+    }
+
+    /// The SSH directory is `$HOME/.ssh`; an unset or empty HOME falls back to `/`.
+    #[test]
+    fn ssh_dir_in_home() {
+        assert_eq!(ssh_dir_from(Some("/home/u")), PathBuf::from("/home/u/.ssh"));
+        assert_eq!(ssh_dir_from(Some("")), PathBuf::from("/.ssh"));
+        assert_eq!(ssh_dir_from(None), PathBuf::from("/.ssh"));
+    }
+
+    /// The agent socket is taken from a non-empty `SSH_AUTH_SOCK` value only.
+    #[test]
+    fn agent_sock_from_env_value() {
+        assert_eq!(
+            agent_sock_from(Some("/run/agent.sock".into())),
+            Some(PathBuf::from("/run/agent.sock"))
+        );
+        assert_eq!(agent_sock_from(Some("".into())), None);
+        assert_eq!(agent_sock_from(None), None);
     }
 
     /// Falls back to HOME/.local/share, also for empty XDG.

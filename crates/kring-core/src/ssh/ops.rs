@@ -606,14 +606,22 @@ fn create_file(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
 ///
 /// The data goes to a temporary sibling first and is hard linked into place.
 /// If the file system cannot hard link, `path` is written directly with
-/// `create_new`.
+/// `create_new`. If the temporary file cannot be removed after a successful
+/// link, the linked `path` is removed again (it is the file just created,
+/// never a pre-existing one) and the error is returned, so a failure never
+/// leaves the key material behind under two names plus a "success".
 fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let tmp = temp_sibling(path);
     create_file(&tmp, bytes, mode).map_err(|e| io_err(&tmp, e))?;
     let linked = fs::hard_link(&tmp, path);
     if linked.is_ok() {
         // A leftover temp file would be a second hard link to the key material.
-        return fs::remove_file(&tmp).map_err(|e| io_err(&tmp, e));
+        if let Err(e) = fs::remove_file(&tmp) {
+            // Roll back: the caller sees a failure, so the new file must not stay.
+            let _ = fs::remove_file(path);
+            return Err(io_err(&tmp, e));
+        }
+        return Ok(());
     }
     let _ = fs::remove_file(&tmp);
     let fallback = match linked {
@@ -676,6 +684,15 @@ mod tests {
         }
         for reserved in RESERVED_NAMES {
             assert!(!valid_key_name(reserved), "{reserved}");
+        }
+    }
+
+    /// The entries added after review are reserved (never listed or written as keys).
+    #[test]
+    fn reserved_names_include_review_additions() {
+        for name in ["known_hosts2", "authorized_principals"] {
+            assert!(RESERVED_NAMES.contains(&name), "{name}");
+            assert!(!valid_key_name(name), "{name}");
         }
     }
 

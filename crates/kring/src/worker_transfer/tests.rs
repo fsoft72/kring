@@ -94,6 +94,8 @@ fn env(kind: ProviderKind) -> Env {
         keyrings_dir: keyrings.clone(),
         pam_dir: pam,
         kwallet_dir: keyrings.join("kwalletd-unused"),
+        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_agent_sock: None,
     };
     let store = Arc::new(FakeStore::new());
     let main = store.add_collection("Main", "pw", false);
@@ -286,6 +288,9 @@ fn may_carry_secret(event: &Event) -> bool {
         | Event::Backups(_)
         | Event::RestoreDone(_)
         | Event::Wallets(_)
+        | Event::SshKeys(_)
+        | Event::AgentIdentities(_)
+        | Event::SshPublicKey { .. }
         | Event::Notice(_)
         | Event::TransferPreview { .. }
         | Event::TransferDone(_)

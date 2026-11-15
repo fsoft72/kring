@@ -19,6 +19,7 @@ use kring_core::model::{
 use kring_core::pam::{PamStatus, pam_status};
 use kring_core::paths;
 use kring_core::provider::ProviderInfo;
+use kring_core::ssh::{NewKey, SshKeyInfo};
 use kring_core::transfer::apply::{TransferMode, TransferReport};
 use kring_core::transfer::consolidate::PLANNED_ID_PREFIX;
 use kring_core::transfer::consolidate_apply::ConsolidationReport;
@@ -27,6 +28,8 @@ use kring_core::transfer::plan::{Choice, TransferCounts};
 use kring_core::{KringError, MasterPasswordStore, SecretStore};
 
 use crate::worker_offline;
+use crate::worker_ssh;
+pub use crate::worker_ssh::AgentStatus;
 use crate::worker_transfer::{self, PlanState};
 pub use crate::worker_transfer::{ConflictView, ConsolidationSummary, StepSummary};
 use crate::worker_wallet;
@@ -201,6 +204,55 @@ pub enum Command {
     /// Create a keyring labelled like wallet `name` (where the kwalletd6 shim
     /// looks for the wallet), protected by `password`.
     CreateWalletCollection { name: String, password: SecretValue },
+    /// Scan the SSH key directory; answers with [`Event::SshKeys`].
+    ScanSshKeys,
+    /// Generate a new key pair in the SSH key directory.
+    GenerateSshKey(NewKey),
+    /// Copy the OpenSSH private key `source` into the SSH key directory as
+    /// `name` (default: the source file name).
+    ImportSshKey {
+        source: PathBuf,
+        name: Option<String>,
+    },
+    /// Read the public key of key `name`; answers with [`Event::SshPublicKey`].
+    ReadSshPublicKey { name: String },
+    /// Write a copy of the private key `name` to the new file `dest`,
+    /// re-encrypted with `new_passphrase` when given (an encrypted key is
+    /// then decrypted with `passphrase` first).
+    ExportSshPrivate {
+        name: String,
+        dest: PathBuf,
+        passphrase: Option<SecretValue>,
+        new_passphrase: Option<SecretValue>,
+    },
+    /// Change the passphrase of key `name` after a backup; `new = None`
+    /// removes it and needs `allow_unencrypted`. An unencrypted key is
+    /// backed up age-encrypted with `backup_passphrase`.
+    ChangeSshPassphrase {
+        name: String,
+        old: Option<SecretValue>,
+        new: Option<SecretValue>,
+        allow_unencrypted: bool,
+        backup_passphrase: Option<SecretValue>,
+    },
+    /// Delete the files of key `name` after a backup (an unencrypted
+    /// private key is backed up age-encrypted with `backup_passphrase`).
+    DeleteSshKey {
+        name: String,
+        backup_passphrase: Option<SecretValue>,
+    },
+    /// List the agent identities; answers with [`Event::AgentIdentities`].
+    AgentList,
+    /// Load key `name` into the agent, for `lifetime_secs` when given.
+    AgentAdd {
+        name: String,
+        passphrase: Option<SecretValue>,
+        lifetime_secs: Option<u32>,
+    },
+    /// Remove the agent identity with `fingerprint` (`SHA256:...`).
+    AgentRemove { fingerprint: String },
+    /// Remove every agent identity.
+    AgentRemoveAll,
 }
 
 /// A notification from the worker to the UI.
@@ -278,6 +330,12 @@ pub enum Event {
         name: String,
         items: Vec<OfflineItemView>,
     },
+    /// SSH keys of the SSH key directory (last scan).
+    SshKeys(Vec<SshKeyInfo>),
+    /// Identities of the ssh-agent, or why it cannot be reached.
+    AgentIdentities(AgentStatus),
+    /// Public key `text` (one OpenSSH line) of key `name`; not a secret.
+    SshPublicKey { name: String, text: String },
     /// An informational notice shown as a toast (not an error).
     Notice(String),
     /// An operation finished with a message.
@@ -303,10 +361,15 @@ pub struct WorkerConfig {
     pub pam_dir: PathBuf,
     /// Directory holding the KWallet wallets (`$XDG_DATA_HOME/kwalletd`).
     pub kwallet_dir: PathBuf,
+    /// Directory holding the SSH keys (`$HOME/.ssh`).
+    pub ssh_dir: PathBuf,
+    /// Socket of the ssh-agent (`SSH_AUTH_SOCK` at startup), `None` when unset.
+    pub ssh_agent_sock: Option<PathBuf>,
 }
 
 impl WorkerConfig {
-    /// Builds the configuration with the real user paths.
+    /// Builds the configuration with the real user paths; reads
+    /// `SSH_AUTH_SOCK` (call it once, at startup).
     pub fn default_paths() -> Self {
         Self {
             backups: BackupManager {
@@ -316,6 +379,8 @@ impl WorkerConfig {
             keyrings_dir: paths::keyrings_dir(),
             pam_dir: PathBuf::from(PAM_DIR),
             kwallet_dir: paths::kwallet_dir(),
+            ssh_dir: paths::ssh_dir(),
+            ssh_agent_sock: paths::agent_sock(),
         }
     }
 }
@@ -354,8 +419,9 @@ impl<N: Fn()> Emitter<N> {
     }
 }
 
-/// Builds the [`Event::PassphraseNeeded`] echo of a Plan 1/2 command with
-/// every passphrase field cleared, so no secret travels back in the event.
+/// Builds the [`Event::PassphraseNeeded`] echo of a Plan 1/2 or SSH command
+/// with every passphrase field cleared (backup and key passphrases), so no
+/// secret travels back in the event.
 ///
 /// Apply commands must never be echoed (they use
 /// [`Event::ApplyPassphrasesNeeded`]); a debug build asserts this.
@@ -385,6 +451,40 @@ pub(crate) fn passphrase_echo(cmd: &Command) -> Event {
             dir,
             files,
             passphrase: None,
+        },
+        Command::GenerateSshKey(key) => Command::GenerateSshKey(NewKey {
+            passphrase: None,
+            ..key
+        }),
+        Command::ExportSshPrivate { name, dest, .. } => Command::ExportSshPrivate {
+            name,
+            dest,
+            passphrase: None,
+            new_passphrase: None,
+        },
+        Command::ChangeSshPassphrase {
+            name,
+            allow_unencrypted,
+            ..
+        } => Command::ChangeSshPassphrase {
+            name,
+            old: None,
+            new: None,
+            allow_unencrypted,
+            backup_passphrase: None,
+        },
+        Command::DeleteSshKey { name, .. } => Command::DeleteSshKey {
+            name,
+            backup_passphrase: None,
+        },
+        Command::AgentAdd {
+            name,
+            lifetime_secs,
+            ..
+        } => Command::AgentAdd {
+            name,
+            passphrase: None,
+            lifetime_secs,
         },
         other => other,
     };
@@ -704,7 +804,8 @@ pub(crate) fn gate<N: Fn()>(
 /// Plans, imports and applies go to [`worker_transfer`]; any other command
 /// that may change keyring data drops the pending plan first. Offline
 /// commands (files, backups, archives) are routed to [`worker_offline`],
-/// KWallet commands to [`worker_wallet`].
+/// KWallet commands to [`worker_wallet`], SSH key and agent commands to
+/// [`worker_ssh`] (they need no Secret Service).
 async fn handle<S, N>(
     out: &Emitter<N>,
     store: Option<&S>,
@@ -727,6 +828,9 @@ async fn handle<S, N>(
     }
     if worker_wallet::is_wallet(&cmd) {
         return worker_wallet::handle(out, store, provider, config, plans, cmd).await;
+    }
+    if worker_ssh::is_ssh(&cmd) {
+        return worker_ssh::handle(out, config, &cmd);
     }
     let Some(store) = store else {
         return out.error(MSG_NO_PROVIDER);
@@ -885,7 +989,18 @@ where
         | Command::ScanWallets
         | Command::OpenWallet { .. }
         | Command::PlanWalletImport { .. }
-        | Command::CreateWalletCollection { .. } => {
+        | Command::CreateWalletCollection { .. }
+        | Command::ScanSshKeys
+        | Command::GenerateSshKey(_)
+        | Command::ImportSshKey { .. }
+        | Command::ReadSshPublicKey { .. }
+        | Command::ExportSshPrivate { .. }
+        | Command::ChangeSshPassphrase { .. }
+        | Command::DeleteSshKey { .. }
+        | Command::AgentList
+        | Command::AgentAdd { .. }
+        | Command::AgentRemove { .. }
+        | Command::AgentRemoveAll => {
             return Err(KringError::InvalidInput(
                 "Offline or transfer command sent to the store path".into(),
             ));
@@ -898,6 +1013,10 @@ where
     out.emit(Event::Done(done));
     Ok(())
 }
+
+/// SSH directory of worker tests that never use SSH commands (does not exist).
+#[cfg(test)]
+pub(crate) const NO_SSH_DIR: &str = "/nonexistent/kring-test-ssh";
 
 /// Receives the next event of `handle` other than [`Event::CommandFinished`]
 /// (tests asserting the event sequence of a command), failing after `timeout`.

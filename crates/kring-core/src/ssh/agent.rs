@@ -1,7 +1,8 @@
 //! Minimal ssh-agent client (draft-miller-ssh-agent) over a Unix socket.
 //!
 //! Messages are `u32` big-endian length + type byte + payload. Every call
-//! opens a fresh blocking connection with 5 second timeouts, and replies are
+//! opens a fresh blocking connection with 5 second timeouts per read or
+//! write and a 10 second deadline for the whole roundtrip, and replies are
 //! capped at [`MAX_MESSAGE_BYTES`], so a hostile or broken peer cannot hang
 //! the caller or force a huge allocation. Replies are parsed with bounds
 //! checks and never panic. Private key bytes are only held in `Zeroizing`
@@ -11,7 +12,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -26,8 +27,10 @@ use crate::backup::io_err;
 use crate::error::{KringError, Result};
 use crate::model::SecretValue;
 
-/// Read and write timeout of every agent connection.
+/// Read and write timeout of each call on an agent connection.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total time one request and its reply may take.
+const ROUNDTRIP_DEADLINE: Duration = Duration::from_secs(10);
 /// Largest agent message accepted (256 KiB).
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 /// SSH_AGENT_FAILURE.
@@ -195,14 +198,68 @@ fn expect_success(sock: &Path, request: &[u8]) -> Result<()> {
 
 /// Opens a connection, sends one message and returns the reply (type byte included).
 fn roundtrip(sock: &Path, request: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    roundtrip_within(sock, request, ROUNDTRIP_DEADLINE)
+}
+
+/// Like [`roundtrip`], failing with `TimedOut` once `total` has elapsed.
+///
+/// Each read and write also keeps the [`IO_TIMEOUT`] bound, so a peer that
+/// sends a byte just before every per-read timeout still cannot hold the
+/// caller past `total`.
+fn roundtrip_within(sock: &Path, request: &[u8], total: Duration) -> Result<Zeroizing<Vec<u8>>> {
     let run = || -> io::Result<Zeroizing<Vec<u8>>> {
-        let mut stream = UnixStream::connect(sock)?;
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        let stream = UnixStream::connect(sock)?;
+        let mut stream = DeadlineStream {
+            stream,
+            deadline: Instant::now() + total,
+        };
         write_message(&mut stream, request)?;
         read_message(&mut stream)
     };
     run().map_err(|e| io_err(sock, e))
+}
+
+/// A Unix stream whose reads and writes all end by one deadline.
+struct DeadlineStream {
+    stream: UnixStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    /// Time left for the next call, capped at [`IO_TIMEOUT`]; `TimedOut` when none is left.
+    fn budget(&self) -> io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the ssh-agent did not answer in time",
+            ));
+        }
+        Ok(left.min(IO_TIMEOUT))
+    }
+}
+
+impl Read for DeadlineStream {
+    /// Reads with the remaining budget as timeout.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let budget = self.budget()?;
+        self.stream.set_read_timeout(Some(budget))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    /// Writes with the remaining budget as timeout.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let budget = self.budget()?;
+        self.stream.set_write_timeout(Some(budget))?;
+        self.stream.write(buf)
+    }
+
+    /// Flushes the stream (a no-op for Unix sockets).
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// Writes one length-prefixed message.
@@ -390,6 +447,36 @@ mod tests {
             assert!(parse_identities(&case).is_err(), "{case:?}");
         }
         assert!(parse_identities(&answer(0, &[])).unwrap().is_empty());
+    }
+
+    /// A peer dripping its reply byte by byte cannot hold a roundtrip past the total deadline.
+    #[test]
+    fn dripping_peer_hits_the_total_deadline() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("drip.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 16];
+            let _ = conn.read(&mut buf);
+            // Declares 64 bytes, then sends one every 100 ms (well under the
+            // per-read timeout), for longer than the total deadline.
+            let _ = conn.write_all(&[0, 0, 0, 64]);
+            for _ in 0..40 {
+                std::thread::sleep(Duration::from_millis(100));
+                if conn.write_all(&[0]).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = std::time::Instant::now();
+        let result = roundtrip_within(&sock, &[MSG_REQUEST_IDENTITIES], Duration::from_millis(800));
+        let elapsed = started.elapsed();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+        server.join().unwrap();
     }
 
     /// A constrained request carries the lifetime constraint after the comment.

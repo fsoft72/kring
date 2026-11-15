@@ -8,6 +8,7 @@ use kring_core::keyring_file::{KeyringFileInfo, RetireBatchReport};
 use kring_core::model::{CollectionId, CollectionInfo, ItemId, ItemInfo, SecretValue};
 use kring_core::pam::PamStatus;
 use kring_core::provider::ProviderInfo;
+use kring_core::ssh::{AgentIdentity, SshKeyInfo};
 use kring_core::transfer::apply::{TransferMode, TransferReport};
 use kring_core::transfer::consolidate_apply::{ConsolidationReport, StepOutcome};
 use kring_core::transfer::import::ImportReport;
@@ -16,7 +17,7 @@ use kring_core::transfer::plan::TransferCounts;
 use crate::operation::{self, Operation};
 use crate::session_secret::SessionSecret;
 use crate::worker::{
-    Command, ConflictView, ConsolidationSummary, Event, OfflineItemView, WalletInfo,
+    AgentStatus, Command, ConflictView, ConsolidationSummary, Event, OfflineItemView, WalletInfo,
 };
 use crate::worker_transfer::{MSG_ORPHANS_NOT_RETIRED, invalidates_plan};
 
@@ -189,6 +190,16 @@ pub struct AppState {
     wallet_create: Option<(String, u64)>,
     /// Wallet whose keyring was just created: its import continues.
     wallet_created: Option<String>,
+    /// SSH keys of the SSH key directory (last scan).
+    pub ssh_keys: Vec<SshKeyInfo>,
+    /// Name of the SSH key being viewed.
+    pub selected_ssh_key: Option<String>,
+    /// Public key `(name, text)` of the selected SSH key (not a secret).
+    pub ssh_public_key: Option<(String, String)>,
+    /// Identities loaded in the ssh-agent (empty while it is unavailable).
+    pub agent_identities: Vec<AgentIdentity>,
+    /// Why the ssh-agent cannot be reached, `None` once it answered.
+    pub agent_unavailable: Option<String>,
     /// Backups, newest first.
     pub backups: Vec<BackupInfo>,
     /// Outcome of the last import.
@@ -347,6 +358,20 @@ impl AppState {
                 self.wallet_password = pending.filter(|(n, _)| *n == name).map(|(_, pw)| pw);
                 self._sync_wallet_reveal();
             }
+            Event::SshKeys(keys) => self._set_ssh_keys(keys),
+            Event::AgentIdentities(AgentStatus::Available(ids)) => {
+                self.agent_identities = ids;
+                self.agent_unavailable = None;
+            }
+            Event::AgentIdentities(AgentStatus::Unavailable(reason)) => {
+                self.agent_identities.clear();
+                self.agent_unavailable = Some(reason);
+            }
+            Event::SshPublicKey { name, text } => {
+                if self.selected_ssh_key.as_ref() == Some(&name) {
+                    self.ssh_public_key = Some((name, text));
+                }
+            }
             Event::Notice(text) => self.notices.push(text),
             Event::PasswordNeeded(name) => {
                 if self.selected_file.as_ref() == Some(&name) {
@@ -493,6 +518,38 @@ impl AppState {
         if !exists {
             self.close_wallet();
         }
+    }
+
+    /// Replaces the SSH key list, deselecting a key that no longer exists.
+    fn _set_ssh_keys(&mut self, keys: Vec<SshKeyInfo>) {
+        self.ssh_keys = keys;
+        let exists = self
+            .selected_ssh_key
+            .as_ref()
+            .is_some_and(|s| self.ssh_keys.iter().any(|k| &k.name == s));
+        if !exists {
+            self.selected_ssh_key = None;
+            self.ssh_public_key = None;
+        }
+    }
+
+    /// Selects SSH key `name`, dropping the public key text of the previous one.
+    pub fn select_ssh_key(&mut self, name: String) {
+        if self.selected_ssh_key.as_ref() != Some(&name) {
+            self.ssh_public_key = None;
+        }
+        self.selected_ssh_key = Some(name);
+    }
+
+    /// Returns true when the agent holds `key` (same fingerprint; a legacy
+    /// key without a known fingerprint never matches).
+    pub fn ssh_key_in_agent(&self, key: &SshKeyInfo) -> bool {
+        if key.fingerprint.is_empty() {
+            return false;
+        }
+        self.agent_identities
+            .iter()
+            .any(|i| i.fingerprint == key.fingerprint)
     }
 
     /// Selects a wallet, dropping the entries (and secrets) of the previous one.
@@ -2126,5 +2183,82 @@ mod tests {
         assert!(s.operation_open(), "kept while its dialog is open");
         s.drop_stuck_operation(false);
         assert!(!s.operation_open());
+    }
+    /// A scanned SSH key named `name` with fingerprint `fp`.
+    fn ssh_key(name: &str, fp: &str) -> SshKeyInfo {
+        SshKeyInfo {
+            name: name.into(),
+            private_path: Some(PathBuf::from(format!("/k/{name}"))),
+            public_path: None,
+            algorithm: kring_core::ssh::SshAlgorithm::Ed25519,
+            bits: Some(256),
+            fingerprint: fp.into(),
+            comment: String::new(),
+            encrypted: Some(false),
+            legacy_format: false,
+            pub_mismatch: false,
+        }
+    }
+
+    /// SSH keys replace the list; a selected key that disappears is
+    /// deselected with its public key text.
+    #[test]
+    fn ssh_keys_and_selection() {
+        let mut s = AppState::default();
+        s.apply(Event::SshKeys(vec![
+            ssh_key("a", "SHA256:a"),
+            ssh_key("b", "SHA256:b"),
+        ]));
+        s.select_ssh_key("a".into());
+        s.apply(Event::SshPublicKey {
+            name: "a".into(),
+            text: "ssh-ed25519 AAAA a".into(),
+        });
+        assert_eq!(
+            s.ssh_public_key.as_ref().map(|(n, _)| n.as_str()),
+            Some("a")
+        );
+        // A late answer for another key is dropped.
+        s.apply(Event::SshPublicKey {
+            name: "b".into(),
+            text: "ssh-ed25519 BBBB b".into(),
+        });
+        assert_eq!(
+            s.ssh_public_key.as_ref().map(|(n, _)| n.as_str()),
+            Some("a")
+        );
+        s.apply(Event::SshKeys(vec![ssh_key("a", "SHA256:a")]));
+        assert_eq!(s.selected_ssh_key.as_deref(), Some("a"));
+        assert!(s.ssh_public_key.is_some());
+        s.select_ssh_key("b".into());
+        assert!(s.ssh_public_key.is_none(), "dropped on selection change");
+        s.apply(Event::SshKeys(vec![ssh_key("a", "SHA256:a")]));
+        assert!(s.selected_ssh_key.is_none());
+    }
+
+    /// Agent identities and unavailability replace each other; a key is in
+    /// the agent when its fingerprint is listed.
+    #[test]
+    fn agent_status() {
+        use kring_core::ssh::{AgentIdentity, SshAlgorithm};
+        let mut s = AppState::default();
+        let id = AgentIdentity {
+            fingerprint: "SHA256:a".into(),
+            comment: "c".into(),
+            algorithm: SshAlgorithm::Ed25519,
+        };
+        s.apply(Event::AgentIdentities(AgentStatus::Available(vec![id])));
+        assert_eq!(s.agent_identities.len(), 1);
+        assert!(s.agent_unavailable.is_none());
+        assert!(s.ssh_key_in_agent(&ssh_key("a", "SHA256:a")));
+        assert!(!s.ssh_key_in_agent(&ssh_key("b", "SHA256:b")));
+        assert!(!s.ssh_key_in_agent(&ssh_key("legacy", "")));
+        s.apply(Event::AgentIdentities(AgentStatus::Unavailable(
+            "gone".into(),
+        )));
+        assert!(s.agent_identities.is_empty());
+        assert_eq!(s.agent_unavailable.as_deref(), Some("gone"));
+        assert!(!s.ssh_key_in_agent(&ssh_key("a", "SHA256:a")));
+        assert!(s.errors.is_empty(), "never an error toast");
     }
 }
