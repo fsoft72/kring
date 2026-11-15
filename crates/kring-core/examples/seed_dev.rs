@@ -19,6 +19,10 @@ use kring_core::{MasterPasswordStore, SecretStore};
 const WORK: (&str, &str) = ("Work", "work");
 /// Label and password of the collection that is left empty.
 const DEFAULT_1: (&str, &str) = ("Default_1", "d1");
+/// Label and password of the orphan holding a duplicate of a login item.
+const DEFAULT_2: (&str, &str) = ("Default_2", "d2");
+/// Label and password of the second empty orphan.
+const DEFAULT_3: (&str, &str) = ("Default_3", "d3");
 /// Passphrase of the sample backup holding a plaintext keyring.
 const BACKUP_PASSPHRASE: &str = "backup";
 /// Binary fixture backed up by both sample backups.
@@ -31,6 +35,9 @@ const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
 /// Preset value that previews a transfer between `login` and `Work`.
 const DIALOG_TRANSFER_PREVIEW: &str = "transfer-preview";
+/// Preset value that previews a consolidation into `login`: `Work` stays
+/// unlocked (a conflict) and `Default_1` is locked (a skipped keyring).
+const DIALOG_CONSOLIDATE_PREVIEW: &str = "consolidate-preview";
 /// Attributes of the item `login` and `Work` share with different secrets.
 const GITHUB_ATTRS: [(&str, &str); 2] = [("service", "gh"), ("user", "dev")];
 /// Attributes of the item `login` and `Work` share with the same secret.
@@ -57,8 +64,9 @@ fn _item(label: &str, pairs: &[(&str, &str)], secret: &str) -> NewItem {
     }
 }
 
-/// Creates the sample collections and items, then locks `Work` (unless the
-/// transfer preview preset needs it unlocked).
+/// Creates the sample collections and items, then locks `Work` (unless a
+/// preview preset needs it unlocked); the consolidation preset locks
+/// `Default_1` instead.
 async fn _seed() -> kring_core::Result<()> {
     let backend = SecretServiceBackend::connect().await?;
     let login = CollectionId(LOGIN_COLLECTION_PATH.into());
@@ -96,19 +104,38 @@ async fn _seed() -> kring_core::Result<()> {
     backend
         .create_item(&work, _item("Mail account", &MAIL_ATTRS, "mail-pw"))
         .await?;
-    backend
+    let default_1 = backend
         .create_with_password(DEFAULT_1.0, &SecretValue::from_text(DEFAULT_1.1))
+        .await?;
+    // Orphans for the consolidation: one holding a copy of a login item
+    // (same identity and secret: a duplicate), one empty.
+    let default_2 = backend
+        .create_with_password(DEFAULT_2.0, &SecretValue::from_text(DEFAULT_2.1))
+        .await?;
+    backend
+        .create_item(&default_2, _item("Mail account", &MAIL_ATTRS, "mail-pw"))
+        .await?;
+    backend
+        .create_with_password(DEFAULT_3.0, &SecretValue::from_text(DEFAULT_3.1))
         .await?;
     if !_keep_work_unlocked() {
         backend.lock(&work).await?;
     }
+    if _preset_is(DIALOG_CONSOLIDATE_PREVIEW) {
+        backend.lock(&default_1).await?;
+    }
     Ok(())
 }
 
-/// Returns true when the app preset previews a transfer into `Work`, which
-/// needs it unlocked.
+/// Returns true when the app preset variable equals `value`.
+fn _preset_is(value: &str) -> bool {
+    std::env::var(VAR_DIALOG).is_ok_and(|v| v == value)
+}
+
+/// Returns true when the app preset previews a transfer into `Work` or a
+/// consolidation of it, which needs it unlocked.
 fn _keep_work_unlocked() -> bool {
-    std::env::var(VAR_DIALOG).is_ok_and(|v| v == DIALOG_TRANSFER_PREVIEW)
+    _preset_is(DIALOG_TRANSFER_PREVIEW) || _preset_is(DIALOG_CONSOLIDATE_PREVIEW)
 }
 
 /// Creates the sample backups: an older binary one (reason
@@ -149,7 +176,7 @@ async fn main() -> ExitCode {
     match _seed().await {
         Ok(()) => {
             println!(
-                "seed_dev: seeded login (3 items), {} (4 items, 2 shared with login, {}, password {:?}), {} (empty, password {:?}), 2 backups (passphrase {:?})",
+                "seed_dev: seeded login (3 items), {} (4 items, 2 shared with login, {}, password {:?}), {} (empty, password {:?}), {} (1 duplicate of login, password {:?}), {} (empty, password {:?}), 2 backups (passphrase {:?})",
                 WORK.0,
                 if _keep_work_unlocked() {
                     "unlocked"
@@ -159,6 +186,10 @@ async fn main() -> ExitCode {
                 WORK.1,
                 DEFAULT_1.0,
                 DEFAULT_1.1,
+                DEFAULT_2.0,
+                DEFAULT_2.1,
+                DEFAULT_3.0,
+                DEFAULT_3.1,
                 BACKUP_PASSPHRASE
             );
             ExitCode::SUCCESS

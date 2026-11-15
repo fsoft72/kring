@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use kring_core::model::{Attributes, CollectionId, CollectionInfo, ItemId};
+use kring_core::model::{Attributes, CollectionId, CollectionInfo, ItemId, SecretValue};
 use kring_core::transfer::apply::TransferMode;
 use kring_core::transfer::plan::Choice;
 use zeroize::Zeroizing;
@@ -13,6 +13,7 @@ use crate::ui::password_field::{forget_fields, new_buffer};
 use crate::ui::theme;
 use crate::ui::widgets::{danger_button, primary_button, secondary_button};
 use crate::views::collection::display_name;
+use crate::views::consolidate::PassphraseNeeds;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_submit::command_for;
 use crate::views::file_detail::default_import_target;
@@ -173,6 +174,22 @@ pub enum DialogKind {
         passphrase: Zeroizing<String>,
         confirm: Zeroizing<String>,
     },
+    /// Passphrases missing to apply consolidation plan `plan_id` (the
+    /// backup of plaintext keyrings, the backup of the retired orphan
+    /// files); resends the apply with the choices and the passphrases
+    /// given before (`kept_*`).
+    ConsolidatePassphrases {
+        plan_id: u64,
+        choices: Vec<Vec<Choice>>,
+        ask_backup: bool,
+        ask_orphan_files: bool,
+        backup: Zeroizing<String>,
+        backup_confirm: Zeroizing<String>,
+        orphan_files: Zeroizing<String>,
+        orphan_files_confirm: Zeroizing<String>,
+        kept_backup: Option<SecretValue>,
+        kept_orphan_files: Option<SecretValue>,
+    },
     /// Choose a passphrase for a backup containing plaintext keyrings.
     Passphrase {
         command: Box<Command>,
@@ -330,6 +347,29 @@ impl DialogKind {
             choices,
             passphrase: new_buffer(),
             confirm: new_buffer(),
+        }
+    }
+
+    /// Dialog asking the passphrases of `missing` for consolidation plan
+    /// `plan_id`, keeping `choices` and the passphrases given before.
+    pub fn consolidate_passphrases(
+        plan_id: u64,
+        choices: Vec<Vec<Choice>>,
+        missing: PassphraseNeeds,
+        kept_backup: Option<SecretValue>,
+        kept_orphan_files: Option<SecretValue>,
+    ) -> Self {
+        Self::ConsolidatePassphrases {
+            plan_id,
+            choices,
+            ask_backup: missing.backup,
+            ask_orphan_files: missing.orphan_files,
+            backup: new_buffer(),
+            backup_confirm: new_buffer(),
+            orphan_files: new_buffer(),
+            orphan_files_confirm: new_buffer(),
+            kept_backup,
+            kept_orphan_files,
         }
     }
 

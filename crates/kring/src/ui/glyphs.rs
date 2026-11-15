@@ -56,6 +56,8 @@ pub enum Ico {
     Archive,
     /// Export: arrow leaving an open box.
     Export,
+    /// Consolidate area: two branches merging into one arrow.
+    Merge,
 }
 
 /// Maps 16-unit grid coordinates to screen positions inside an icon box.
@@ -233,6 +235,28 @@ fn _simple(p: &Painter, g: &Grid, st: Stroke, ico: Ico) {
             );
             line(g.pt(8.0, 10.5), g.pt(8.0, 2.0));
             _poly(p, vec![g.pt(5.0, 5.0), g.pt(8.0, 2.0), g.pt(11.0, 5.0)], st);
+        }
+        Ico::Merge => {
+            _poly(
+                p,
+                vec![
+                    g.pt(3.5, 2.0),
+                    g.pt(3.5, 4.5),
+                    g.pt(8.0, 9.0),
+                    g.pt(8.0, 14.0),
+                ],
+                st,
+            );
+            _poly(
+                p,
+                vec![g.pt(12.5, 2.0), g.pt(12.5, 4.5), g.pt(8.0, 9.0)],
+                st,
+            );
+            _poly(
+                p,
+                vec![g.pt(5.0, 11.0), g.pt(8.0, 14.0), g.pt(11.0, 11.0)],
+                st,
+            );
         }
         _ => {}
     }

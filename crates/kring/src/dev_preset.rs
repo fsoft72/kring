@@ -9,16 +9,18 @@
 use std::path::Path;
 
 use kring_core::dev_guard::{IT_RUNTIME_VAR, violation_from};
-use kring_core::model::{CollectionId, CollectionInfo, ItemId};
+use kring_core::model::{CollectionId, CollectionInfo, ItemId, SecretValue};
 use kring_core::transfer::apply::TransferMode;
 
 use crate::app_state::AppState;
 use crate::views::backups::{BackupView, path_exists, restore_dialog};
 use crate::views::collection::{display_name, export_dialog};
+use crate::views::consolidate::{default_target, needs_passphrases};
 use crate::views::dialogs::DialogKind;
 use crate::views::file_detail::retire_dialog;
 use crate::views::file_items::displayed_file_items;
 use crate::views::item_list::displayed_items;
+use crate::views::transfer::default_choices;
 use crate::views::{Action, Area};
 use crate::worker::Command;
 
@@ -34,9 +36,14 @@ const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
 /// [`VAR_REVEAL`] both sides of the first conflict are revealed); in
 /// the files area `import`, `retire` or `open` (password of a binary file);
 /// in the backups area `restore` (confirmation) or `restore-now` (restores
-/// every file of the selected backup without a passphrase).
+/// every file of the selected backup without a passphrase); in the
+/// consolidate area `consolidate-preview` (plans a consolidation into the
+/// default target with the orphan files; with [`VAR_REVEAL`] both sides of
+/// the first conflict are revealed), `consolidate-apply` (then opens the
+/// passphrase dialog of the apply) or `consolidate-now` (then applies with
+/// the preselected choices and [`DEV_PASSPHRASE`] for every passphrase).
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
-/// Area to show first: `files` or `backups`.
+/// Area to show first: `files`, `backups` or `consolidate`.
 const VAR_AREA: &str = "KRING_DEV_AREA";
 /// Keyring file (name without `.keyring`) to select in the files area.
 const VAR_FILE: &str = "KRING_DEV_FILE";
@@ -50,6 +57,16 @@ const TRANSFER_PAIR: [&str; 2] = ["login", "work"];
 const AREA_FILES: &str = "files";
 /// Value of [`VAR_AREA`] selecting the Backups area.
 const AREA_BACKUPS: &str = "backups";
+/// Value of [`VAR_AREA`] selecting the Consolidate area.
+const AREA_CONSOLIDATE: &str = "consolidate";
+/// Value of [`VAR_DIALOG`] opening the consolidation preview.
+const DIALOG_CONSOLIDATE_PREVIEW: &str = "consolidate-preview";
+/// Value of [`VAR_DIALOG`] opening the passphrase dialog of the consolidation.
+const DIALOG_CONSOLIDATE_APPLY: &str = "consolidate-apply";
+/// Value of [`VAR_DIALOG`] applying the consolidation right away.
+const DIALOG_CONSOLIDATE_NOW: &str = "consolidate-now";
+/// Passphrase used by `consolidate-now` (same as the seeded backups).
+const DEV_PASSPHRASE: &str = "backup";
 
 /// Initial state requested for screenshots.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -71,6 +88,9 @@ pub struct DevPreset {
     pub backup: Option<usize>,
     /// Reveal both sides of the first conflict once the transfer preview is open.
     pub transfer_reveal: bool,
+    /// Step after the consolidation preview arrived (`consolidate-apply` or
+    /// `consolidate-now`).
+    pub consolidate_follow: Option<String>,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -94,6 +114,7 @@ pub fn preset_from(
         file: var(VAR_FILE),
         backup: var(VAR_BACKUP).and_then(|v| v.parse().ok()),
         transfer_reveal: false,
+        consolidate_follow: None,
     }
 }
 
@@ -128,6 +149,7 @@ impl DevPreset {
         match area.as_str() {
             AREA_FILES => Some(Area::Files),
             AREA_BACKUPS => Some(Area::Backups),
+            AREA_CONSOLIDATE => Some(Area::Consolidate),
             _ => None,
         }
     }
@@ -261,23 +283,90 @@ impl DevPreset {
         out
     }
 
-    /// Reveals both sides of the first conflict of the open transfer preview; fires once.
+    /// Consolidate area actions due now: once the collections are listed,
+    /// plans a consolidation into the default target with the orphan files;
+    /// fires once.
+    ///
+    /// With `consolidate-apply` / `consolidate-now` the apply follows once
+    /// the preview arrived.
+    pub fn take_consolidate_actions(&mut self, state: &AppState) -> Vec<Action> {
+        if self.consolidate_follow.is_some() {
+            return self._take_consolidate_follow(state);
+        }
+        let wanted = [
+            DIALOG_CONSOLIDATE_PREVIEW,
+            DIALOG_CONSOLIDATE_APPLY,
+            DIALOG_CONSOLIDATE_NOW,
+        ];
+        if !self.dialog.as_deref().is_some_and(|d| wanted.contains(&d)) {
+            return Vec::new();
+        }
+        let Some(target) = default_target(&state.collections) else {
+            return Vec::new();
+        };
+        let dialog = self.dialog.take();
+        self.consolidate_follow = dialog.filter(|d| d != DIALOG_CONSOLIDATE_PREVIEW);
+        self.transfer_reveal = self.reveal;
+        vec![Action::Send(Command::PlanConsolidation {
+            target,
+            include_orphan_files: true,
+        })]
+    }
+
+    /// Opens the passphrase dialog or sends the apply of the consolidation
+    /// preview with its preselected choices; fires once.
+    fn _take_consolidate_follow(&mut self, state: &AppState) -> Vec<Action> {
+        let Some((plan_id, summary)) = &state.consolidation_preview else {
+            return Vec::new();
+        };
+        let Some(follow) = self.consolidate_follow.take() else {
+            return Vec::new();
+        };
+        let choices: Vec<_> = summary
+            .steps
+            .iter()
+            .map(|s| default_choices(&s.conflicts))
+            .collect();
+        let needs = needs_passphrases(summary, &state.files);
+        if follow == DIALOG_CONSOLIDATE_APPLY {
+            let kind = DialogKind::consolidate_passphrases(*plan_id, choices, needs, None, None);
+            return vec![Action::Open(kind)];
+        }
+        let pass = |needed: bool| needed.then(|| SecretValue::from_text(DEV_PASSPHRASE));
+        vec![Action::Send(Command::ApplyConsolidation {
+            plan_id: *plan_id,
+            choices,
+            backup_passphrase: pass(needs.backup),
+            orphan_files_passphrase: pass(needs.orphan_files),
+        })]
+    }
+
+    /// Reveals both sides of the first conflict of the open transfer or
+    /// consolidation preview (never a planned target item); fires once.
     pub fn take_transfer_reveal(&mut self, state: &AppState) -> Vec<Action> {
         if !self.transfer_reveal {
             return Vec::new();
         }
-        let Some(first) = state
+        let transfer = state
             .transfer_preview
             .as_ref()
-            .and_then(|p| p.conflicts.first())
-        else {
+            .and_then(|p| p.conflicts.first());
+        let consolidation = state
+            .consolidation_preview
+            .as_ref()
+            .and_then(|(_, s)| s.steps.iter().find_map(|step| step.conflicts.first()));
+        let Some(first) = transfer.or(consolidation) else {
             return Vec::new();
         };
         self.transfer_reveal = false;
-        [&first.existing_item, &first.incoming_item]
+        let existing = first
+            .existing_item
+            .as_ref()
+            .filter(|_| !first.existing_planned);
+        [existing, first.incoming_item.as_ref()]
             .into_iter()
             .flatten()
-            .map(|id| Action::Send(Command::RevealSecret(id.clone())))
+            .map(|id| Action::RevealPreviewSecret(id.clone()))
             .collect()
     }
 
@@ -361,6 +450,7 @@ mod tests {
                 file: Some("textual_two_items".into()),
                 backup: Some(1),
                 transfer_reveal: false,
+                consolidate_follow: None,
             }
         );
     }
@@ -488,6 +578,151 @@ mod tests {
                 if destinations == &["/k/a.keyring (new)"]
         ));
         assert!(p.take_backup_actions(&s, &mut view, k).is_empty());
+    }
+
+    /// The consolidate preset waits for an unlocked target, plans once with
+    /// the orphan files, then reveals the first conflict of the preview.
+    #[test]
+    fn consolidate_preview_preset() {
+        use crate::worker::{ConflictView, ConsolidationSummary, StepSummary};
+        use kring_core::model::LOGIN_COLLECTION_PATH;
+        use kring_core::transfer::plan::{Choice, TransferCounts};
+        let mut p = DevPreset {
+            area: Some(AREA_CONSOLIDATE.into()),
+            dialog: Some(DIALOG_CONSOLIDATE_PREVIEW.into()),
+            reveal: true,
+            ..DevPreset::default()
+        };
+        assert_eq!(p.take_area(), Some(Area::Consolidate));
+        let mut s = AppState::default();
+        assert!(p.take_consolidate_actions(&s).is_empty(), "no keyrings yet");
+        s.apply(Event::Collections(vec![CollectionInfo {
+            id: CollectionId(LOGIN_COLLECTION_PATH.into()),
+            label: "Login".into(),
+            locked: false,
+            item_count: 1,
+            aliases: vec![],
+            is_login: true,
+            created: 0,
+            modified: 0,
+        }]));
+        let actions = p.take_consolidate_actions(&s);
+        assert!(matches!(
+            &actions[..],
+            [Action::Send(Command::PlanConsolidation { target, include_orphan_files: true })]
+                if target.0 == LOGIN_COLLECTION_PATH
+        ));
+        assert!(p.take_consolidate_actions(&s).is_empty());
+        let conflict = ConflictView {
+            label_incoming: "a".into(),
+            label_existing: "a".into(),
+            modified_incoming: 0,
+            modified_existing: 0,
+            default_choice: Choice::KeepTarget,
+            incoming_item: Some(ItemId("/c/w/1".into())),
+            incoming_revealable: true,
+            existing_item: Some(ItemId("planned:0".into())),
+            existing_planned: true,
+            offline_index: None,
+        };
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 1,
+            summary: ConsolidationSummary {
+                target: CollectionId(LOGIN_COLLECTION_PATH.into()),
+                steps: vec![StepSummary {
+                    source: CollectionId("/c/w".into()),
+                    label: "w".into(),
+                    counts: TransferCounts::default(),
+                    conflicts: vec![conflict],
+                }],
+                delete_empty: vec![],
+                skipped: vec![],
+                locked_count: 0,
+                set_default: false,
+                conflict_count: 1,
+                orphan_files: vec![],
+            },
+        });
+        let reveal = p.take_transfer_reveal(&s);
+        assert!(matches!(
+            &reveal[..],
+            [Action::RevealPreviewSecret(id)] if id.0 == "/c/w/1"
+        ));
+    }
+
+    /// `consolidate-now` applies the preview once it arrived (plain
+    /// keyrings only: no passphrase); `consolidate-apply` opens the dialog.
+    #[test]
+    fn consolidate_apply_follows_preview() {
+        use crate::worker::ConsolidationSummary;
+        use kring_core::model::LOGIN_COLLECTION_PATH;
+        let login = CollectionId(LOGIN_COLLECTION_PATH.into());
+        let collections = vec![CollectionInfo {
+            id: login.clone(),
+            label: "Login".into(),
+            locked: false,
+            item_count: 1,
+            aliases: vec![],
+            is_login: true,
+            created: 0,
+            modified: 0,
+        }];
+        let summary = ConsolidationSummary {
+            target: login,
+            steps: vec![],
+            delete_empty: vec![],
+            skipped: vec![],
+            locked_count: 0,
+            set_default: false,
+            conflict_count: 0,
+            orphan_files: vec!["o".into()],
+        };
+        for (dialog, opens) in [
+            (DIALOG_CONSOLIDATE_NOW, false),
+            (DIALOG_CONSOLIDATE_APPLY, true),
+        ] {
+            let mut p = DevPreset {
+                dialog: Some(dialog.into()),
+                ..DevPreset::default()
+            };
+            let mut s = AppState::default();
+            s.apply(Event::Collections(collections.clone()));
+            let plan = p.take_consolidate_actions(&s);
+            assert!(matches!(
+                &plan[..],
+                [Action::Send(Command::PlanConsolidation { .. })]
+            ));
+            assert!(
+                p.take_consolidate_actions(&s).is_empty(),
+                "waits for the preview"
+            );
+            s.apply(Event::ConsolidationPreview {
+                plan_id: 7,
+                summary: summary.clone(),
+            });
+            let next = p.take_consolidate_actions(&s);
+            if opens {
+                assert!(matches!(
+                    &next[..],
+                    [Action::Open(DialogKind::ConsolidatePassphrases {
+                        plan_id: 7,
+                        ask_orphan_files: true,
+                        ..
+                    })]
+                ));
+            } else {
+                assert!(matches!(
+                    &next[..],
+                    [Action::Send(Command::ApplyConsolidation {
+                        plan_id: 7,
+                        backup_passphrase: None,
+                        orphan_files_passphrase: Some(_),
+                        ..
+                    })]
+                ));
+            }
+            assert!(p.take_consolidate_actions(&s).is_empty());
+        }
     }
 
     /// The expand index follows the displayed (label-sorted) order, once.

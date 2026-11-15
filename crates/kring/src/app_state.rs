@@ -1,5 +1,7 @@
 //! UI-side application state, updated by worker events.
 
+use std::path::PathBuf;
+
 use kring_core::backup::{BackupInfo, RestoreReport};
 use kring_core::keyring_file::textual::{OfflineItem, ParseWarning};
 use kring_core::keyring_file::{KeyringFileInfo, RetireBatchReport};
@@ -12,6 +14,7 @@ use kring_core::transfer::import::ImportReport;
 use kring_core::transfer::plan::TransferCounts;
 
 use crate::worker::{Command, ConflictView, ConsolidationSummary, Event};
+use crate::worker_transfer::invalidates_plan;
 
 /// Maximum number of error messages kept.
 const MAX_ERRORS: usize = 20;
@@ -180,10 +183,21 @@ pub struct AppState {
     /// Checked items of the selected collection; cleared on collection change,
     /// after a transfer and pruned when the items reload without them.
     pub selection: Vec<ItemId>,
-    /// Secrets revealed in the transfer preview; dropped when it closes.
+    /// Backups created by the running (or last) consolidation apply.
+    pub consolidation_backups: Vec<PathBuf>,
+    /// Secrets revealed in the transfer or consolidation preview; dropped
+    /// when it closes.
     transfer_revealed: Vec<(ItemId, SecretValue)>,
+    /// Items whose secret a preview asked for and that did not arrive yet,
+    /// one entry per request; never cleared, so a late answer after the
+    /// preview closed is recognised and dropped.
+    transfer_reveal_requests: Vec<ItemId>,
     /// True from sending `ApplyTransfer` until the worker answers it.
     transfer_applying: bool,
+    /// True from sending `ApplyConsolidation` until the worker answers it.
+    consolidation_applying: bool,
+    /// True while the Consolidate area (and its preview) is on screen.
+    consolidation_shown: bool,
     /// Keyring file of the last file import sent: its items in `file_items`
     /// back the offline side of the preview conflicts.
     import_file: Option<String>,
@@ -228,9 +242,14 @@ impl AppState {
                 }
             }
             Event::Secret(id, s) => {
-                if self._in_preview(&id) {
-                    self.transfer_revealed.retain(|(r, _)| r != &id);
-                    self.transfer_revealed.push((id, s));
+                let asked = self.transfer_reveal_requests.iter().position(|r| r == &id);
+                if let Some(pos) = asked {
+                    // Asked by a preview: never shown on the item card.
+                    self.transfer_reveal_requests.remove(pos);
+                    if self._in_preview(&id) {
+                        self.transfer_revealed.retain(|(r, _)| r != &id);
+                        self.transfer_revealed.push((id, s));
+                    }
                     return;
                 }
                 if self.selected_item.as_ref() == Some(&id) {
@@ -239,6 +258,9 @@ impl AppState {
             }
             Event::BackupCreated(info) => {
                 self.status = format!("Backup created: {}", info.dir.display());
+                if self.consolidation_applying {
+                    self.consolidation_backups.push(info.dir.clone());
+                }
                 self.backups_stale = true;
                 if !info.pruned.is_empty() {
                     let removed = _count(info.pruned.len(), "old backup");
@@ -303,18 +325,19 @@ impl AppState {
                 self.selection.clear();
             }
             Event::ConsolidationPreview { plan_id, summary } => {
+                self.close_transfer_preview();
                 self.consolidation_preview = Some((plan_id, summary));
                 self.consolidation_progress = None;
+                self.consolidation_applying = false;
+                self.consolidation_backups.clear();
                 self.last_consolidation = None;
-                self.close_transfer_preview();
             }
             Event::ConsolidationProgress { done, total } => {
                 self.consolidation_progress = Some((done, total));
             }
             Event::ConsolidationDone(report, retired) => {
                 self.status = consolidation_status(&report, retired.as_ref());
-                self.consolidation_preview = None;
-                self.consolidation_progress = None;
+                self.close_consolidation_preview();
                 self.pending_apply_passphrases = None;
                 self.last_consolidation = Some((report, retired));
             }
@@ -324,6 +347,7 @@ impl AppState {
                 orphan_files,
             } => {
                 self.transfer_applying = false;
+                self.consolidation_applying = false;
                 self.pending_apply_passphrases = Some(ApplyPassphrases {
                     plan_id,
                     backup,
@@ -333,14 +357,14 @@ impl AppState {
             Event::Done(msg) => self.status = msg,
             Event::Error(msg) => {
                 self.consolidation_progress = None;
+                self.transfer_applying = false;
+                self.consolidation_applying = false;
+                // Only a stale plan closes a preview; any other error keeps
+                // it open (an apply after a failure answers with a stale plan).
                 if msg.starts_with(STALE_PLAN_PREFIX) {
                     self.close_transfer_preview();
-                    self.consolidation_preview = None;
+                    self.close_consolidation_preview();
                     self.pending_apply_passphrases = None;
-                }
-                // A failed apply consumed the plan: its preview is useless now.
-                if self.transfer_applying {
-                    self.close_transfer_preview();
                 }
                 // The pending file command survives unrelated errors; it is
                 // dropped on file change, on its items or when its dialog is taken.
@@ -485,15 +509,62 @@ impl AppState {
         self.transfer_applying = false;
     }
 
-    /// Returns true when `id` is a revealable live item of the open preview.
+    /// Closes the consolidation preview: drops its progress, its revealed
+    /// secrets and its passphrase request (the worker plan is discarded by
+    /// the caller when needed).
+    pub fn close_consolidation_preview(&mut self) {
+        let Some((plan_id, _)) = self.consolidation_preview.take() else {
+            return;
+        };
+        let asked = self.pending_apply_passphrases.map(|p| p.plan_id);
+        if asked == Some(plan_id) {
+            self.pending_apply_passphrases = None;
+        }
+        self.consolidation_progress = None;
+        self.consolidation_applying = false;
+        if self.transfer_preview.is_none() {
+            self.transfer_revealed.clear();
+        }
+    }
+
+    /// Records whether the Consolidate area is on screen; leaving it drops
+    /// the secrets revealed in its preview.
+    pub fn set_consolidation_shown(&mut self, shown: bool) {
+        self.consolidation_shown = shown;
+        if !shown && self.transfer_preview.is_none() {
+            self.transfer_revealed.clear();
+        }
+    }
+
+    /// Records a secret request sent by a preview: its answer goes to the
+    /// preview (or is dropped once the preview closed), never to the card.
+    pub fn track_preview_reveal(&mut self, id: ItemId) {
+        self.transfer_reveal_requests.push(id);
+    }
+
+    /// Returns true when `id` is a revealable live item of an open preview
+    /// (the transfer dialog, or the consolidation preview while shown).
     fn _in_preview(&self, id: &ItemId) -> bool {
-        let Some(preview) = &self.transfer_preview else {
+        let is_side = |c: &ConflictView| {
+            (!c.existing_planned && c.existing_item.as_ref() == Some(id))
+                || c.incoming_item.as_ref() == Some(id)
+        };
+        if let Some(preview) = &self.transfer_preview {
+            return preview.conflicts.iter().any(is_side);
+        }
+        let Some((_, summary)) = &self.consolidation_preview else {
             return false;
         };
-        preview
-            .conflicts
-            .iter()
-            .any(|c| c.existing_item.as_ref() == Some(id) || c.incoming_item.as_ref() == Some(id))
+        self.consolidation_shown
+            && summary
+                .steps
+                .iter()
+                .any(|step| step.conflicts.iter().any(is_side))
+    }
+
+    /// Returns true from sending `ApplyConsolidation` until the worker answers it.
+    pub fn is_applying_consolidation(&self) -> bool {
+        self.consolidation_applying
     }
 
     /// Returns true from sending `ApplyTransfer` until the worker answers it.
@@ -528,11 +599,23 @@ impl AppState {
 
     /// Records what a sent command means for the transfer preview: an apply
     /// in flight, or the keyring file being imported.
+    ///
+    /// Any other command that drops the worker's pending plan also closes
+    /// the consolidation preview (e.g. an Unlock from its shortcut), so a
+    /// stale plan is never offered.
     pub fn track_transfer_command(&mut self, cmd: &Command) {
         match cmd {
             Command::ApplyTransfer { .. } => self.transfer_applying = true,
+            Command::ApplyConsolidation { .. } => {
+                self.consolidation_applying = true;
+                self.consolidation_backups.clear();
+            }
             Command::ImportFile { name, .. } | Command::PlanFileImport { name, .. } => {
                 self.import_file = Some(name.clone());
+                self.close_consolidation_preview();
+            }
+            other if invalidates_plan(other) && !matches!(other, Command::DiscardPlan) => {
+                self.close_consolidation_preview();
             }
             _ => {}
         }
@@ -1234,6 +1317,9 @@ mod tests {
             ..AppState::default()
         };
         s.apply(preview_with(1, vec![live_conflict("/c/t/1", "/c/s/1")]));
+        s.track_preview_reveal(ItemId("/c/t/1".into()));
+        s.track_preview_reveal(ItemId("/c/s/1".into()));
+        s.track_preview_reveal(ItemId("/c/x/9".into()));
         s.apply(Event::Secret(
             ItemId("/c/t/1".into()),
             SecretValue::from_text("old"),
@@ -1280,12 +1366,15 @@ mod tests {
         let mut s = AppState::default();
         let conflicts = vec![live_conflict("/c/t/1", "/c/s/1")];
         s.apply(preview_with(1, conflicts.clone()));
+        s.track_preview_reveal(ItemId("/c/t/1".into()));
         s.apply(Event::Secret(
             ItemId("/c/t/1".into()),
             SecretValue::from_text("old"),
         ));
+        assert!(s.transfer_secret(&ItemId("/c/t/1".into())).is_some());
         s.apply(preview_with(2, conflicts.clone()));
         assert!(s.transfer_secret(&ItemId("/c/t/1".into())).is_none());
+        s.track_preview_reveal(ItemId("/c/t/1".into()));
         s.apply(Event::Secret(
             ItemId("/c/t/1".into()),
             SecretValue::from_text("old"),
@@ -1296,10 +1385,10 @@ mod tests {
         assert!(s.transfer_secret(&ItemId("/c/t/1".into())).is_none());
     }
 
-    /// An error answering an apply drops the (consumed) plan's preview; a
-    /// passphrase request keeps it; errors without an apply in flight too.
+    /// Errors keep the preview open (the toast shows them) and end the
+    /// apply in flight; only a stale plan closes it.
     #[test]
-    fn apply_error_drops_preview() {
+    fn apply_error_keeps_preview_unless_stale() {
         let apply = Command::ApplyTransfer {
             plan_id: 1,
             choices: vec![],
@@ -1310,21 +1399,115 @@ mod tests {
         s.apply(Event::Error("clipboard failed".into()));
         assert!(s.transfer_preview.is_some());
         s.track_transfer_command(&apply);
-        s.apply(Event::ApplyPassphrasesNeeded {
-            plan_id: 1,
-            backup: true,
-            orphan_files: false,
-        });
-        s.apply(Event::Error("unrelated".into()));
-        assert!(
-            s.transfer_preview.is_some(),
-            "the plan waits for a passphrase"
-        );
-        s.track_transfer_command(&apply);
+        assert!(s.is_applying_transfer());
         s.apply(Event::Error(
             "Items changed since the preview, preview again".into(),
         ));
+        assert!(s.transfer_preview.is_some(), "kept, the toast explains");
+        assert!(!s.is_applying_transfer(), "Apply is enabled again");
+        s.track_transfer_command(&apply);
+        s.apply(Event::Error("Plan is out of date, preview again".into()));
         assert!(s.transfer_preview.is_none());
+    }
+
+    /// A secret asked by a preview that arrives after it closed is dropped:
+    /// it reaches neither the preview nor the item card.
+    #[test]
+    fn late_preview_secret_dropped_after_close() {
+        let id = ItemId("/c/s/1".into());
+        let mut s = AppState {
+            selected_item: Some(id.clone()),
+            ..AppState::default()
+        };
+        s.apply(preview_with(1, vec![live_conflict("/c/t/1", "/c/s/1")]));
+        s.track_preview_reveal(id.clone());
+        s.close_transfer_preview();
+        s.apply(Event::Secret(id.clone(), SecretValue::from_text("late")));
+        assert!(s.revealed.is_none());
+        assert!(s.transfer_secret(&id).is_none());
+        s.apply(Event::Secret(id.clone(), SecretValue::from_text("card")));
+        assert!(s.revealed.is_some(), "the ledger entry was used once");
+    }
+
+    /// Builds a consolidation preview event with one step holding `conflict`.
+    fn consolidation_with(plan_id: u64, conflict: ConflictView) -> Event {
+        use crate::worker::StepSummary;
+        let mut summary = empty_summary();
+        summary.steps.push(StepSummary {
+            source: CollectionId("/c/s".into()),
+            label: "s".into(),
+            counts: TransferCounts::default(),
+            conflicts: vec![conflict],
+        });
+        Event::ConsolidationPreview { plan_id, summary }
+    }
+
+    /// Consolidation preview secrets are kept only while its area is shown;
+    /// planned target items are never revealable.
+    #[test]
+    fn consolidation_preview_secrets_need_area() {
+        let incoming = ItemId("/c/s/1".into());
+        let mut s = AppState::default();
+        s.apply(consolidation_with(4, live_conflict("/c/t/1", "/c/s/1")));
+        s.track_preview_reveal(incoming.clone());
+        s.apply(Event::Secret(incoming.clone(), SecretValue::from_text("v")));
+        assert!(s.transfer_secret(&incoming).is_none(), "area not shown");
+        s.set_consolidation_shown(true);
+        s.track_preview_reveal(incoming.clone());
+        s.apply(Event::Secret(incoming.clone(), SecretValue::from_text("v")));
+        assert!(s.transfer_secret(&incoming).is_some());
+        s.set_consolidation_shown(false);
+        assert!(s.transfer_secret(&incoming).is_none());
+        let mut planned = live_conflict("planned:0", "/c/s/2");
+        planned.existing_planned = true;
+        s.set_consolidation_shown(true);
+        s.apply(consolidation_with(5, planned));
+        s.track_preview_reveal(ItemId("planned:0".into()));
+        s.apply(Event::Secret(
+            ItemId("planned:0".into()),
+            SecretValue::from_text("v"),
+        ));
+        assert!(s.transfer_secret(&ItemId("planned:0".into())).is_none());
+    }
+
+    /// A command dropping the worker plan closes the consolidation preview;
+    /// reads keep it. The apply records its backups and an error ends it
+    /// with the preview kept.
+    #[test]
+    fn consolidation_preview_follows_plan() {
+        let mut s = AppState::default();
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 2,
+            summary: empty_summary(),
+        });
+        s.track_transfer_command(&Command::ScanFiles);
+        s.track_transfer_command(&Command::RevealSecret(ItemId("/c/a/1".into())));
+        assert!(s.consolidation_preview.is_some());
+        s.track_transfer_command(&Command::ApplyConsolidation {
+            plan_id: 2,
+            choices: vec![],
+            backup_passphrase: None,
+            orphan_files_passphrase: None,
+        });
+        assert!(s.is_applying_consolidation());
+        s.apply(Event::BackupCreated(BackupInfo {
+            dir: "/b/1".into(),
+            reason: "consolidate".into(),
+            created: String::new(),
+            files: vec![],
+            seq: 0,
+            prune_warning: None,
+            pruned: vec![],
+        }));
+        assert_eq!(s.consolidation_backups, [PathBuf::from("/b/1")]);
+        s.apply(Event::Error("backup failed".into()));
+        assert!(!s.is_applying_consolidation());
+        assert!(s.consolidation_preview.is_some());
+        s.track_transfer_command(&Command::Unlock {
+            collection: CollectionId("/c/d".into()),
+            password: SecretValue::from_text("p"),
+        });
+        assert!(s.consolidation_preview.is_none());
     }
 
     /// The offline side of a conflict comes from the imported file only while

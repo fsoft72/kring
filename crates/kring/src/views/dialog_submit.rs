@@ -317,6 +317,36 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             // It encrypts a new backup: a new passphrase, typed twice.
             backup_passphrase: Some(_new_password(passphrase, confirm)?),
         },
+        DialogKind::ConsolidatePassphrases {
+            plan_id,
+            choices,
+            ask_backup,
+            ask_orphan_files,
+            backup,
+            backup_confirm,
+            orphan_files,
+            orphan_files_confirm,
+            kept_backup,
+            kept_orphan_files,
+        } => {
+            // Both encrypt new backups: new passphrases, typed twice.
+            let backup_passphrase = if *ask_backup {
+                Some(_new_password(backup, backup_confirm)?)
+            } else {
+                kept_backup.clone()
+            };
+            let orphan_files_passphrase = if *ask_orphan_files {
+                Some(_new_password(orphan_files, orphan_files_confirm)?)
+            } else {
+                kept_orphan_files.clone()
+            };
+            Command::ApplyConsolidation {
+                plan_id: *plan_id,
+                choices: choices.clone(),
+                backup_passphrase,
+                orphan_files_passphrase,
+            }
+        }
         DialogKind::Passphrase {
             command,
             passphrase,
@@ -556,5 +586,59 @@ mod tests {
             command_for(&kind).unwrap(),
             Command::RestoreBackup { passphrase: Some(p), .. } if p.as_text() == Some("pp")
         ));
+    }
+
+    /// The consolidation dialog validates only the asked passphrases and
+    /// resends the kept one with the choices.
+    #[test]
+    fn consolidate_passphrases_keep_given_ones() {
+        use crate::views::consolidate::PassphraseNeeds;
+        use kring_core::transfer::plan::Choice;
+        let missing = PassphraseNeeds {
+            backup: true,
+            orphan_files: false,
+        };
+        let choices = vec![vec![Choice::UseIncoming]];
+        let mut kind = DialogKind::consolidate_passphrases(
+            3,
+            choices.clone(),
+            missing,
+            None,
+            Some(SecretValue::from_text("orphan")),
+        );
+        assert!(
+            command_for(&kind).is_err(),
+            "empty backup passphrase rejected"
+        );
+        if let DialogKind::ConsolidatePassphrases {
+            backup,
+            backup_confirm,
+            ..
+        } = &mut kind
+        {
+            *backup = buf("bp");
+            *backup_confirm = buf("bx");
+        }
+        assert!(
+            command_for(&kind).is_err(),
+            "unconfirmed passphrase rejected"
+        );
+        if let DialogKind::ConsolidatePassphrases { backup_confirm, .. } = &mut kind {
+            *backup_confirm = buf("bp");
+        }
+        match command_for(&kind).unwrap() {
+            Command::ApplyConsolidation {
+                plan_id,
+                choices: sent,
+                backup_passphrase,
+                orphan_files_passphrase,
+            } => {
+                assert_eq!(plan_id, 3);
+                assert_eq!(sent, choices);
+                assert_eq!(backup_passphrase.unwrap().as_text(), Some("bp"));
+                assert_eq!(orphan_files_passphrase.unwrap().as_text(), Some("orphan"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

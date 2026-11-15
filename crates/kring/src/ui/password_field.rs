@@ -24,8 +24,19 @@ pub const FIELD_CONFIRM: &str = "confirm";
 pub const FIELD_OLD: &str = "old";
 /// Field holding an item secret.
 pub const FIELD_SECRET: &str = "secret";
+/// Field holding a second passphrase (e.g. of retired orphan files).
+pub const FIELD_SECOND: &str = "second";
+/// Field holding the confirmation of the second passphrase.
+pub const FIELD_SECOND_CONFIRM: &str = "second-confirm";
 /// Every field name, used to forget their editor state.
-const ALL_FIELDS: [&str; 4] = [FIELD_PASSWORD, FIELD_CONFIRM, FIELD_OLD, FIELD_SECRET];
+const ALL_FIELDS: [&str; 6] = [
+    FIELD_PASSWORD,
+    FIELD_CONFIRM,
+    FIELD_OLD,
+    FIELD_SECRET,
+    FIELD_SECOND,
+    FIELD_SECOND_CONFIRM,
+];
 
 /// Creates an empty password buffer, zeroized on drop.
 pub fn new_buffer() -> Zeroizing<String> {

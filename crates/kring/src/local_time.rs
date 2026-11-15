@@ -44,13 +44,7 @@ pub fn format_rfc3339(value: &str, offset: UtcOffset) -> String {
 /// Formats unix seconds as `YYYY-MM-DD HH:MM` at `offset`; `-` when zero
 /// (unknown) or out of range.
 pub fn format_unix(secs: u64, offset: UtcOffset) -> String {
-    if secs == 0 {
-        return "-".to_string();
-    }
-    let parsed = i64::try_from(secs)
-        .ok()
-        .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok());
-    let Some(t) = parsed.map(|t| t.to_offset(offset)) else {
+    let Some(t) = _unix_at(secs, offset) else {
         return "-".to_string();
     };
     format!(
@@ -61,6 +55,25 @@ pub fn format_unix(secs: u64, offset: UtcOffset) -> String {
         t.hour(),
         t.minute()
     )
+}
+
+/// Formats unix seconds as `YYYY-MM-DD HH:MM:SS` at `offset`; `-` when zero
+/// (unknown) or out of range.
+pub fn format_unix_seconds(secs: u64, offset: UtcOffset) -> String {
+    let Some(t) = _unix_at(secs, offset) else {
+        return "-".to_string();
+    };
+    format!("{}:{:02}", format_unix(secs, offset), t.second())
+}
+
+/// Converts unix seconds to a date-time at `offset`; `None` when zero or out of range.
+fn _unix_at(secs: u64, offset: UtcOffset) -> Option<OffsetDateTime> {
+    if secs == 0 {
+        return None;
+    }
+    let s = i64::try_from(secs).ok()?;
+    let t = OffsetDateTime::from_unix_timestamp(s).ok()?;
+    Some(t.to_offset(offset))
 }
 
 /// Returns today's date at `offset` as `YYYYmmdd`.
@@ -90,6 +103,17 @@ mod tests {
         assert_eq!(format_unix(1_759_363_200, cet), "2025-10-02 01:00");
         assert_eq!(format_unix(0, cet), "-");
         assert_eq!(format_unix(u64::MAX, cet), "-");
+    }
+
+    /// The seconds variant adds `:SS`; unknown stays `-`.
+    #[test]
+    fn formats_unix_with_seconds() {
+        let cet = UtcOffset::from_hms(1, 0, 0).unwrap();
+        assert_eq!(
+            format_unix_seconds(1_759_363_207, cet),
+            "2025-10-02 01:00:07"
+        );
+        assert_eq!(format_unix_seconds(0, cet), "-");
     }
 
     /// Today's date has eight digits.

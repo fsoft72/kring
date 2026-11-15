@@ -2,31 +2,27 @@
 //! the conflict preview dialog.
 //!
 //! The preview holds no secrets: each side of a conflict is revealed on
-//! demand (`RevealSecret` for live items, `AppState::file_items` for the
-//! imported keyring file) and every revealed value is dropped when the
-//! dialog closes.
+//! demand through the shared row of `views::conflict_row` (a tracked
+//! `RevealSecret` for live items, `AppState::file_items` for the imported
+//! keyring file) and every revealed value is dropped when the dialog closes.
 
 use std::collections::BTreeSet;
 
-use eframe::egui::{self, CornerRadius, RichText, Sense, Stroke, StrokeKind, Ui};
+use eframe::egui::{self, RichText, Ui};
 use kring_core::model::{CollectionId, CollectionInfo, ItemId};
 use kring_core::transfer::apply::TransferMode;
 use kring_core::transfer::plan::{Choice, TransferCounts};
 
 use crate::app_state::{AppState, TransferPreview};
-use crate::local_time;
-use crate::secret_display::{SecretView, secret_display};
-use crate::ui::glyphs::Ico;
 use crate::ui::theme;
 use crate::ui::widgets::{
-    card_frame, chip, danger_button, field_label, ico_button, muted, note, primary_button,
-    secondary_button, semibold,
+    danger_button, field_label, muted, note, primary_button, secondary_button, semibold,
 };
 use crate::views::collection::display_name;
+use crate::views::conflict_row::{RowEvent, conflict_row};
 use crate::views::dialogs::{ImportTarget, styled_modal};
-use crate::views::item_detail::value_box;
 use crate::views::{Action, Gates, MSG_NO_PROVIDER};
-use crate::worker::{Command, ConflictView};
+use crate::worker::ConflictView;
 
 /// Id of the preview modal.
 const PREVIEW_MODAL_ID: &str = "kring-transfer-preview";
@@ -34,20 +30,8 @@ const PREVIEW_MODAL_ID: &str = "kring-transfer-preview";
 const PREVIEW_WIDTH: f32 = 760.0;
 /// Maximum height of the scrolled conflict list.
 const PREVIEW_LIST_HEIGHT: f32 = 420.0;
-/// Room taken by the eye button next to a secret.
-const EYE_ROOM: f32 = 36.0;
-/// Height of a choice button.
-const CHOICE_HEIGHT: f32 = 30.0;
-/// Radius of the radio mark of a choice button.
-const RADIO_RADIUS: f32 = 6.0;
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
-/// Chip marking the newer side of a conflict.
-const CHIP_NEWER: &str = "newer";
-/// Shown instead of a secret that only the worker holds (archive items).
-const MSG_NOT_AVAILABLE: &str = "not available";
-/// Shown instead of the secret of an item an earlier step creates.
-const MSG_PLANNED: &str = "will be created by an earlier step";
 /// Tooltip of Copy / Move when no other keyring is unlocked.
 const MSG_NO_OTHER_TARGET: &str = "Unlock another keyring first";
 /// Tooltip of Apply while the apply runs.
@@ -60,15 +44,6 @@ const MSG_NO_CONFLICTS: &str = "No conflicts: existing items in the target stay 
 /// Explanation above the conflict list.
 const MSG_CONFLICTS: &str = "Same attributes with another secret. Choose the secret to keep \
      for each item.";
-
-/// Side of a conflict.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Side {
-    /// The item already in the target.
-    Existing,
-    /// The item being copied or moved.
-    Incoming,
-}
 
 /// Checks `id` when unchecked, unchecks it when checked.
 pub fn selection_toggle(selection: &mut Vec<ItemId>, id: &ItemId) {
@@ -120,17 +95,6 @@ pub fn transfer_targets(
             locked: c.locked,
         })
         .collect()
-}
-
-/// Returns the side modified later, or `None` on a tie.
-pub fn newer_side(c: &ConflictView) -> Option<Side> {
-    if c.modified_existing == c.modified_incoming {
-        return None;
-    }
-    if c.modified_existing > c.modified_incoming {
-        return Some(Side::Existing);
-    }
-    Some(Side::Incoming)
 }
 
 /// Returns why "Copy to..." is disabled for items of `current`: no provider,
@@ -200,176 +164,8 @@ impl TransferView {
     }
 }
 
-/// How one side of a conflict shows its secret.
-enum SideSecret {
-    /// A live item, revealed with `RevealSecret`; `Some` when revealed.
-    Live(ItemId, Option<SecretView>),
-    /// An item of the imported file; `Some` when shown.
-    Offline(Option<SecretView>),
-    /// No secret can be shown; the reason replaces the box.
-    Unavailable(&'static str),
-}
-
-/// What was clicked on one side of a conflict.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SideClick {
-    /// Nothing.
-    None,
-    /// The choice button of the side.
-    Choice,
-    /// The eye next to the secret.
-    Eye,
-}
-
-/// One side of a conflict, ready to render.
-struct SideView<'a> {
-    /// Uppercase heading, e.g. `In Work`.
-    heading: String,
-    /// Item label.
-    label: &'a str,
-    /// Modification time, unix seconds.
-    modified: u64,
-    /// True when this side was modified later.
-    newer: bool,
-    /// Secret display.
-    secret: SideSecret,
-    /// Text of the choice button.
-    choice_text: &'static str,
-    /// True when this side is the chosen one.
-    chosen: bool,
-}
-
-/// Builds the secret display of the target side of `c`.
-fn _existing_secret(state: &AppState, c: &ConflictView) -> SideSecret {
-    if c.existing_planned {
-        return SideSecret::Unavailable(MSG_PLANNED);
-    }
-    let Some(id) = &c.existing_item else {
-        return SideSecret::Unavailable(MSG_NOT_AVAILABLE);
-    };
-    let shown = state.transfer_secret(id).map(secret_display);
-    SideSecret::Live(id.clone(), shown)
-}
-
-/// Builds the secret display of the incoming side of conflict `index`.
-fn _incoming_secret(
-    state: &AppState,
-    view: &TransferView,
-    index: usize,
-    c: &ConflictView,
-) -> SideSecret {
-    if !c.incoming_revealable {
-        return SideSecret::Unavailable(MSG_NOT_AVAILABLE);
-    }
-    if let Some(id) = &c.incoming_item {
-        let shown = state.transfer_secret(id).map(secret_display);
-        return SideSecret::Live(id.clone(), shown);
-    }
-    let Some(item) = state.offline_incoming(c) else {
-        return SideSecret::Unavailable(MSG_NOT_AVAILABLE);
-    };
-    let shown = view
-        .is_offline_shown(index)
-        .then(|| secret_display(&item.secret));
-    SideSecret::Offline(shown)
-}
-
-/// Paints a full-width choice button with a radio mark; returns true when clicked.
-fn _choice_button(ui: &mut Ui, text: &str, chosen: bool) -> bool {
-    let size = egui::vec2(ui.available_width(), CHOICE_HEIGHT);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let p = ui.painter();
-    let r = CornerRadius::same(theme::RADIUS_CTRL);
-    let (fill, border) = match (chosen, resp.hovered()) {
-        (true, _) => (theme::INPUT_FILL_BLUE, theme::PRIMARY),
-        (false, true) => (theme::FIELD_ROW_BG, theme::SECONDARY.gamma_multiply(0.6)),
-        (false, false) => (theme::FIELD_ROW_BG, theme::BUTTON_BORDER),
-    };
-    p.rect_filled(rect, r, fill);
-    p.rect_stroke(rect, r, Stroke::new(1.0_f32, border), StrokeKind::Inside);
-    let center = egui::pos2(rect.left() + 12.0 + RADIO_RADIUS, rect.center().y);
-    let ring = if chosen {
-        theme::SECONDARY
-    } else {
-        theme::LABEL
-    };
-    p.circle_stroke(center, RADIO_RADIUS, Stroke::new(1.5_f32, ring));
-    if chosen {
-        p.circle_filled(center, RADIO_RADIUS - 3.0, theme::SECONDARY);
-    }
-    let color = if chosen { theme::TEXT } else { theme::LABEL };
-    let galley = p.layout_no_wrap(
-        text.to_string(),
-        egui::FontId::new(13.0, theme::semibold()),
-        color,
-    );
-    let pos = egui::pos2(
-        center.x + RADIO_RADIUS + 8.0,
-        rect.center().y - galley.size().y / 2.0,
-    );
-    p.galley(pos, galley, color);
-    resp.clicked()
-}
-
-/// Renders the secret of a side: masked box with an eye, or the reason it
-/// cannot be shown. Returns true when the eye was clicked.
-fn _side_secret(ui: &mut Ui, secret: &SideSecret) -> bool {
-    let shown = match secret {
-        SideSecret::Live(_, shown) | SideSecret::Offline(shown) => shown.as_ref(),
-        SideSecret::Unavailable(reason) => {
-            let reason = RichText::new(*reason).italics().color(theme::MUTED);
-            ui.add_sized([ui.available_width(), 34.0], egui::Label::new(reason));
-            return false;
-        }
-    };
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        value_box(ui, shown, ui.available_width() - EYE_ROOM);
-        let (ico, tip) = if shown.is_some() {
-            (Ico::EyeOff, "Hide")
-        } else {
-            (Ico::Eye, "Show")
-        };
-        clicked = ico_button(ui, ico, tip, None, false);
-    });
-    clicked
-}
-
-/// Renders one side of a conflict; returns what was clicked.
-fn _side(ui: &mut Ui, side: &SideView<'_>) -> SideClick {
-    ui.horizontal(|ui| {
-        field_label(ui, &side.heading);
-        if side.newer {
-            chip(ui, CHIP_NEWER, theme::OK);
-        }
-    });
-    ui.add(egui::Label::new(semibold(side.label, 14.0)).truncate());
-    let modified = local_time::format_unix(side.modified, local_time::offset());
-    muted(ui, &format!("Modified {modified}"));
-    ui.add_space(4.0);
-    let eye = _side_secret(ui, &side.secret);
-    ui.add_space(6.0);
-    if _choice_button(ui, side.choice_text, side.chosen) {
-        return SideClick::Choice;
-    }
-    if eye {
-        return SideClick::Eye;
-    }
-    SideClick::None
-}
-
-/// Returns the action of an eye click on a side.
-fn _eye_action(secret: &SideSecret) -> Option<Action> {
-    match secret {
-        SideSecret::Live(id, None) => Some(Action::Send(Command::RevealSecret(id.clone()))),
-        SideSecret::Live(id, Some(_)) => Some(Action::HideTransferSecret(id.clone())),
-        SideSecret::Offline(_) | SideSecret::Unavailable(_) => None,
-    }
-}
-
-/// Renders conflict `index` as a card with the target side on the left and
-/// the incoming side on the right; returns the action to run.
+/// Renders conflict `index` with the shared row and applies its event to
+/// `view`; returns the action to run.
 fn _conflict_row(
     ui: &mut Ui,
     state: &AppState,
@@ -378,48 +174,12 @@ fn _conflict_row(
     c: &ConflictView,
     target_label: &str,
 ) -> Option<Action> {
-    let newer = newer_side(c);
     let choice = view.choices.get(index).copied().unwrap_or(c.default_choice);
-    let existing = SideView {
-        heading: format!("In {target_label}"),
-        label: &c.label_existing,
-        modified: c.modified_existing,
-        newer: newer == Some(Side::Existing),
-        secret: _existing_secret(state, c),
-        choice_text: "Keep current",
-        chosen: choice == Choice::KeepTarget,
-    };
-    let incoming = SideView {
-        heading: "Incoming".to_string(),
-        label: &c.label_incoming,
-        modified: c.modified_incoming,
-        newer: newer == Some(Side::Incoming),
-        secret: _incoming_secret(state, view, index, c),
-        choice_text: "Use incoming",
-        chosen: choice == Choice::UseIncoming,
-    };
-    let mut clicks = (SideClick::None, SideClick::None);
-    card_frame().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.columns(2, |cols| {
-            cols[0].spacing_mut().item_spacing.y = 4.0;
-            cols[1].spacing_mut().item_spacing.y = 4.0;
-            clicks.0 = _side(&mut cols[0], &existing);
-            clicks.1 = _side(&mut cols[1], &incoming);
-        });
-    });
-    match clicks {
-        (SideClick::Choice, _) => view.choose(index, Choice::KeepTarget),
-        (_, SideClick::Choice) => view.choose(index, Choice::UseIncoming),
-        (SideClick::Eye, _) => return _eye_action(&existing.secret),
-        (_, SideClick::Eye) => {
-            if matches!(incoming.secret, SideSecret::Offline(_)) {
-                view.toggle_offline(index);
-                return None;
-            }
-            return _eye_action(&incoming.secret);
-        }
-        _ => {}
+    let shown = view.is_offline_shown(index);
+    match conflict_row(ui, state, c, choice, shown, target_label)? {
+        RowEvent::Choose(choice) => view.choose(index, choice),
+        RowEvent::ToggleOffline => view.toggle_offline(index),
+        other => return other.secret_action(),
     }
     None
 }
@@ -614,15 +374,9 @@ mod tests {
         assert!(default_choices(&[]).is_empty());
     }
 
-    /// The newer side is marked; ties mark none.
+    /// Apply names the backup when destructive.
     #[test]
-    fn newer_side_marks_later_modification() {
-        let mut c = conflict(Choice::UseIncoming);
-        assert_eq!(newer_side(&c), Some(Side::Incoming));
-        c.modified_existing = 5;
-        assert_eq!(newer_side(&c), Some(Side::Existing));
-        c.modified_incoming = 5;
-        assert_eq!(newer_side(&c), None);
+    fn apply_label_names_backup() {
         assert_eq!(apply_label(true), "Apply (backup first)");
         assert_eq!(apply_label(false), "Apply");
     }

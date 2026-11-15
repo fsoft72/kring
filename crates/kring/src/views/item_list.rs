@@ -30,9 +30,23 @@ const GLYPH_BOX: f32 = 20.0;
 /// Width of the item search box.
 const SEARCH_WIDTH: f32 = 260.0;
 
-/// Returns the selection count of the toolbar, e.g. `2 selected`.
-pub fn selection_label(n: usize) -> String {
-    format!("{n} selected")
+/// Returns the selection count of the toolbar, e.g. `2 selected`, or
+/// `3 selected (1 hidden)` when the search hides some checked items.
+pub fn selection_label(n: usize, hidden: usize) -> String {
+    if hidden == 0 {
+        return format!("{n} selected");
+    }
+    format!("{n} selected ({hidden} hidden)")
+}
+
+/// Returns how many checked items the search `filter` hides.
+pub fn hidden_selected(state: &AppState, filter: &str) -> usize {
+    let shown = displayed_items(state, filter);
+    state
+        .selection
+        .iter()
+        .filter(|id| !shown.iter().any(|i| &i.id == *id))
+        .count()
 }
 
 /// Returns the Copy to / Move to target picker for the checked items of `c`.
@@ -46,10 +60,12 @@ fn _selection_actions(
     ui: &mut Ui,
     state: &AppState,
     c: &CollectionInfo,
+    hidden: usize,
     gates: Gates,
 ) -> Option<Action> {
     let mut action = None;
-    ui.label(semibold(selection_label(state.selection.len()), 14.0));
+    let text = selection_label(state.selection.len(), hidden);
+    ui.label(semibold(text, 14.0));
     let copy = copy_blocked(state, &c.id);
     if primary_button(ui, "Copy to...", copy) {
         action = Some(Action::Open(transfer_dialog(state, c, TransferMode::Copy)));
@@ -75,7 +91,8 @@ fn _toolbar(
     let mut action = None;
     ui.horizontal(|ui| {
         if !state.selection.is_empty() {
-            action = _selection_actions(ui, state, c, gates);
+            let hidden = hidden_selected(state, filter);
+            action = _selection_actions(ui, state, c, hidden, gates);
         } else {
             let blocked = gates.write.or(c.locked.then_some(MSG_UNLOCK_FIRST));
             if primary_button(ui, "+  New item", blocked) {
@@ -311,4 +328,41 @@ pub fn show(
             }
         });
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::Event;
+    use kring_core::model::{CollectionId, ItemId};
+
+    /// Builds an item of collection `/c/a`.
+    fn item(id: &str, label: &str) -> ItemInfo {
+        ItemInfo {
+            id: ItemId(id.into()),
+            collection: CollectionId("/c/a".into()),
+            label: label.into(),
+            attributes: Default::default(),
+            locked: false,
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    /// Checked items hidden by the search are counted apart.
+    #[test]
+    fn selection_label_counts_hidden() {
+        let coll = CollectionId("/c/a".into());
+        let mut s = AppState::default();
+        s.select_collection(coll.clone());
+        s.apply(Event::Items(
+            coll,
+            vec![item("/c/a/1", "alpha"), item("/c/a/2", "beta")],
+        ));
+        s.selection = vec![ItemId("/c/a/1".into()), ItemId("/c/a/2".into())];
+        assert_eq!(hidden_selected(&s, ""), 0);
+        assert_eq!(hidden_selected(&s, "alp"), 1);
+        assert_eq!(selection_label(2, 0), "2 selected");
+        assert_eq!(selection_label(2, 1), "2 selected (1 hidden)");
+    }
 }

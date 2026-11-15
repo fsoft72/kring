@@ -14,6 +14,7 @@ use crate::dev_preset::DevPreset;
 use crate::ui::theme;
 use crate::ui::toasts::{ToastKind, Toasts, kind_for_status, user_message};
 use crate::views::backups::{self, BackupView};
+use crate::views::consolidate::{self, ConsolidateView, PassphraseNeeds};
 use crate::views::dialogs::{Dialog, DialogKind, Outcome};
 use crate::views::file_items::FileView;
 use crate::views::item_detail::AttrEditor;
@@ -65,6 +66,8 @@ pub struct KringApp {
     backup_view: BackupView,
     /// Choices and shown offline secrets of the transfer preview.
     transfer_view: TransferView,
+    /// Start card fields, choices and given passphrases of the Consolidate area.
+    consolidate_view: ConsolidateView,
     /// Keyrings directory, where restores write (same as the worker's).
     keyrings_dir: PathBuf,
     toasts: Toasts,
@@ -91,6 +94,7 @@ impl KringApp {
             file_view: FileView::default(),
             backup_view: BackupView::default(),
             transfer_view: TransferView::default(),
+            consolidate_view: ConsolidateView::default(),
             keyrings_dir: kring_core::paths::keyrings_dir(),
             toasts: Toasts::default(),
             #[cfg(debug_assertions)]
@@ -144,6 +148,7 @@ impl KringApp {
     fn _send(&mut self, cmd: Command) {
         self.state.track_file_command(&cmd);
         self.state.track_transfer_command(&cmd);
+        self.consolidate_view.remember(&cmd);
         if self.worker.tx.send(cmd).is_err() {
             self.worker_stopped = true;
             return;
@@ -217,6 +222,15 @@ impl KringApp {
                 });
             }
             Action::HideTransferSecret(id) => self.state.hide_transfer_secret(&id),
+            Action::RevealPreviewSecret(id) => {
+                self.state.track_preview_reveal(id.clone());
+                self._send(Command::RevealSecret(id));
+            }
+            Action::CloseConsolidationPreview => {
+                self.state.close_consolidation_preview();
+                self._send(Command::DiscardPlan);
+            }
+            Action::DismissConsolidation => self.state.last_consolidation = None,
         }
     }
 
@@ -270,6 +284,7 @@ impl KringApp {
                 self.dev
                     .take_backup_actions(&self.state, &mut self.backup_view, &self.keyrings_dir)
             }
+            Area::Consolidate => self.dev.take_consolidate_actions(&self.state),
         };
         let reveal = self.dev.take_transfer_reveal(&self.state);
         for action in actions.into_iter().chain(reveal) {
@@ -298,10 +313,10 @@ impl KringApp {
         self.dialog = Some(Dialog::new(DialogKind::passphrase(cmd)));
     }
 
-    /// Opens the backup passphrase dialog when the pending transfer plan
-    /// asked for one, keeping the choices of the preview.
-    ///
-    /// Requests of a consolidation plan are left for its own area.
+    /// Opens the passphrase dialog when the pending plan asked for
+    /// passphrases, keeping the choices of its preview: the backup one for
+    /// a transfer; for a consolidation only the asked ones, resending those
+    /// given before.
     fn _open_apply_passphrase_dialog(&mut self) {
         if self.dialog.is_some() {
             return;
@@ -309,6 +324,25 @@ impl KringApp {
         let Some(asked) = self.state.pending_apply_passphrases else {
             return;
         };
+        let consolidation = self.state.consolidation_preview.as_ref().map(|p| p.0);
+        if consolidation == Some(asked.plan_id) {
+            self.state.pending_apply_passphrases = None;
+            self.consolidate_view.sync(&self.state);
+            let (backup, orphan_files) = self.consolidate_view.kept(asked.plan_id);
+            let missing = PassphraseNeeds {
+                backup: asked.backup,
+                orphan_files: asked.orphan_files,
+            };
+            let kind = DialogKind::consolidate_passphrases(
+                asked.plan_id,
+                self.consolidate_view.choices.clone(),
+                missing,
+                backup,
+                orphan_files,
+            );
+            self.dialog = Some(Dialog::new(kind));
+            return;
+        }
         let preview = self.state.transfer_preview.as_ref().map(|p| p.plan_id);
         if preview != Some(asked.plan_id) || !asked.backup {
             return;
@@ -391,6 +425,7 @@ impl KringApp {
                     }
                     Area::Files => files_list::show(ui, &self.state, &mut self.files_filter),
                     Area::Backups => backups::list(ui, &self.state, &mut self.backup_view),
+                    Area::Consolidate => consolidate::list(ui, &self.state, &self.consolidate_view),
                 };
                 action = found.or(action.take());
             });
@@ -410,6 +445,9 @@ impl KringApp {
                     Area::Files => file_detail::show(ui, &self.state, &mut self.file_view, gates),
                     Area::Backups => {
                         backups::detail(ui, &self.state, &mut self.backup_view, &self.keyrings_dir)
+                    }
+                    Area::Consolidate => {
+                        consolidate::detail(ui, &self.state, &mut self.consolidate_view, gates)
                     }
                 };
                 action = found.or(action.take());

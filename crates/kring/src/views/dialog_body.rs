@@ -7,7 +7,8 @@ use zeroize::Zeroizing;
 
 use crate::app_state::FileAction;
 use crate::ui::password_field::{
-    FIELD_CONFIRM, FIELD_OLD, FIELD_PASSWORD, FIELD_SECRET, password_field,
+    FIELD_CONFIRM, FIELD_OLD, FIELD_PASSWORD, FIELD_SECOND, FIELD_SECOND_CONFIRM, FIELD_SECRET,
+    password_field,
 };
 use crate::ui::theme;
 use crate::ui::widgets::{field_label, input, semibold};
@@ -32,6 +33,12 @@ const MSG_MOVE_NOTE: &str = "Each item is removed from this keyring once it is s
 /// Note of the copy target picker.
 const MSG_COPY_NOTE: &str = "Items are added to the target; this keyring is not changed. \
      Conflicts are shown for review first.";
+/// Passphrase request of a consolidation backup holding plaintext keyrings.
+const MSG_CONSOLIDATE_BACKUP: &str = "A backup of all keyring files is taken first. It \
+     contains plaintext keyrings, choose a passphrase to encrypt it.";
+/// Passphrase request of the retired orphan files.
+const MSG_CONSOLIDATE_ORPHANS: &str = "The empty plaintext files are retired with one \
+     encrypted backup, choose its passphrase.";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -364,6 +371,34 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
             _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _danger("Apply (backup first)")
+        }
+        DialogKind::ConsolidatePassphrases {
+            ask_backup,
+            ask_orphan_files,
+            backup,
+            backup_confirm,
+            orphan_files,
+            orphan_files_confirm,
+            ..
+        } => {
+            _title(ui, "Consolidation passphrases");
+            if *ask_backup {
+                ui.label(RichText::new(MSG_CONSOLIDATE_BACKUP).color(theme::TERTIARY));
+                _password_field(ui, "Backup passphrase", FIELD_PASSWORD, backup);
+                _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, backup_confirm);
+            }
+            if *ask_orphan_files {
+                ui.add_space(4.0);
+                ui.label(RichText::new(MSG_CONSOLIDATE_ORPHANS).color(theme::TERTIARY));
+                _password_field(ui, "Orphan files passphrase", FIELD_SECOND, orphan_files);
+                _password_field(
+                    ui,
+                    "Confirm passphrase",
+                    FIELD_SECOND_CONFIRM,
+                    orphan_files_confirm,
+                );
+            }
+            _danger("Consolidate (backup first)")
         }
         DialogKind::Passphrase {
             command,

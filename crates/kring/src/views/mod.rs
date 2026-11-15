@@ -4,6 +4,8 @@ pub mod attr_diff;
 pub mod backups;
 pub mod banners;
 pub mod collection;
+pub mod conflict_row;
+pub mod consolidate;
 pub mod dialog_body;
 pub mod dialog_submit;
 pub mod dialogs;
@@ -60,8 +62,15 @@ pub enum Action {
     CloseTransferPreview,
     /// Apply the transfer preview with the choices of the dialog.
     ApplyTransfer,
-    /// Hide a secret revealed in the transfer preview.
+    /// Hide a secret revealed in the transfer or consolidation preview.
     HideTransferSecret(ItemId),
+    /// Reveal a secret in the transfer or consolidation preview (never on
+    /// the item card, dropped when it arrives after the preview closed).
+    RevealPreviewSecret(ItemId),
+    /// Close the consolidation preview and drop its plan.
+    CloseConsolidationPreview,
+    /// Close the result card of the last consolidation.
+    DismissConsolidation,
 }
 
 /// Area of the window selected in the nav rail.
@@ -74,6 +83,8 @@ pub enum Area {
     Files,
     /// Backups of the keyring files and their restore.
     Backups,
+    /// Consolidation of the orphan keyrings into one.
+    Consolidate,
 }
 
 /// Commands that load the data of the Backups area: the backups, and the
@@ -85,9 +96,11 @@ pub fn backups_commands() -> Vec<Command> {
 /// Switches from area `from` to `to`; returns the commands to send on entry.
 ///
 /// Leaving the Offline files area closes the selected file, dropping its
-/// secrets; leaving the Backups area forgets the last restore. Any switch
-/// drops the report of the last import. Entering Files rescans the keyrings
-/// directory; entering Backups lists the backups too.
+/// secrets; leaving the Backups area forgets the last restore; leaving the
+/// Consolidate area drops the secrets revealed in its preview. Any switch
+/// drops the report of the last import. Entering Files or Consolidate
+/// rescans the keyrings directory (orphan files); entering Backups lists
+/// the backups too.
 pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     if from == to {
         return Vec::new();
@@ -95,12 +108,17 @@ pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     match from {
         Area::Files => state.close_file(),
         Area::Backups => state.last_restore = None,
+        Area::Consolidate => state.set_consolidation_shown(false),
         Area::Secrets => {}
     }
     state.last_import = None;
     match to {
         Area::Files => vec![Command::ScanFiles],
         Area::Backups => backups_commands(),
+        Area::Consolidate => {
+            state.set_consolidation_shown(true);
+            vec![Command::ScanFiles]
+        }
         Area::Secrets => Vec::new(),
     }
 }
@@ -214,6 +232,16 @@ mod tests {
         s.last_import = Some(ImportReport::default());
         assert!(switch_area(&mut s, Area::Backups, Area::Secrets).is_empty());
         assert!(s.last_restore.is_none() && s.last_import.is_none());
+    }
+
+    /// Entering Consolidate rescans the files and shows its preview; leaving
+    /// hides it.
+    #[test]
+    fn switch_area_consolidate() {
+        let mut s = AppState::default();
+        let cmds = switch_area(&mut s, Area::Secrets, Area::Consolidate);
+        assert!(matches!(&cmds[..], [Command::ScanFiles]));
+        assert!(switch_area(&mut s, Area::Consolidate, Area::Backups).len() == 2);
     }
 
     /// No provider blocks everything.

@@ -12,7 +12,11 @@
 #              secret: a duplicate) with login. With
 #              KRING_DEV_DIALOG=transfer-preview it stays unlocked and the app
 #              previews copying the login items into it.
-#   Default_1  empty, password `d1`
+#   Default_1  empty, password `d1` (locked with
+#              KRING_DEV_DIALOG=consolidate-preview, which also keeps Work
+#              unlocked so the consolidation preview shows a conflict)
+#   Default_2  1 item duplicating login's "Mail account", password `d2`
+#   Default_3  empty, password `d3`
 # and, before the daemon starts, the synthetic fixtures of
 # crates/kring-core/tests/fixtures/keyrings are copied into the TEMP keyrings
 # dir (never from the real one), so the Offline files area has binary,

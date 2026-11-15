@@ -16,13 +16,14 @@ const BRAND_RADIUS: u8 = 8;
 const SOON_ALPHA: f32 = 0.4;
 /// Rail tiles in order: the area (`None` when not implemented yet), glyph
 /// and tooltip.
-const TILES: [(Option<Area>, Ico, &str); 6] = [
+const TILES: [(Option<Area>, Ico, &str); 7] = [
     (Some(Area::Secrets), Ico::Key, "Secrets"),
     (Some(Area::Files), Ico::Folder, "Offline files"),
     (None, Ico::Wallet, "KWallet"),
     (None, Ico::Terminal, "SSH keys"),
     (None, Ico::Shield, "GPG keys"),
     (Some(Area::Backups), Ico::Archive, "Backups"),
+    (Some(Area::Consolidate), Ico::Merge, "Consolidate"),
 ];
 
 /// State of the background worker shown by the rail dot.
@@ -152,14 +153,19 @@ pub fn show(ui: &mut Ui, activity: WorkerActivity, current: Area) -> Option<Area
 mod tests {
     use super::*;
 
-    /// Every area has exactly one enabled tile; Backups replaced Tools.
+    /// Every area has exactly one enabled tile; Backups replaced Tools and
+    /// Consolidate comes last.
     #[test]
     fn tiles_cover_areas() {
-        for area in [Area::Secrets, Area::Files, Area::Backups] {
+        for area in [Area::Secrets, Area::Files, Area::Backups, Area::Consolidate] {
             assert_eq!(TILES.iter().filter(|t| t.0 == Some(area)).count(), 1);
         }
         assert!(TILES.iter().all(|t| t.2 != "Tools"));
         assert_eq!(TILES[5], (Some(Area::Backups), Ico::Archive, "Backups"));
+        assert_eq!(
+            TILES[6],
+            (Some(Area::Consolidate), Ico::Merge, "Consolidate")
+        );
     }
 
     /// Stopped wins over busy, which wins over idle.
