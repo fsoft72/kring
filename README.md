@@ -10,12 +10,13 @@ libraries.
 - **Offline files**: browse the `*.keyring` files in `~/.local/share/keyrings` without the daemon. Binary (encrypted) files open with their password; plaintext files are read directly, including ones the daemon rejects because of multi-line `secret=` values (recovered by a tolerant parser). Items can be imported into an unlocked keyring (duplicates skipped, conflicts listed, nothing overwritten). "Delete file" removes any file the daemon has not loaded (binary, plaintext or unrecognized): "Back up the file before deleting" is checked by default (a plaintext file's backup is encrypted with a passphrase you choose); unchecked, the deletion is permanent and the button is enabled only after typing the exact file name. A file loaded by gnome-keyring (the note shows its keyring id and label, e.g. `Default_10 (label "Default")`) is deleted as a keyring through gnome-keyring, with the usual backup of all keyring files (encrypted when any of them is plaintext); the backup can be skipped only when that keyring is unlocked and holds no items (a locked keyring never counts as empty). This needs a provider that allows writes, and works on locked keyrings too (no prompt).
 - **KWallet migration**: read KDE wallets (`~/.local/share/kwalletd/*.kwl`) without KWallet running, browse their folders and entries, and import them into a gnome-keyring keyring so apps keep finding their secrets (see below).
 - **SSH keys**: list the keys in `~/.ssh`, see their fingerprint, type, comment and public key, generate, import, export, change the passphrase of and delete them (after a backup), and load them into the running ssh-agent or remove them from it (see below).
+- **GPG keys**: list the keys of your GnuPG keyring with their user ids, subkeys, validity and expiry, create, import, export (public and secret), change the passphrase of and delete them (after an encrypted backup) (see below).
 - **Same-named keyrings**: when two or more keyrings share a label (gnome-keyring names many orphans "Default"), every list, header and keyring picker shows `<label> · <keyring id>` for each of them.
 - **Backups and restore**: every destructive action first writes a backup; the Backups area lists them and restores selected files.
 - **Copy, move and consolidate**: move items between keyrings with a conflict preview, or merge all orphan keyrings into `login` in one step (see below).
 - **Encrypted export**: export a keyring to an age passphrase-encrypted `.kring.age` file and import it back.
-- **Progress of destructive actions**: deleting an item, keyring, file or SSH key, changing an SSH key passphrase, retiring a file, restoring a backup and applying a move (or a "use incoming" choice) open a "Working..." window listing the backup step and the operation, then the result (or the error). It closes only once the operation finished, and every other destructive action stays disabled meanwhile, so the same keyring cannot be deleted twice.
-- **Remember a passphrase for the session**: passphrase dialogs (unlock, backup, restore, retire, export/import archive, consolidation, the password of a binary keyring file or of a KWallet wallet, the new KWallet keyring, an SSH key passphrase) offer "Remember for this session". The remembered value then answers passphrase requests by itself (once per request; the dialog opens if it is wrong), is tried first when you click Unlock, fills the keyring file and wallet password dialogs, and fills new-backup passphrases without the confirmation field. A wrong keyring file, wallet or SSH key password, typed or remembered, reopens its dialog with "Wrong passphrase, try again". A key tile in the rail shows that one is remembered; click it to forget it.
+- **Progress of destructive actions**: deleting an item, keyring, file, SSH or GPG key, changing an SSH or GPG key passphrase, retiring a file, restoring a backup and applying a move (or a "use incoming" choice) open a "Working..." window listing the backup step and the operation, then the result (or the error). It closes only once the operation finished, and every other destructive action stays disabled meanwhile, so the same keyring cannot be deleted twice.
+- **Remember a passphrase for the session**: passphrase dialogs (unlock, backup, restore, retire, export/import archive, consolidation, the password of a binary keyring file or of a KWallet wallet, the new KWallet keyring, an SSH or GPG key passphrase) offer "Remember for this session". The remembered value then answers passphrase requests by itself (once per request; the dialog opens if it is wrong), is tried first when you click Unlock, fills the keyring file and wallet password dialogs, and fills new-backup passphrases without the confirmation field. A wrong keyring file, wallet, SSH or GPG key password, typed or remembered, reopens its dialog with "Wrong passphrase, try again". A key tile in the rail shows that one is remembered; click it to forget it.
 
 ## Copy / Move and Consolidate
 
@@ -150,6 +151,84 @@ Legacy PEM keys are read only: they can be listed, copied (public key) and
 deleted. Convert one with `ssh-keygen -p -f <file>` (it rewrites it in the
 OpenSSH format) to manage it in kring.
 
+## GPG keys
+
+The GPG keys area lists the keys of your GnuPG keyring by driving the `gpg`
+binary found in `PATH` (without it the area says so). It
+uses the GnuPG home gpg itself uses: `GNUPGHOME`, else `~/.gnupg`. Each key
+shows its first user id, its long key id, its type (ED25519, RSA 3072, ...),
+SECRET or PUBLIC, CARD / OFFLINE when the secret primary key is on a smartcard
+or an offline stub, and REVOKED, EXPIRED or its validity (ULTIMATE, FULL, ...).
+The detail shows the fingerprint (grouped by 4), key id, type, usage, creation
+and expiry dates, owner trust, every user id, a subkeys table (key id, type,
+created, expires, usage) and the armored public key with a Copy button.
+
+- **+ New key**: name and optional email (the user id `Name <email>`),
+  Ed25519 / Cv25519 (default), RSA 3072 or RSA 4096, an expiry (1, 2 or 5
+  years, or never) and a passphrase ("No passphrase" leaves the secret key
+  unprotected, with a warning). A signing primary key and an encryption subkey
+  are created.
+- **Import**: imports the public and secret keys of an OpenPGP file (armored or
+  binary, up to 16 MiB); the result says how many keys were imported or
+  unchanged.
+- **Save public key...**: writes the armored public key to a new file (never
+  over an existing one). Copy in the public key box puts it on the clipboard.
+- **Export secret key...**: writes the armored secret key with its subkeys to a
+  new file, mode 0600. The export keeps the key's protection: it is encrypted
+  with the key passphrase, an unprotected key is exported in clear.
+- **Change passphrase...**: backs the key up, then changes the passphrase of the
+  primary key and of its subkeys.
+- **Delete...**: backs the key up, then deletes its secret and public parts by
+  full fingerprint (it must still be the key that was backed up).
+
+Changing the passphrase and deleting show the progress window. The listing
+does not say whether a secret key has a passphrase, so the key passphrase field
+starts optional: leave it empty for an unprotected key; if gpg needs one, the
+dialog reopens with "GPG key passphrase required", and a wrong one reopens it
+with "Wrong passphrase, try again". These dialogs take the passphrase
+remembered for the session. Keys whose secret primary key is an offline stub or
+on a smartcard can be viewed and their public key exported, but "Export secret
+key", "Change passphrase" and "Delete" are disabled (their tooltip says why):
+kring cannot back such a key up. Use gpg directly for them. Trust and key
+signing are not managed by kring.
+
+### Loopback passphrase entry
+
+kring passes passphrases to gpg over a pipe with `--pinentry-mode loopback`, so
+no pinentry window opens. GnuPG 2.1.12 and later allow this by default. If your
+`gpg-agent.conf` contains `no-allow-loopback-pinentry`, gpg refuses it and the
+area shows a notice instead of the keys: remove that line (or add
+`allow-loopback-pinentry`), then restart the agent with
+`gpgconf --kill gpg-agent`. When an action finds gpg unusable, the key list
+stays as it was and the same notice is shown until the next rescan succeeds.
+
+### GPG key backups and manual recovery
+
+Before changing a passphrase or deleting a key, kring backs up its exports into
+the backups directory (reason `change-gpg-passphrase` or `delete-gpg-key`):
+`<FINGERPRINT>.public.asc` (the armored public key, in clear) and, for a key
+with a secret part, `<FINGERPRINT>.secret.asc.age`, the armored secret key
+encrypted with age and the backup passphrase you choose in the dialog (always:
+even a passphrase-protected secret export is never stored without it). The
+backup is read back and checked before gpg changes anything.
+
+These backups are listed in the Backups area, but its Restore button is
+disabled for them ("GPG key backups are restored by hand: see README"). Recover
+a key by hand from `$XDG_DATA_HOME/kring/backups/<date>-delete-gpg-key` (or
+`...-change-gpg-passphrase`):
+
+```sh
+cd ~/.local/share/kring/backups/<date>-delete-gpg-key
+age -d -o /tmp/key-secret.asc <FINGERPRINT>.secret.asc.age   # asks the backup passphrase
+gpg --import /tmp/key-secret.asc                             # asks the key passphrase (as it was then)
+shred -u /tmp/key-secret.asc
+gpg --import <FINGERPRINT>.public.asc                        # public-only keys
+```
+
+The secret export keeps the key passphrase it had when the backup was taken
+(the old one for a passphrase change). Owner trust is not part of the export:
+set it again with `gpg --edit-key <FINGERPRINT> trust` if needed.
+
 ## Run
 
 Isolated, seeded session for trying things out (private D-Bus session, throwaway
@@ -157,7 +236,10 @@ gnome-keyring, temp `HOME`; your real keyrings and wallets are never touched; th
 KWallet area shows two copies of the test wallet, `kdewallet` and `fixture`,
 password `fixture-pw`; the SSH keys area shows the test keys in a temp
 `~/.ssh`, passphrase of `id_ed25519_enc` `fixture-pw`, with a private
-ssh-agent holding `id_ecdsa`; your real `~/.ssh` and agent are never used):
+ssh-agent holding `id_ecdsa`; the GPG keys area shows a temp GnuPG home with
+the secret key "Fixture User", passphrase `fixture-pw`, and the public key of
+"Public Contact" (its export is `~/contact.asc` in the temp `HOME`, to try
+Import); your real `~/.ssh`, `~/.gnupg` and agents are never used):
 
 ```sh
 scripts/dev-session.sh
@@ -185,5 +267,6 @@ cargo run -p kring-core --example scan_report -- ~/.local/share/keyrings
 - Restoring overwrites files in the keyrings directory (after backing up the current ones). The daemon keeps its own in-memory copy, so restart it afterwards: `systemctl --user restart gnome-keyring-daemon`. kring shows this command and does not run it.
 - Secrets are never logged and are zeroized in memory when dropped.
 - SSH keys: kring changes only key files it listed in `~/.ssh` (never `authorized_keys`, `known_hosts`, `config` or symlinks), writes through a temp file and a rename in the same directory, never overwrites a key except when changing its passphrase (after a backup), and never writes an unencrypted private key into a backup. Private keys and passphrases stay in zeroized memory and are never logged; the agent only receives a key you add.
+- GPG keys: kring runs `gpg` on your GnuPG home only while the GPG keys area is open or for an action you take, addresses keys by full fingerprint and passes passphrases over a pipe (never on the command line or in the environment). Backups never hold a secret key export in clear (always age-encrypted); a secret export you ask for keeps the key's own protection (an unprotected key is exported in clear, to a 0600 file). Deleting or changing the passphrase of a key happens only after its backup was verified.
 - KWallet wallets are only read: kring never writes, deletes or locks the files in `~/.local/share/kwalletd`, and never talks to KWallet. Symlinked wallet, salt or attributes files are refused.
 - **Remembered passphrase warning**: "Remember for this session" keeps the passphrase in memory only (never on disk, in logs or in debug output) until kring closes or you forget it from the rail. While it is remembered, anyone using your session can unlock keyrings and decrypt or write backups with it without typing it. Use it only on a machine you control, and forget it when you are done.
