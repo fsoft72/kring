@@ -16,7 +16,7 @@ fn main() -> eframe::Result<()> {
     // Must run while the process has a single thread.
     kring::local_time::init();
     let Connected {
-        runtime: _bus_runtime,
+        runtime: bus_runtime,
         store,
         provider,
         error,
@@ -36,6 +36,11 @@ fn main() -> eframe::Result<()> {
         run_and_return: true,
         ..Default::default()
     };
+    // The app creator owns the store. When eframe fails before calling it
+    // (no display, missing graphics libraries) the creator, and with it the
+    // oo7 service, is dropped here: that drop spawns a task and panics
+    // outside a tokio context, so the bus runtime is entered for the call.
+    let _context = bus_runtime.as_ref().map(|runtime| runtime.enter());
     eframe::run_native(
         "kring",
         options,

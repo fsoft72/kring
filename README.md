@@ -227,6 +227,22 @@ The secret export keeps the key passphrase it had when the backup was taken
 (the old one for a passphrase change). Owner trust is not part of the export:
 set it again with `gpg --edit-key <FINGERPRINT> trust` if needed.
 
+## Download
+
+Each `v<version>` tag publishes a GitHub Release with ready-to-run binaries
+for 64-bit Linux: `kring-<version>-x86_64` and `kring-<version>-aarch64` (ARM64),
+each with a `.sha256` checksum. They need glibc 2.28 or newer (any current
+distribution) and a Wayland or X11 session:
+
+```bash
+sha256sum -c kring-0.1.0-x86_64.sha256
+chmod +x kring-0.1.0-x86_64
+./kring-0.1.0-x86_64
+```
+
+There is no static musl build: winit loads libwayland, libX11 and EGL/GL at
+runtime, which a static musl binary cannot do, so its window would never open.
+
 ## Run
 
 Isolated, seeded session for trying things out (private D-Bus session, throwaway
