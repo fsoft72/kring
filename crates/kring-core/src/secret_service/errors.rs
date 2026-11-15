@@ -7,7 +7,10 @@ use crate::error::KringError;
 
 /// D-Bus error name: the object does not exist.
 const ERR_UNKNOWN_OBJECT: &str = "org.freedesktop.DBus.Error.UnknownObject";
-/// D-Bus error name: the method does not exist (also returned for vanished objects).
+/// D-Bus error name: the method does not exist.
+///
+/// gnome-keyring answers UnknownMethod (not UnknownObject) for calls on an object that
+/// vanished, so it is mapped to `NotFound`. This could mask a genuine missing-method bug.
 const ERR_UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 /// D-Bus error name: no service owns the requested name.
 const ERR_SERVICE_UNKNOWN: &str = "org.freedesktop.DBus.Error.ServiceUnknown";

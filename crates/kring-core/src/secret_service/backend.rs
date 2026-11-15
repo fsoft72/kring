@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use oo7::dbus::{Collection, Item, Service, api};
 use oo7::zbus;
+use oo7::zbus::OwnedObjectPath;
 use oo7::{ContentType, Secret};
 
 use super::errors::{map_dbus, map_zbus};
@@ -18,9 +19,6 @@ use crate::store::SecretStore;
 
 /// Aliases that are resolved for every collection in `list_collections`.
 const KNOWN_ALIASES: [&str; 3] = ["default", "session", "login"];
-
-/// How many times listing items is attempted when an item vanishes mid-listing.
-const ITEM_LIST_ATTEMPTS: u32 = 3;
 
 /// Secret Service backend talking to the session bus with an encrypted session.
 pub struct SecretServiceBackend {
@@ -81,28 +79,48 @@ impl SecretServiceBackend {
             .ok_or_else(|| KringError::NotFound(id.0.clone()))
     }
 
-    /// Reads the items of a collection once.
+    /// Reads the items of a collection, skipping items deleted by another client mid-listing.
     async fn read_items(&self, collection: &CollectionId) -> Result<Vec<ItemInfo>> {
-        let ctx = "reading an item";
-        let items = collection_items(&self.find_collection(collection).await?).await?;
-        let mut out = Vec::with_capacity(items.len());
-        for i in items {
-            out.push(ItemInfo {
-                id: ItemId(i.path().to_string()),
-                collection: collection.clone(),
-                label: i.label().await.map_err(|e| map_dbus(ctx, e))?,
-                attributes: i
-                    .attributes()
-                    .await
-                    .map_err(|e| map_dbus(ctx, e))?
-                    .into_iter()
-                    .collect(),
-                locked: i.is_locked().await.map_err(|e| map_dbus(ctx, e))?,
-                created: secs(i.created().await.map_err(|e| map_dbus(ctx, e))?),
-                modified: secs(i.modified().await.map_err(|e| map_dbus(ctx, e))?),
-            });
+        let found = self.find_collection(collection).await?;
+        let proxy = api::Collection::new(&self.connection, found.path().to_owned())
+            .await
+            .map_err(|e| map_dbus("opening a collection", e))?;
+        let paths = proxy
+            .inner()
+            .get_property::<Vec<OwnedObjectPath>>("Items")
+            .await
+            .map_err(|e| map_zbus("listing items", e))?;
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.read_item_info(collection, path.as_str()).await {
+                Ok(info) => out.push(info),
+                Err(KringError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
         }
         Ok(out)
+    }
+
+    /// Reads the properties of one item.
+    async fn read_item_info(&self, collection: &CollectionId, path: &str) -> Result<ItemInfo> {
+        let ctx = "reading an item";
+        let i = api::Item::new(&self.connection, path.to_string())
+            .await
+            .map_err(|e| map_dbus(ctx, e))?;
+        Ok(ItemInfo {
+            id: ItemId(path.to_string()),
+            collection: collection.clone(),
+            label: i.label().await.map_err(|e| map_dbus(ctx, e))?,
+            attributes: i
+                .attributes()
+                .await
+                .map_err(|e| map_dbus(ctx, e))?
+                .into_iter()
+                .collect(),
+            locked: i.is_locked().await.map_err(|e| map_dbus(ctx, e))?,
+            created: secs(i.created().await.map_err(|e| map_dbus(ctx, e))?),
+            modified: secs(i.modified().await.map_err(|e| map_dbus(ctx, e))?),
+        })
     }
 
     /// Resolves the object paths of the well-known aliases, paired with their names.
@@ -176,18 +194,9 @@ impl SecretStore for SecretServiceBackend {
         Ok(out)
     }
 
-    /// Lists the items of a collection (without secrets).
-    ///
-    /// Retries when an item vanishes mid-listing: the `Items` property can briefly list
-    /// an object that another client has just deleted.
+    /// Lists the items of a collection (without secrets); vanished items are skipped.
     async fn list_items(&self, collection: &CollectionId) -> Result<Vec<ItemInfo>> {
-        let mut attempt = 1;
-        loop {
-            match self.read_items(collection).await {
-                Err(KringError::NotFound(_)) if attempt < ITEM_LIST_ATTEMPTS => attempt += 1,
-                other => return other,
-            }
-        }
+        self.read_items(collection).await
     }
 
     /// Reads a secret, failing with `Locked` (no prompt) when the item is locked.
