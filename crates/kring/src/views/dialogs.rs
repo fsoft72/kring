@@ -12,7 +12,7 @@ use crate::app_state::FileAction;
 use crate::ui::password_field::{forget_fields, new_buffer};
 use crate::ui::theme;
 use crate::ui::widgets::{danger_button, primary_button, secondary_button};
-use crate::views::collection::display_name;
+use crate::views::collection::{display_name, display_names};
 use crate::views::consolidate::PassphraseNeeds;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_submit::command_for;
@@ -39,6 +39,19 @@ pub enum RestorePassphrase {
     /// Only the pre-restore backup of a plaintext file is encrypted: a new
     /// passphrase, typed twice.
     New,
+}
+
+/// What the delete dialog of a keyring file shows and allows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteSpec {
+    /// Body lines.
+    pub lines: Vec<String>,
+    /// The backup holds plaintext data: it is encrypted with a new passphrase.
+    pub needs_passphrase: bool,
+    /// Note shown above the passphrase fields.
+    pub passphrase_note: &'static str,
+    /// The backup may be skipped (the checkbox is shown).
+    pub backup_optional: bool,
 }
 
 /// A keyring offered as import target.
@@ -129,12 +142,12 @@ pub enum DialogKind {
         passphrase: Zeroizing<String>,
         confirm: Zeroizing<String>,
     },
-    /// Confirm deleting a keyring file the daemon does not serve.
+    /// Confirm deleting a keyring file (a live one through the daemon).
     DeleteFile {
         name: String,
-        /// The file is not encrypted on disk: its backup needs a passphrase.
-        plaintext: bool,
-        /// Back up the file first (checked by default).
+        /// Body, passphrase need and whether the backup may be skipped.
+        spec: DeleteSpec,
+        /// Back up first (checked by default, forced when not optional).
         backup: bool,
         /// Typed file name, required when `backup` is off.
         typed: String,
@@ -270,11 +283,12 @@ impl DialogKind {
 
     /// Import dialog of file `name`: every keyring is listed, locked ones disabled.
     pub fn import_file(name: String, collections: &[CollectionInfo]) -> Self {
+        let names = display_names(collections);
         let targets = collections
             .iter()
             .map(|c| ImportTarget {
                 id: c.id.clone(),
-                label: display_name(c),
+                label: names.get(&c.id).cloned().unwrap_or_else(|| display_name(c)),
                 locked: c.locked,
             })
             .collect();
@@ -296,10 +310,10 @@ impl DialogKind {
     }
 
     /// Delete confirmation of file `name`, with the backup checkbox checked.
-    pub fn delete_file(name: String, plaintext: bool) -> Self {
+    pub fn delete_file(name: String, spec: DeleteSpec) -> Self {
         Self::DeleteFile {
             name,
-            plaintext,
+            spec,
             backup: true,
             typed: String::new(),
             passphrase: new_buffer(),
@@ -324,9 +338,9 @@ impl DialogKind {
         }
     }
 
-    /// Export dialog of collection `c`, suggesting `<home>/kring-<name>-<date>.kring.age`.
-    pub fn export_collection(c: &CollectionInfo, home: &Path, date: &str) -> Self {
-        let label = display_name(c);
+    /// Export dialog of collection `c` shown as `label`, suggesting
+    /// `<home>/kring-<label>-<date>.kring.age`.
+    pub fn export_collection(c: &CollectionInfo, label: String, home: &Path, date: &str) -> Self {
         Self::ExportCollection {
             collection: c.id.clone(),
             path: default_export_path(home, &label, date),
@@ -336,11 +350,11 @@ impl DialogKind {
         }
     }
 
-    /// Archive import dialog into collection `c`.
-    pub fn import_archive(c: &CollectionInfo) -> Self {
+    /// Archive import dialog into collection `c`, shown as `label`.
+    pub fn import_archive(c: &CollectionInfo, label: String) -> Self {
         Self::ImportArchive {
             target: c.id.clone(),
-            label: display_name(c),
+            label,
             path: String::new(),
             passphrase: new_buffer(),
         }

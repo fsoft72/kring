@@ -10,7 +10,7 @@
 //! the shared conflict row and dropped when the preview closes or the area
 //! is left.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Sense, Ui};
 use kring_core::keyring_file::{
@@ -29,7 +29,7 @@ use crate::ui::widgets::{
     accent_card, card, chip, danger_button, field_label, heading, muted, muted_text,
     primary_button, secondary_button, semibold,
 };
-use crate::views::collection::display_name;
+use crate::views::collection::{display_name, display_names};
 use crate::views::conflict_row::{MSG_CONFLICTS, RowEvent, conflict_row};
 use crate::views::dialogs::DialogKind;
 use crate::views::sidebar::row_background;
@@ -171,6 +171,15 @@ pub fn collection_name(id: &CollectionId, label: &str) -> String {
     decode_path_segment(segment).unwrap_or_else(|_| segment.to_string())
 }
 
+/// Returns the shown name of `id`: from `names` (see `display_names`), else
+/// [`collection_name`] of its summary label.
+pub fn name_in(names: &HashMap<CollectionId, String>, id: &CollectionId, label: &str) -> String {
+    names
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| collection_name(id, label))
+}
+
 /// Returns the number of items a step carries (every planned action).
 fn _step_items(counts: &TransferCounts) -> usize {
     counts.create + counts.duplicate + counts.conflict + counts.no_secret + counts.same_batch
@@ -179,7 +188,13 @@ fn _step_items(counts: &TransferCounts) -> usize {
 /// Returns the summary cards of a preview into `target_label`, in order:
 /// move, delete, skipped (locked), skipped (unreadable), not touched
 /// (protected), default, retire. Lines with nothing to say are left out, except the move line.
-pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<SummaryLine> {
+///
+/// Keyrings are named through `names` (see [`name_in`]).
+pub fn summary_lines(
+    summary: &ConsolidationSummary,
+    target_label: &str,
+    names: &HashMap<CollectionId, String>,
+) -> Vec<SummaryLine> {
     let line = |kind, text: String| SummaryLine { kind, text };
     let items: usize = summary.steps.iter().map(|s| _step_items(&s.counts)).sum();
     let mut out = vec![if summary.steps.is_empty() {
@@ -220,7 +235,7 @@ pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<
         .skipped
         .iter()
         .filter(|(_, _, r)| matches!(r, SkipReason::Unreadable(_)))
-        .map(|(id, label, _)| collection_name(id, label))
+        .map(|(id, label, _)| name_in(names, id, label))
         .collect();
     if !unreadable.is_empty() {
         let text = format!("Skipped: unreadable {}", unreadable.join(", "));
@@ -230,7 +245,7 @@ pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<
         .skipped
         .iter()
         .filter(|(_, _, r)| matches!(r, SkipReason::Protected(_)))
-        .map(|(id, label, _)| collection_name(id, label))
+        .map(|(id, label, _)| name_in(names, id, label))
         .collect();
     if !protected.is_empty() {
         let text = format!("Not touched: {} (protected)", protected.join(", "));
@@ -515,11 +530,18 @@ fn _label_of(state: &AppState, id: &CollectionId) -> String {
         .collections
         .iter()
         .find(|c| &c.id == id)
-        .map_or_else(|| id.0.clone(), display_name)
+        .map_or_else(|| id.0.clone(), |c| shown(state, c))
 }
 
-/// Renders one keyring row of the list with its role chip.
-fn _list_row(ui: &mut Ui, c: &CollectionInfo, role: Option<Role>) {
+/// Returns the shown name of `c` among the listed collections.
+fn shown(state: &AppState, c: &CollectionInfo) -> String {
+    display_names(&state.collections)
+        .remove(&c.id)
+        .unwrap_or_else(|| display_name(c))
+}
+
+/// Renders one keyring row of the list (shown as `name`) with its role chip.
+fn _list_row(ui: &mut Ui, c: &CollectionInfo, name: &str, role: Option<Role>) {
     let size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     row_background(ui, rect, false, resp.hovered());
@@ -531,7 +553,7 @@ fn _list_row(ui: &mut Ui, c: &CollectionInfo, role: Option<Role>) {
         |ui| {
             ui.vertical(|ui| {
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(semibold(display_name(c), 14.0)).truncate());
+                ui.add(egui::Label::new(semibold(name, 14.0)).truncate());
                 let detail = if c.locked {
                     "locked".to_string()
                 } else {
@@ -560,9 +582,11 @@ pub fn list(ui: &mut Ui, state: &AppState, view: &ConsolidateView) -> Option<Act
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
+            let names = display_names(&state.collections);
             for c in &state.collections {
                 let role = keyring_role(summary, view.target.as_ref(), c);
-                _list_row(ui, c, role);
+                let name = names.get(&c.id).map_or("", String::as_str);
+                _list_row(ui, c, name, role);
             }
         });
     None
@@ -577,8 +601,9 @@ fn _target_combo(ui: &mut Ui, state: &AppState, target: &mut Option<CollectionId
         .selected_text(selected)
         .width(TARGET_WIDTH)
         .show_ui(ui, |ui| {
+            let names = display_names(&state.collections);
             for c in &state.collections {
-                let mut text = display_name(c);
+                let mut text = names.get(&c.id).cloned().unwrap_or_else(|| display_name(c));
                 if c.locked {
                     text.push_str(" (locked)");
                 }
@@ -642,7 +667,12 @@ fn _line_color(kind: LineKind) -> Color32 {
 }
 
 /// Renders the expandable move steps under the move line.
-fn _steps(ui: &mut Ui, summary: &ConsolidationSummary, view: &mut ConsolidateView) {
+fn _steps(
+    ui: &mut Ui,
+    names: &HashMap<CollectionId, String>,
+    summary: &ConsolidationSummary,
+    view: &mut ConsolidateView,
+) {
     for (index, step) in summary.steps.iter().enumerate() {
         let open = view.is_expanded(index);
         let size = egui::vec2(ui.available_width(), STEP_ROW_HEIGHT);
@@ -661,7 +691,7 @@ fn _steps(ui: &mut Ui, summary: &ConsolidationSummary, view: &mut ConsolidateVie
         glyphs::paint(ui.painter(), glyph, ico, theme::LABEL);
         let text = format!(
             "{} - {}",
-            collection_name(&step.source, &step.label),
+            name_in(names, &step.source, &step.label),
             count_noun(_step_items(&step.counts), "item")
         );
         ui.painter().text(
@@ -687,17 +717,18 @@ fn _steps(ui: &mut Ui, summary: &ConsolidationSummary, view: &mut ConsolidateVie
 fn _line_extra(
     ui: &mut Ui,
     kind: LineKind,
+    names: &HashMap<CollectionId, String>,
     summary: &ConsolidationSummary,
     view: &mut ConsolidateView,
     gates: Gates,
 ) -> Option<Action> {
     match kind {
-        LineKind::Move => _steps(ui, summary, view),
+        LineKind::Move => _steps(ui, names, summary, view),
         LineKind::Delete => {
             let names: Vec<String> = summary
                 .delete_empty
                 .iter()
-                .map(|(id, label)| collection_name(id, label))
+                .map(|(id, label)| name_in(names, id, label))
                 .collect();
             ui.label(muted_text(names.join(", ")));
         }
@@ -712,7 +743,7 @@ fn _line_extra(
                 .filter(|(_, _, r)| *r == SkipReason::Locked);
             ui.horizontal_wrapped(|ui| {
                 for (id, label, _) in locked {
-                    let name = collection_name(id, label);
+                    let name = name_in(names, id, label);
                     ui.label(RichText::new(&name).color(theme::TEXT).size(13.0));
                     if secondary_button(ui, "Unlock", gates.master) {
                         action = Some(Action::Open(DialogKind::unlock(id.clone(), name)));
@@ -727,7 +758,7 @@ fn _line_extra(
                 let SkipReason::Unreadable(why) = reason else {
                     continue;
                 };
-                ui.label(muted_text(format!("{}: {why}", collection_name(id, label))));
+                ui.label(muted_text(format!("{}: {why}", name_in(names, id, label))));
             }
         }
         LineKind::NotTouched | LineKind::Default => {}
@@ -746,6 +777,7 @@ fn _conflicts(
     if summary.conflict_count == 0 {
         return None;
     }
+    let names = display_names(&state.collections);
     let mut action = None;
     ui.add_space(8.0);
     field_label(ui, "Conflicts");
@@ -755,7 +787,7 @@ fn _conflicts(
         if step.conflicts.is_empty() {
             continue;
         }
-        let name = collection_name(&step.source, &step.label);
+        let name = name_in(&names, &step.source, &step.label);
         ui.label(muted_text(format!("From {name}")));
         for (index, c) in step.conflicts.iter().enumerate() {
             let choice = view
@@ -797,11 +829,12 @@ fn _preview_body(
     gates: Gates,
 ) -> Option<Action> {
     let target_label = _label_of(state, &summary.target);
+    let names = display_names(&state.collections);
     let mut action = None;
-    for line in summary_lines(summary, &target_label) {
+    for line in summary_lines(summary, &target_label, &names) {
         accent_card(ui, _line_color(line.kind), |ui| {
             ui.label(semibold(&line.text, 14.0));
-            let found = _line_extra(ui, line.kind, summary, view, gates);
+            let found = _line_extra(ui, line.kind, &names, summary, view, gates);
             action = found.or(action.take());
         });
         ui.add_space(6.0);
@@ -1043,7 +1076,7 @@ mod tests {
     /// protected ones are listed apart; the target is not listed.
     #[test]
     fn summary_lines_cover_the_plan() {
-        let lines = summary_lines(&full_summary(), "Login");
+        let lines = summary_lines(&full_summary(), "Login", &HashMap::new());
         let texts: Vec<_> = lines.iter().map(|l| (l.kind, l.text.as_str())).collect();
         assert_eq!(
             texts,
@@ -1077,7 +1110,7 @@ mod tests {
             ..full_summary()
         };
         assert_eq!(
-            summary_lines(&summary, "Login"),
+            summary_lines(&summary, "Login", &HashMap::new()),
             [SummaryLine {
                 kind: LineKind::Move,
                 text: "Nothing to move into Login".into()
@@ -1355,5 +1388,16 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Keyrings are named from the disambiguated names, else from their label.
+    #[test]
+    fn name_in_prefers_shown_names() {
+        let id = CollectionId("/org/freedesktop/secrets/collection/Default_5f10".into());
+        let mut names = HashMap::new();
+        assert_eq!(name_in(&names, &id, "Default"), "Default");
+        assert_eq!(name_in(&names, &id, " "), "Default_10");
+        names.insert(id.clone(), "Default · Default_10".to_string());
+        assert_eq!(name_in(&names, &id, "Default"), "Default · Default_10");
     }
 }

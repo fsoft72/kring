@@ -1,7 +1,9 @@
 //! The selected collection: header, actions and item table.
 
+use std::collections::HashMap;
+
 use eframe::egui;
-use kring_core::model::{Attributes, CollectionInfo, ItemInfo, decode_path_segment};
+use kring_core::model::{Attributes, CollectionId, CollectionInfo, ItemInfo, decode_path_segment};
 
 use crate::app_state::AppState;
 use crate::local_time;
@@ -58,8 +60,42 @@ pub fn display_name(c: &CollectionInfo) -> String {
     if !c.label.trim().is_empty() {
         return c.label.clone();
     }
-    let segment = c.id.0.rsplit('/').next().unwrap_or_default();
+    collection_key(&c.id)
+}
+
+/// Returns the keyring id of a collection: its decoded last object path
+/// segment (e.g. `Default_10` for `.../collection/Default_5f10`).
+pub fn collection_key(id: &CollectionId) -> String {
+    let segment = id.0.rsplit('/').next().unwrap_or_default();
     decode_path_segment(segment).unwrap_or_else(|_| segment.to_string())
+}
+
+/// Returns the shown name of every collection: its [`display_name`], or
+/// `<display name> · <keyring id>` when two or more collections share it.
+pub fn display_names(collections: &[CollectionInfo]) -> HashMap<CollectionId, String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for c in collections {
+        *counts.entry(display_name(c)).or_default() += 1;
+    }
+    collections
+        .iter()
+        .map(|c| {
+            let base = display_name(c);
+            let name = if counts.get(&base).copied().unwrap_or(0) > 1 {
+                format!("{base} · {}", collection_key(&c.id))
+            } else {
+                base
+            };
+            (c.id.clone(), name)
+        })
+        .collect()
+}
+
+/// Returns the shown name of `c` among `collections` (see [`display_names`]).
+pub fn shown_name(collections: &[CollectionInfo], c: &CollectionInfo) -> String {
+    display_names(collections)
+        .remove(&c.id)
+        .unwrap_or_else(|| display_name(c))
 }
 
 /// Returns the extra warnings of the delete confirmation (login and default keyring).
@@ -122,11 +158,11 @@ pub fn header_subline(c: &CollectionInfo) -> String {
     format!("{} {noun} - {lock}", c.item_count)
 }
 
-/// Returns the export dialog of `c`, suggesting a file in `$HOME` dated today.
-pub fn export_dialog(c: &CollectionInfo) -> DialogKind {
+/// Returns the export dialog of `c` shown as `name`, suggesting a file in `$HOME` dated today.
+pub fn export_dialog(c: &CollectionInfo, name: String) -> DialogKind {
     let home = std::env::var_os("HOME").map_or_else(|| "/".into(), std::path::PathBuf::from);
     let date = local_time::today_compact(local_time::offset());
-    DialogKind::export_collection(c, &home, &date)
+    DialogKind::export_collection(c, name, &home, &date)
 }
 
 /// Renders the chips of a collection header.
@@ -141,16 +177,21 @@ fn _chips(ui: &mut egui::Ui, c: &CollectionInfo) {
     }
 }
 
-/// Renders the right-aligned icon actions of a collection header.
-fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<Action> {
+/// Renders the right-aligned icon actions of a collection header (`name` is its shown name).
+fn _collection_actions(
+    ui: &mut egui::Ui,
+    c: &CollectionInfo,
+    name: &str,
+    gates: Gates,
+) -> Option<Action> {
     let mut action = None;
     let locked = c.locked.then_some(MSG_UNLOCK_FIRST);
     if ico_button(ui, Ico::Export, "Export to an archive", locked, false) {
-        action = Some(Action::Open(export_dialog(c)));
+        action = Some(Action::Open(export_dialog(c, name.to_string())));
     }
     let delete = Action::Open(DialogKind::DeleteCollection {
         collection: c.id.clone(),
-        label: display_name(c),
+        label: name.to_string(),
         item_count: c.item_count,
         warnings: delete_warnings(c),
     });
@@ -164,7 +205,7 @@ fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> O
         gates.write_and_master(),
         false,
     ) {
-        let kind = DialogKind::change_password(c.id.clone(), display_name(c));
+        let kind = DialogKind::change_password(c.id.clone(), name.to_string());
         action = Some(Action::Open(kind));
     }
     if ico_button(ui, Ico::Pencil, "Rename", gates.write, false) {
@@ -185,7 +226,7 @@ fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> O
     }
     if c.locked {
         if ico_button(ui, Ico::Unlock, "Unlock", gates.master, false) {
-            let kind = DialogKind::unlock(c.id.clone(), display_name(c));
+            let kind = DialogKind::unlock(c.id.clone(), name.to_string());
             action = Some(Action::Open(kind));
         }
     } else if ico_button(ui, Ico::Lock, "Lock", None, false) {
@@ -194,16 +235,16 @@ fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> O
     action
 }
 
-/// Renders title, chips, subline and icon actions of a collection.
-fn _header(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<Action> {
+/// Renders title (the shown `name`), chips, subline and icon actions of a collection.
+fn _header(ui: &mut egui::Ui, c: &CollectionInfo, name: &str, gates: Gates) -> Option<Action> {
     let mut action = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        ui.add(egui::Label::new(semibold(display_name(c), 22.0)).truncate());
+        ui.add(egui::Label::new(semibold(name, 22.0)).truncate());
         _chips(ui, c);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            action = _collection_actions(ui, c, gates);
+            action = _collection_actions(ui, c, name, gates);
         });
     });
     muted(ui, &header_subline(c));
@@ -257,7 +298,8 @@ pub fn show(
         empty_state(ui, state);
         return None;
     };
-    let mut action = _header(ui, c, gates);
+    let name = shown_name(&state.collections, c);
+    let mut action = _header(ui, c, &name, gates);
     _notes(ui, state, c);
     import_report(ui, state);
     ui.add_space(10.0);
@@ -330,6 +372,43 @@ mod tests {
         assert_eq!(display_name(&escaped), "My_Keys");
         c.label = "Mine".into();
         assert_eq!(display_name(&c), "Mine");
+    }
+
+    /// Shared labels get the keyring id appended; unique and blank labels are unchanged.
+    #[test]
+    fn display_names_disambiguate_shared_labels() {
+        let named = |path: &str, label: &str| {
+            let mut c = col(path, &[], false);
+            c.label = label.into();
+            c
+        };
+        let cols = [
+            named(
+                "/org/freedesktop/secrets/collection/Default_5f10",
+                "Default",
+            ),
+            named(
+                "/org/freedesktop/secrets/collection/Default_5f11",
+                "Default",
+            ),
+            named("/org/freedesktop/secrets/collection/login", "Login"),
+            named("/org/freedesktop/secrets/collection/session", " "),
+        ];
+        let names = display_names(&cols);
+        assert_eq!(names.len(), 4);
+        assert_eq!(names[&cols[0].id], "Default · Default_10");
+        assert_eq!(names[&cols[1].id], "Default · Default_11");
+        assert_eq!(names[&cols[2].id], "Login");
+        assert_eq!(names[&cols[3].id], "session");
+        assert_eq!(shown_name(&cols, &cols[1]), "Default · Default_11");
+        assert_eq!(shown_name(&cols[..1], &cols[0]), "Default");
+        let other = named("/c/x", "X");
+        assert_eq!(
+            shown_name(&cols, &other),
+            "X",
+            "unknown collection: plain name"
+        );
+        assert!(display_names(&[]).is_empty());
     }
 
     /// The subline counts items and states the lock.

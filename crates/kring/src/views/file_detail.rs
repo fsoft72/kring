@@ -2,9 +2,7 @@
 
 use eframe::egui::{self, RichText};
 use kring_core::keyring_file::textual::{ParseWarning, WarningKind};
-use kring_core::keyring_file::{
-    KeyringFileInfo, KeyringFormat, MSG_DELETE_LIVE, RetireMode, retire_mode,
-};
+use kring_core::keyring_file::{KeyringFileInfo, KeyringFormat, RetireMode, retire_mode};
 use kring_core::model::{CollectionId, CollectionInfo};
 
 use crate::app_state::AppState;
@@ -13,8 +11,8 @@ use crate::ui::theme;
 use crate::ui::widgets::{
     accent_card, danger_button, glyph_tile, heading, muted, note, primary_button, semibold,
 };
-use crate::views::collection::{display_name, format_date};
-use crate::views::dialogs::DialogKind;
+use crate::views::collection::{collection_key, format_date};
+use crate::views::dialogs::{DeleteSpec, DialogKind};
 use crate::views::file_items::{self, FileView};
 use crate::views::files_list::{chips, format_size};
 use crate::views::{Action, Gates, MSG_NO_PROVIDER};
@@ -28,6 +26,12 @@ const MSG_NO_TARGET: &str = "Unlock a keyring first";
 const MSG_NOT_KEYRING: &str = "Not a keyring file";
 /// Tooltip of Import on a file without items.
 const MSG_NOTHING_TO_IMPORT: &str = "No items to import";
+/// Passphrase note of the backup of a plaintext file before deleting it.
+const MSG_DELETE_PLAINTEXT: &str =
+    "This file is not encrypted on disk: its backup is encrypted, choose a passphrase";
+/// Passphrase note of the backup of all keyrings before deleting a loaded one.
+const MSG_DELETE_LIVE_PLAINTEXT: &str =
+    "The backup contains plaintext keyrings: it is encrypted, choose a passphrase";
 /// Body of the card of a binary file not opened yet.
 const MSG_ENCRYPTED: &str = "Encrypted keyring file. Enter its password to see the items.";
 
@@ -154,14 +158,76 @@ pub fn retire_dialog(state: &AppState, info: &KeyringFileInfo) -> DialogKind {
     DialogKind::retire_file(info.name.clone(), retire_dialog_text(&mode, info))
 }
 
-/// Returns why Delete is disabled: a live file is deleted from Secrets instead.
-pub fn delete_blocked(live: bool) -> Option<&'static str> {
-    live.then_some(MSG_DELETE_LIVE)
+/// Returns why Delete is disabled: a live file is deleted through the
+/// daemon, so the provider must allow writes (Plan 1 gate).
+pub fn delete_blocked(live: bool, gates: Gates) -> Option<&'static str> {
+    if !live {
+        return None;
+    }
+    gates.write
+}
+
+/// Returns ` (label "<label>")`, or nothing for a blank label.
+fn _label_part(c: &CollectionInfo) -> String {
+    if c.label.trim().is_empty() {
+        return String::new();
+    }
+    format!(" (label \"{}\")", c.label)
+}
+
+/// Returns the live note of a file, e.g.
+/// `gnome-keyring has this file loaded as the keyring Default_10 (label "Default")`.
+pub fn live_note(c: &CollectionInfo) -> String {
+    format!(
+        "gnome-keyring has this file loaded as the keyring {}{}",
+        collection_key(&c.id),
+        _label_part(c)
+    )
+}
+
+/// Returns what the delete dialog of `info` shows and allows.
+///
+/// A file the daemon does not serve is deleted from disk, the backup
+/// optional. A live one is deleted through the daemon after a backup of all
+/// keyrings (needing a passphrase when any listed file is plaintext); the
+/// backup may be skipped only when the keyring holds no items.
+pub fn delete_spec(state: &AppState, info: &KeyringFileInfo) -> DeleteSpec {
+    let Some(c) = live_collection(info, &state.collections) else {
+        return DeleteSpec {
+            lines: vec![format!(
+                "\"{}.keyring\" is not loaded by gnome-keyring and is deleted from disk.",
+                info.name
+            )],
+            needs_passphrase: info.plaintext,
+            passphrase_note: MSG_DELETE_PLAINTEXT,
+            backup_optional: true,
+        };
+    };
+    let key = collection_key(&c.id);
+    let label = _label_part(c);
+    let empty = c.item_count == 0;
+    let line = if empty {
+        format!(
+            "\"{key}\" is loaded by gnome-keyring{label} and holds no items: it will be \
+             deleted through gnome-keyring."
+        )
+    } else {
+        format!(
+            "\"{key}\" is loaded by gnome-keyring{label}: it will be deleted through \
+             gnome-keyring after a backup."
+        )
+    };
+    DeleteSpec {
+        lines: vec![line],
+        needs_passphrase: state.files.iter().any(|f| f.plaintext),
+        passphrase_note: MSG_DELETE_LIVE_PLAINTEXT,
+        backup_optional: empty,
+    }
 }
 
 /// Returns the delete dialog of `info` (backup checked by default).
-pub fn delete_dialog(info: &KeyringFileInfo) -> DialogKind {
-    DialogKind::delete_file(info.name.clone(), info.plaintext)
+pub fn delete_dialog(state: &AppState, info: &KeyringFileInfo) -> DialogKind {
+    DialogKind::delete_file(info.name.clone(), delete_spec(state, info))
 }
 
 /// Returns why Retire is disabled: a live keyring needs a provider allowing writes.
@@ -181,8 +247,8 @@ fn _actions(
     gates: Gates,
 ) -> Option<Action> {
     let mut action = None;
-    if danger_button(ui, "Delete file", delete_blocked(live)) {
-        action = Some(Action::Open(delete_dialog(info)));
+    if danger_button(ui, "Delete file", delete_blocked(live, gates)) {
+        action = Some(Action::Open(delete_dialog(state, info)));
     }
     if info.plaintext && danger_button(ui, "Retire file", _retire_blocked(live, gates)) {
         action = Some(Action::Open(retire_dialog(state, info)));
@@ -255,10 +321,7 @@ fn _notes(
         note(ui, theme::ERROR, err, theme::ERROR);
     }
     let text = match live {
-        Some(c) => format!(
-            "gnome-keyring has this file loaded as the keyring \"{}\"",
-            display_name(c)
-        ),
+        Some(c) => live_note(c),
         None => "Not loaded by gnome-keyring: apps cannot see the items of this file".into(),
     };
     note(ui, theme::SECONDARY, &text, theme::MUTED);
@@ -549,33 +612,93 @@ mod tests {
         );
     }
 
-    /// Delete is refused for a live file; the dialog knows whether the file is plaintext.
+    /// Delete of a live file follows the write gate; the spec depends on the file.
     #[test]
-    fn delete_gate_and_dialog() {
-        assert_eq!(delete_blocked(true), Some(MSG_DELETE_LIVE));
-        assert_eq!(delete_blocked(false), None);
+    fn delete_gate_and_spec() {
+        let gated = Gates {
+            write: Some("no writes"),
+            master: None,
+        };
+        assert_eq!(delete_blocked(true, gated), Some("no writes"));
+        assert_eq!(delete_blocked(false, gated), None);
+        assert_eq!(
+            delete_blocked(
+                true,
+                Gates {
+                    write: None,
+                    master: None
+                }
+            ),
+            None
+        );
+
+        let mut s = AppState::default();
         let f = textual("Default_keyring_3", 1, true);
-        match delete_dialog(&f) {
-            DialogKind::DeleteFile {
-                name,
-                plaintext,
-                backup,
-                ..
-            } => {
-                assert_eq!(name, "Default_keyring_3");
-                assert!(plaintext && backup);
-            }
-            _ => panic!("expected DeleteFile"),
-        }
-        let mut b = textual("b", 0, true);
+        let mut b = textual("Default_10", 0, true);
         b.format = KeyringFormat::BinaryV0;
         b.plaintext = false;
+        s.apply(Event::Files(vec![f.clone(), b.clone()]));
+        let spec = delete_spec(&s, &f);
+        assert!(spec.needs_passphrase && spec.backup_optional);
+        assert_eq!(
+            spec.lines,
+            [
+                "\"Default_keyring_3.keyring\" is not loaded by gnome-keyring and is deleted \
+              from disk."
+            ]
+        );
         assert!(matches!(
-            delete_dialog(&b),
-            DialogKind::DeleteFile {
-                plaintext: false,
-                ..
-            }
+            delete_dialog(&s, &f),
+            DialogKind::DeleteFile { backup: true, .. }
         ));
+        let spec = delete_spec(&s, &b);
+        assert!(!spec.needs_passphrase && spec.backup_optional);
+
+        let mut live = col(
+            "/org/freedesktop/secrets/collection/Default_5f10",
+            "Default",
+            false,
+        );
+        live.item_count = 2;
+        s.apply(Event::Collections(vec![live.clone()]));
+        let spec = delete_spec(&s, &b);
+        assert_eq!(
+            spec.lines,
+            [
+                "\"Default_10\" is loaded by gnome-keyring (label \"Default\"): it will be \
+              deleted through gnome-keyring after a backup."
+            ]
+        );
+        assert!(!spec.backup_optional);
+        assert!(spec.needs_passphrase, "another listed file is plaintext");
+        assert_eq!(spec.passphrase_note, MSG_DELETE_LIVE_PLAINTEXT);
+
+        live.item_count = 0;
+        s.apply(Event::Collections(vec![live]));
+        let spec = delete_spec(&s, &b);
+        assert!(
+            spec.backup_optional,
+            "an empty loaded keyring may skip the backup"
+        );
+        assert!(spec.lines[0].contains("holds no items"));
+    }
+
+    /// The live note names the keyring id and its label.
+    #[test]
+    fn live_note_shows_id_and_label() {
+        let c = col(
+            "/org/freedesktop/secrets/collection/Default_5f10",
+            "Default",
+            false,
+        );
+        assert_eq!(
+            live_note(&c),
+            "gnome-keyring has this file loaded as the keyring Default_10 (label \"Default\")"
+        );
+        let blank = col("/org/freedesktop/secrets/collection/x", " ", false);
+        assert_eq!(
+            live_note(&blank),
+            "gnome-keyring has this file loaded as the keyring x"
+        );
     }
 }

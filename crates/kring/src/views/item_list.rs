@@ -13,7 +13,9 @@ use crate::ui::theme;
 use crate::ui::widgets::{
     card_frame, muted, primary_button, search_box, secondary_button, semibold,
 };
-use crate::views::collection::{MSG_UNLOCK_FIRST, attributes_summary, format_date, matches_filter};
+use crate::views::collection::{
+    MSG_UNLOCK_FIRST, attributes_summary, format_date, matches_filter, shown_name,
+};
 use crate::views::dialogs::DialogKind;
 use crate::views::item_detail::{self, AttrEditor};
 use crate::views::transfer::copy_blocked;
@@ -99,7 +101,8 @@ fn _toolbar(
                 action = Some(Action::Open(DialogKind::new_item(c.id.clone())));
             }
             if secondary_button(ui, "Import archive", blocked) {
-                action = Some(Action::Open(DialogKind::import_archive(c)));
+                let label = shown_name(&state.collections, c);
+                action = Some(Action::Open(DialogKind::import_archive(c, label)));
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

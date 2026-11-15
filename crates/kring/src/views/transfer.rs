@@ -18,7 +18,7 @@ use crate::ui::theme;
 use crate::ui::widgets::{
     danger_button, field_label, muted, note, primary_button, secondary_button, semibold,
 };
-use crate::views::collection::display_name;
+use crate::views::collection::{display_name, display_names, shown_name};
 use crate::views::conflict_row::{MSG_CONFLICTS, RowEvent, conflict_row};
 use crate::views::dialogs::{ImportTarget, styled_modal};
 use crate::views::{Action, Gates, MSG_NO_PROVIDER};
@@ -83,12 +83,13 @@ pub fn transfer_targets(
     collections: &[CollectionInfo],
     current: Option<&CollectionId>,
 ) -> Vec<ImportTarget> {
+    let names = display_names(collections);
     collections
         .iter()
         .filter(|c| Some(&c.id) != current)
         .map(|c| ImportTarget {
             id: c.id.clone(),
-            label: display_name(c),
+            label: names.get(&c.id).cloned().unwrap_or_else(|| display_name(c)),
             locked: c.locked,
         })
         .collect()
@@ -240,7 +241,10 @@ pub fn show(
         .collections
         .iter()
         .find(|c| c.id == preview.target)
-        .map_or_else(|| preview.target.0.clone(), display_name);
+        .map_or_else(
+            || preview.target.0.clone(),
+            |c| shown_name(&state.collections, c),
+        );
     let destructive = apply_is_destructive(preview.mode, &view.choices);
     let blocked = if state.is_applying_transfer() {
         Some(MSG_APPLYING)

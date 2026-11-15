@@ -7,7 +7,7 @@ use crate::app_state::AppState;
 use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
 use crate::ui::widgets::{chip, muted, muted_text, primary_button, search_box, semibold};
-use crate::views::collection::{display_name, is_default};
+use crate::views::collection::{display_names, is_default};
 use crate::views::dialogs::DialogKind;
 use crate::views::{Action, Gates};
 
@@ -24,10 +24,10 @@ pub fn list_summary(state: &AppState) -> String {
     format!("{total} {noun} - {locked} locked")
 }
 
-/// Returns true when the display name contains `filter` (case-insensitive).
-pub fn keyring_matches(c: &CollectionInfo, filter: &str) -> bool {
+/// Returns true when the shown name contains `filter` (case-insensitive).
+pub fn keyring_matches(name: &str, filter: &str) -> bool {
     let needle = filter.trim().to_lowercase();
-    needle.is_empty() || display_name(c).to_lowercase().contains(&needle)
+    needle.is_empty() || name.to_lowercase().contains(&needle)
 }
 
 /// Paints the row background: selected tint plus accent bar, or hover tint.
@@ -46,8 +46,8 @@ pub fn row_background(ui: &Ui, rect: egui::Rect, selected: bool, hovered: bool) 
     }
 }
 
-/// Renders one keyring row; returns true when clicked.
-fn _row(ui: &mut Ui, c: &CollectionInfo, selected: bool) -> bool {
+/// Renders one keyring row with its shown `name`; returns true when clicked.
+fn _row(ui: &mut Ui, c: &CollectionInfo, name: &str, selected: bool) -> bool {
     let size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -58,7 +58,7 @@ fn _row(ui: &mut Ui, c: &CollectionInfo, selected: bool) -> bool {
         .layout(Layout::left_to_right(Align::Center));
     ui.scope_builder(builder, |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let name = RichText::new(display_name(c))
+        let name = RichText::new(name)
             .family(theme::medium())
             .size(14.0)
             .color(theme::TEXT);
@@ -100,13 +100,14 @@ pub fn show(ui: &mut Ui, state: &AppState, filter: &mut String, gates: Gates) ->
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            let rows = state
-                .collections
-                .iter()
-                .filter(|c| keyring_matches(c, filter));
-            for c in rows {
+            let names = display_names(&state.collections);
+            for c in &state.collections {
+                let name = names.get(&c.id).map_or("", String::as_str);
+                if !keyring_matches(name, filter) {
+                    continue;
+                }
                 let selected = state.selected.as_ref() == Some(&c.id);
-                if _row(ui, c, selected) {
+                if _row(ui, c, name, selected) {
                     action = Some(Action::SelectCollection(c.id.clone()));
                 }
             }
@@ -148,14 +149,29 @@ mod tests {
         assert_eq!(list_summary(&s), "1 keyring - 0 locked");
     }
 
-    /// The filter matches the display name case-insensitively; blank matches all.
+    /// The filter matches the shown name case-insensitively; blank matches all.
     #[test]
     fn filter_by_name() {
-        let c = col("/org/freedesktop/secrets/collection/session", " ", false);
-        assert!(keyring_matches(&c, ""));
-        assert!(keyring_matches(&c, "SESS"));
-        let w = col("/c/w", "Work", false);
-        assert!(keyring_matches(&w, " work "));
-        assert!(!keyring_matches(&w, "login"));
+        let cols = [
+            col("/org/freedesktop/secrets/collection/session", " ", false),
+            col(
+                "/org/freedesktop/secrets/collection/Default_5f10",
+                "Default",
+                false,
+            ),
+            col(
+                "/org/freedesktop/secrets/collection/Default_5f11",
+                "Default",
+                false,
+            ),
+        ];
+        let names = display_names(&cols);
+        let session = &names[&cols[0].id];
+        assert!(keyring_matches(session, ""));
+        assert!(keyring_matches(session, "SESS"));
+        assert!(keyring_matches("Work", " work "));
+        assert!(!keyring_matches("Work", "login"));
+        assert!(keyring_matches(&names[&cols[2].id], "default_11"));
+        assert!(!keyring_matches(&names[&cols[1].id], "default_11"));
     }
 }

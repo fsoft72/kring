@@ -42,9 +42,6 @@ const MSG_CONSOLIDATE_ORPHANS: &str = "The empty plaintext files are retired wit
      encrypted backup, choose its passphrase.";
 /// Warning of a delete without backup.
 const MSG_DELETE_NO_BACKUP: &str = "Permanent deletion: no backup will be made";
-/// Passphrase request of the backup of a plaintext file before deleting it.
-const MSG_DELETE_PLAINTEXT: &str =
-    "This file is not encrypted on disk: its backup is encrypted, choose a passphrase";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -440,13 +437,14 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
     }
 }
 
-/// Renders the delete confirmation of a keyring file: the backup checkbox,
-/// then either the backup passphrase (plaintext file) or the red warning and
-/// the typed name confirmation (no backup).
+/// Renders the delete confirmation of a keyring file: the body lines, the
+/// backup checkbox (only when the backup is optional), then either the
+/// backup passphrase (when the backup needs one) or the red warning and the
+/// typed name confirmation (no backup).
 fn _delete_file(ui: &mut egui::Ui, kind: &mut DialogKind) {
     let DialogKind::DeleteFile {
         name,
-        plaintext,
+        spec,
         backup,
         typed,
         passphrase,
@@ -456,17 +454,20 @@ fn _delete_file(ui: &mut egui::Ui, kind: &mut DialogKind) {
         return;
     };
     _title(ui, &format!("Delete {name}"));
-    _text(
-        ui,
-        &format!("\"{name}.keyring\" is not loaded by gnome-keyring and is deleted from disk."),
-    );
-    ui.checkbox(
-        backup,
-        RichText::new("Back up the file before deleting").color(theme::TEXT),
-    );
+    for line in spec.lines.iter() {
+        _text(ui, line);
+    }
+    if spec.backup_optional {
+        ui.checkbox(
+            backup,
+            RichText::new("Back up the file before deleting").color(theme::TEXT),
+        );
+    } else {
+        *backup = true;
+    }
     if *backup {
-        if *plaintext {
-            ui.label(RichText::new(MSG_DELETE_PLAINTEXT).color(theme::TERTIARY));
+        if spec.needs_passphrase {
+            ui.label(RichText::new(spec.passphrase_note).color(theme::TERTIARY));
             _password_field(ui, "Backup passphrase", FIELD_PASSWORD, passphrase);
             _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
         }

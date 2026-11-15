@@ -13,7 +13,7 @@ use crate::ui::widgets::{
     add_button, danger_button, field_label, ico_button, input, primary_button, secondary_button,
 };
 use crate::views::attr_diff::attribute_diff;
-use crate::views::collection::display_name;
+use crate::views::collection::shown_name;
 use crate::views::dialogs::DialogKind;
 use crate::views::transfer::copy_blocked;
 use crate::views::{Action, Gates};
@@ -160,8 +160,13 @@ pub fn value_box(ui: &mut egui::Ui, view: Option<&SecretView>, width: f32) {
         });
 }
 
-/// Renders the body of a card whose keyring is locked.
-fn _locked_body(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<Action> {
+/// Renders the body of a card whose keyring (shown as `name`) is locked.
+fn _locked_body(
+    ui: &mut egui::Ui,
+    c: &CollectionInfo,
+    name: String,
+    gates: Gates,
+) -> Option<Action> {
     let mut action = None;
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
@@ -169,7 +174,7 @@ fn _locked_body(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<A
         ui.label(RichText::new(MSG_UNLOCK_TO_SEE).color(theme::MUTED));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if primary_button(ui, "Unlock", gates.master) {
-                let kind = DialogKind::unlock(c.id.clone(), display_name(c));
+                let kind = DialogKind::unlock(c.id.clone(), name);
                 action = Some(Action::Open(kind));
             }
         });
@@ -259,7 +264,7 @@ pub fn show(
     divider(ui);
     ui.add_space(6.0);
     if item.locked || c.locked {
-        return _locked_body(ui, c, gates);
+        return _locked_body(ui, c, shown_name(&state.collections, c), gates);
     }
     editor.sync(item);
     let mut action = _secret_row(ui, state, item);

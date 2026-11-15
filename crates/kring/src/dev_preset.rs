@@ -14,7 +14,7 @@ use kring_core::transfer::apply::TransferMode;
 
 use crate::app_state::AppState;
 use crate::views::backups::{BackupView, path_exists, restore_dialog};
-use crate::views::collection::{display_name, export_dialog};
+use crate::views::collection::{display_name, export_dialog, shown_name};
 use crate::views::consolidate::{default_target, needs_passphrases};
 use crate::views::dialogs::DialogKind;
 use crate::views::file_detail::{delete_dialog, retire_dialog};
@@ -223,11 +223,13 @@ impl DevPreset {
                 &state.collections,
             ))),
             Some("retire") => Some(Action::Open(retire_dialog(state, info))),
-            Some("delete-file") => Some(Action::Open(delete_dialog(info))),
+            Some("delete-file") => Some(Action::Open(delete_dialog(state, info))),
+            // Unchecks the backup only where it is optional (never for a
+            // loaded keyring holding items).
             Some("delete-file-no-backup") => {
-                let mut kind = delete_dialog(info);
-                if let DialogKind::DeleteFile { backup, .. } = &mut kind {
-                    *backup = false;
+                let mut kind = delete_dialog(state, info);
+                if let DialogKind::DeleteFile { spec, backup, .. } = &mut kind {
+                    *backup = !spec.backup_optional;
                 }
                 Some(Action::Open(kind))
             }
@@ -404,9 +406,17 @@ impl DevPreset {
             .and_then(|id| state.collections.iter().find(|c| &c.id == id));
         let kind = match (self.dialog.as_deref(), locked, selected) {
             (Some("new-keyring"), _, _) => Some(DialogKind::create_collection()),
-            (Some("unlock"), Some(c), _) => Some(DialogKind::unlock(c.id.clone(), display_name(c))),
-            (Some("export"), _, Some(c)) => Some(export_dialog(c)),
-            (Some("import-archive"), _, Some(c)) => Some(DialogKind::import_archive(c)),
+            (Some("unlock"), Some(c), _) => {
+                let name = shown_name(&state.collections, c);
+                Some(DialogKind::unlock(c.id.clone(), name))
+            }
+            (Some("export"), _, Some(c)) => {
+                Some(export_dialog(c, shown_name(&state.collections, c)))
+            }
+            (Some("import-archive"), _, Some(c)) => {
+                let label = shown_name(&state.collections, c);
+                Some(DialogKind::import_archive(c, label))
+            }
             _ => None,
         };
         if let Some(kind) = kind {
@@ -548,24 +558,45 @@ mod tests {
         assert_eq!(DevPreset::default().take_area(), None);
     }
 
-    /// The delete presets open the delete dialog, with the backup checked or not.
+    /// The delete presets open the delete dialog, with the backup checked or
+    /// not; a loaded keyring holding items always keeps its backup.
     #[test]
     fn delete_file_presets() {
-        for (dialog, expected) in [("delete-file", true), ("delete-file-no-backup", false)] {
+        let live = CollectionInfo {
+            id: CollectionId("/org/freedesktop/secrets/collection/t".into()),
+            label: "T".into(),
+            locked: false,
+            item_count: 1,
+            aliases: vec![],
+            is_login: false,
+            created: 0,
+            modified: 0,
+        };
+        let cases = [
+            ("delete-file", false, true),
+            ("delete-file-no-backup", false, false),
+            ("delete-file", true, true),
+            ("delete-file-no-backup", true, true),
+        ];
+        for (dialog, is_live, expected) in cases {
             let mut p = DevPreset {
                 dialog: Some(dialog.into()),
                 ..DevPreset::default()
             };
             let mut s = AppState::default();
+            if is_live {
+                s.apply(Event::Collections(vec![live.clone()]));
+            }
             s.apply(Event::Files(vec![file("t")]));
             s.select_file("t".into());
             let actions = p.take_file_actions(&s);
             assert!(
                 matches!(
                     &actions[..],
-                    [Action::Open(DialogKind::DeleteFile { backup, .. })] if *backup == expected
+                    [Action::Open(DialogKind::DeleteFile { backup, spec, .. })]
+                        if *backup == expected && spec.backup_optional == !is_live
                 ),
-                "{dialog}"
+                "{dialog} live={is_live}"
             );
         }
     }

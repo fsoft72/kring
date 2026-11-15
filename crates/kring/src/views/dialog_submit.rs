@@ -28,6 +28,8 @@ pub const MSG_NO_ARCHIVE_PASSPHRASE: &str = "Enter the passphrase of the archive
 const MSG_NO_BACKUP_PASSPHRASE: &str = "Enter the passphrase of the backup";
 /// Why Delete is disabled while the typed name does not match (no backup).
 pub const MSG_TYPE_NAME: &str = "Type the file name to confirm";
+/// Why a delete without backup is refused for a loaded keyring holding items.
+pub const MSG_BACKUP_MANDATORY: &str = "Loaded keyrings are always backed up before deletion";
 
 /// Returns true when `typed` is exactly the file name `name` (no trimming, case sensitive).
 pub fn delete_confirm_ok(typed: &str, name: &str) -> bool {
@@ -35,10 +37,12 @@ pub fn delete_confirm_ok(typed: &str, name: &str) -> bool {
 }
 
 /// Returns why the main button of a delete dialog is disabled: without a
-/// backup the exact file name must be typed. `None` for other dialogs.
+/// backup (only when optional) the exact file name must be typed. `None`
+/// for other dialogs.
 pub fn delete_dialog_blocked(kind: &DialogKind) -> Option<&'static str> {
     let DialogKind::DeleteFile {
         name,
+        spec,
         backup,
         typed,
         ..
@@ -46,7 +50,13 @@ pub fn delete_dialog_blocked(kind: &DialogKind) -> Option<&'static str> {
     else {
         return None;
     };
-    if *backup || delete_confirm_ok(typed, name) {
+    if *backup {
+        return None;
+    }
+    if !spec.backup_optional {
+        return Some(MSG_BACKUP_MANDATORY);
+    }
+    if delete_confirm_ok(typed, name) {
         return None;
     }
     Some(MSG_TYPE_NAME)
@@ -277,7 +287,7 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
         },
         DialogKind::DeleteFile {
             name,
-            plaintext,
+            spec,
             backup,
             passphrase,
             confirm,
@@ -286,7 +296,7 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             if let Some(reason) = delete_dialog_blocked(kind) {
                 return Err(reason.into());
             }
-            let backup_passphrase = match (*backup, *plaintext) {
+            let backup_passphrase = match (*backup, spec.needs_passphrase) {
                 (true, true) => Some(_new_password(passphrase, confirm)?),
                 _ => None,
             };
@@ -500,7 +510,12 @@ mod tests {
     /// Export suggests a sanitized path and needs a confirmed passphrase.
     #[test]
     fn export_validates() {
-        let mut kind = DialogKind::export_collection(&col("My keys"), Path::new("/h"), "20261115");
+        let mut kind = DialogKind::export_collection(
+            &col("My keys"),
+            "My keys".into(),
+            Path::new("/h"),
+            "20261115",
+        );
         let DialogKind::ExportCollection { path, .. } = &kind else {
             panic!("expected ExportCollection");
         };
@@ -538,7 +553,7 @@ mod tests {
     /// Archive import needs a path and a passphrase and targets the collection.
     #[test]
     fn import_archive_validates() {
-        let mut kind = DialogKind::import_archive(&col("Work"));
+        let mut kind = DialogKind::import_archive(&col("Work"), "Work".into());
         assert_eq!(command_for(&kind).unwrap_err(), MSG_NO_PATH);
         if let DialogKind::ImportArchive { path, .. } = &mut kind {
             *path = "/tmp/in.kring.age".into();
@@ -693,6 +708,16 @@ mod tests {
         }
     }
 
+    /// Builds a delete spec.
+    fn spec(needs_passphrase: bool, backup_optional: bool) -> crate::views::dialogs::DeleteSpec {
+        crate::views::dialogs::DeleteSpec {
+            lines: vec!["x".into()],
+            needs_passphrase,
+            passphrase_note: "note",
+            backup_optional,
+        }
+    }
+
     /// Sets the backup flag, typed name and passphrases of a delete dialog.
     fn fill_delete(kind: &mut DialogKind, backup_on: bool, name: &str, pass: (&str, &str)) {
         let DialogKind::DeleteFile {
@@ -730,7 +755,7 @@ mod tests {
     /// The backup checkbox starts checked; a binary file needs no passphrase.
     #[test]
     fn delete_binary_with_backup() {
-        let kind = DialogKind::delete_file("b".into(), false);
+        let kind = DialogKind::delete_file("b".into(), spec(false, true));
         assert!(matches!(kind, DialogKind::DeleteFile { backup: true, .. }));
         match command_for(&kind).unwrap() {
             Command::DeleteFile {
@@ -749,7 +774,7 @@ mod tests {
     /// A plaintext file backed up needs a confirmed new passphrase.
     #[test]
     fn delete_plaintext_with_backup_needs_passphrase() {
-        let mut kind = DialogKind::delete_file("p".into(), true);
+        let mut kind = DialogKind::delete_file("p".into(), spec(true, true));
         assert!(command_for(&kind).is_err(), "empty passphrase rejected");
         fill_delete(&mut kind, true, "", ("pp", "pq"));
         assert!(command_for(&kind).is_err(), "mismatch rejected");
@@ -771,7 +796,7 @@ mod tests {
     /// Without a backup the exact file name must be typed; no passphrase is sent.
     #[test]
     fn delete_without_backup_needs_typed_name() {
-        let mut kind = DialogKind::delete_file("p".into(), true);
+        let mut kind = DialogKind::delete_file("p".into(), spec(true, true));
         fill_delete(&mut kind, false, "P", ("pp", "pp"));
         assert!(command_for(&kind).is_err(), "wrong name rejected");
         assert_eq!(delete_dialog_blocked(&kind), Some(MSG_TYPE_NAME));
@@ -795,6 +820,24 @@ mod tests {
             None,
             "backup on: never blocked"
         );
+    }
+
+    /// When the backup is mandatory (loaded keyring with items) it cannot be skipped.
+    #[test]
+    fn delete_mandatory_backup_cannot_be_skipped() {
+        let mut kind = DialogKind::delete_file("Default_10".into(), spec(false, false));
+        fill_delete(&mut kind, false, "Default_10", ("", ""));
+        assert_eq!(delete_dialog_blocked(&kind), Some(MSG_BACKUP_MANDATORY));
+        assert_eq!(command_for(&kind).unwrap_err(), MSG_BACKUP_MANDATORY);
+        fill_delete(&mut kind, true, "", ("", ""));
+        match command_for(&kind).unwrap() {
+            Command::DeleteFile {
+                backup,
+                backup_passphrase,
+                ..
+            } => assert!(backup && backup_passphrase.is_none()),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     /// The passphrase resend of a delete keeps the name and the backup flag.
