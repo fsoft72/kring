@@ -119,12 +119,16 @@ fn gnome() -> Env {
 }
 
 impl Env {
-    /// Receives the next event, failing after 10 seconds.
+    /// Receives the next event, failing after 10 seconds; every event goes
+    /// through [`assert_secret_free`].
     fn next(&self) -> Event {
-        self.handle
+        let event = self
+            .handle
             .rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("event expected")
+            .expect("event expected");
+        assert_secret_free(&event);
+        event
     }
 
     /// Sends a command.
@@ -263,6 +267,44 @@ impl Env {
     }
 }
 
+/// Returns true for the events whose payload can hold a `SecretValue`.
+///
+/// Exhaustive on purpose: a new variant must be classified here.
+fn may_carry_secret(event: &Event) -> bool {
+    match event {
+        Event::Secret(..) | Event::FileItems { .. } | Event::PassphraseNeeded(_) => true,
+        Event::Provider(_)
+        | Event::ProviderUnavailable
+        | Event::Pam(_)
+        | Event::Collections(_)
+        | Event::Items(..)
+        | Event::BackupCreated(_)
+        | Event::ApplyPassphrasesNeeded { .. }
+        | Event::Files(_)
+        | Event::PasswordNeeded(_)
+        | Event::ImportDone(_)
+        | Event::Backups(_)
+        | Event::RestoreDone(_)
+        | Event::TransferPreview { .. }
+        | Event::TransferDone(_)
+        | Event::ConsolidationPreview { .. }
+        | Event::ConsolidationProgress { .. }
+        | Event::ConsolidationDone(..)
+        | Event::Done(_)
+        | Event::Error(_) => false,
+    }
+}
+
+/// Fails on any event that can carry a secret: these tests never reveal
+/// secrets or open files, and transfer handlers must never echo a command
+/// (in particular an apply command) in `PassphraseNeeded`.
+fn assert_secret_free(event: &Event) {
+    if !may_carry_secret(event) {
+        return;
+    }
+    panic!("event that can carry a secret: {event:?}");
+}
+
 /// Returns the transfer report of the first `TransferDone` among `events`.
 fn transfer_done(events: &[Event]) -> kring_core::transfer::apply::TransferReport {
     events
@@ -347,10 +389,12 @@ fn use_incoming_requires_backup_first() {
     let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
     e.apply(plan_id, vec![Choice::UseIncoming], None);
     match e.next() {
-        Event::PassphraseNeeded(cmd) => {
-            assert!(matches!(*cmd, Command::ApplyTransfer { plan_id: p, .. } if p == plan_id));
-        }
-        other => panic!("expected PassphraseNeeded, got {other:?}"),
+        Event::ApplyPassphrasesNeeded {
+            plan_id: p,
+            backup,
+            orphan_files,
+        } => assert_eq!((p, backup, orphan_files), (plan_id, true, false)),
+        other => panic!("expected ApplyPassphrasesNeeded, got {other:?}"),
     }
     assert_eq!(e.secret(&existing), "old");
     e.apply(plan_id, vec![Choice::UseIncoming], Some(PASSPHRASE));
@@ -459,6 +503,61 @@ fn changed_source_refused() {
     block(e.store.update_item(&item, update)).unwrap();
     e.apply(plan_id, vec![], None);
     assert_eq!(e.expect_error(), MSG_SOURCES_CHANGED);
+
+    let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
+    let rename = ItemUpdate {
+        label: Some("renamed".into()),
+        attributes: None,
+        secret: None,
+    };
+    block(e.store.update_item(&item, rename)).unwrap();
+    e.apply(plan_id, vec![], None);
+    assert_eq!(e.expect_error(), MSG_SOURCES_CHANGED);
+    assert!(e.items(&e.main).is_empty());
+}
+
+/// Plan 1 and Plan 2 mutations (DeleteItem, RetireFile, RestoreBackup) also
+/// make the pending plan stale.
+#[test]
+fn stale_plan_after_plan_1_and_2_mutations() {
+    let e = gnome();
+    e.binary_keyring("Other");
+    let item = e.add_item(&e.other, "site", &[("k", "1")], "s1");
+    let unrelated = e.add_item(&e.other, "old", &[("k", "9")], "s9");
+
+    let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
+    e.send(Command::DeleteItem {
+        item: unrelated,
+        backup_passphrase: None,
+    });
+    let backup_dir = match e.next() {
+        Event::BackupCreated(info) => info.dir,
+        other => panic!("expected BackupCreated, got {other:?}"),
+    };
+    e.until(|ev| matches!(ev, Event::Done(_)));
+    e.apply(plan_id, vec![], None);
+    assert_eq!(e.expect_error(), MSG_STALE_PLAN);
+
+    e.fixture_keyring(EMPTY_TEXTUAL, "loose");
+    let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
+    e.send(Command::RetireFile {
+        name: "loose".into(),
+        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+    });
+    e.until(|ev| matches!(ev, Event::Files(_)));
+    assert!(!e.keyring("loose").exists());
+    e.apply(plan_id, vec![], None);
+    assert_eq!(e.expect_error(), MSG_STALE_PLAN);
+
+    let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
+    e.send(Command::RestoreBackup {
+        dir: backup_dir,
+        files: vec![e.keyring("Other")],
+        passphrase: None,
+    });
+    e.until(|ev| matches!(ev, Event::Done(_)));
+    e.apply(plan_id, vec![], None);
+    assert_eq!(e.expect_error(), MSG_STALE_PLAN);
     assert!(e.items(&e.main).is_empty());
 }
 
@@ -698,10 +797,23 @@ fn orphan_batch_runs_after_consolidation() {
         backup_passphrase: backup.map(SecretValue::from_text),
         orphan_files_passphrase: orphan.map(SecretValue::from_text),
     };
+    let asked = |e: &Env| match e.next() {
+        Event::ApplyPassphrasesNeeded {
+            plan_id: p,
+            backup,
+            orphan_files,
+        } => {
+            assert_eq!(p, plan_id);
+            (backup, orphan_files)
+        }
+        other => panic!("expected ApplyPassphrasesNeeded, got {other:?}"),
+    };
+    e.send(apply(None, None));
+    assert_eq!(asked(&e), (true, true));
     e.send(apply(Some(PASSPHRASE), None));
-    assert!(matches!(e.next(), Event::PassphraseNeeded(_)));
+    assert_eq!(asked(&e), (false, true));
     e.send(apply(None, Some(PASSPHRASE)));
-    assert!(matches!(e.next(), Event::PassphraseNeeded(_)));
+    assert_eq!(asked(&e), (true, false));
     assert!(e.has_collection(&e.other));
     assert_eq!(e.backup_count(), 0);
 
@@ -724,6 +836,36 @@ fn orphan_batch_runs_after_consolidation() {
     assert!(e.keyring("full").exists());
     assert!(!e.has_collection(&e.other));
     assert_eq!(e.backup_count(), 2);
+}
+
+/// A consolidation that stops (an empty collection got an item after the
+/// preview) reports `completed == false` and retires no orphan file.
+#[test]
+fn failed_consolidation_keeps_orphan_files() {
+    let e = gnome();
+    e.add_item(&e.other, "b", &[("k", "2")], "y");
+    let empty = e.store.add_collection("Empty", "pw", false);
+    for name in ["Main", "Other", "Empty"] {
+        e.binary_keyring(name);
+    }
+    e.fixture_keyring(EMPTY_TEXTUAL, "orphan");
+    let (plan_id, summary) = e.plan_consolidation(true);
+    assert_eq!(summary.orphan_files, ["orphan"]);
+    e.add_item(&empty, "late", &[("k", "3")], "z");
+    e.send(Command::ApplyConsolidation {
+        plan_id,
+        choices: vec![vec![]],
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
+        orphan_files_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
+    });
+    let events = e.until(|ev| matches!(ev, Event::ConsolidationDone(_, _)));
+    match events.last() {
+        Some(Event::ConsolidationDone(report, None)) => assert!(!report.completed),
+        other => panic!("expected ConsolidationDone without retire, got {other:?}"),
+    }
+    assert!(e.keyring("orphan").exists());
+    assert!(e.has_collection(&empty));
+    assert_eq!(e.backup_count(), 1);
 }
 
 /// Review Focus 5 (compile time): the apply commands carry only a plan id,

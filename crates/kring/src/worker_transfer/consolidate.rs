@@ -1,6 +1,9 @@
 //! Consolidation handlers: snapshots, preview, apply with progress and the
 //! batch retire of empty plaintext orphan files.
 
+use std::io::Read;
+
+use kring_core::backup::{KEYRING_MAGIC, is_plaintext_keyring, keyring_backup_set};
 use kring_core::keyring_file::{
     KeyringFileInfo, KeyringFormat, RetireBatchReport, RetireMode, retire_files_batch, retire_mode,
     scan_dir,
@@ -18,10 +21,12 @@ use super::{
     StepSummary, conflict_view, existing_of, invalid,
 };
 use crate::worker::{
-    BackupStep, CHANGE_WORDING, Command, Event, WorkerConfig, backup_collections, load_items,
-    refresh,
+    BackupStep, CHANGE_WORDING, Event, WorkerConfig, backup_collections, load_items, refresh,
 };
 use crate::worker_offline::emit_backup;
+
+/// Extension of keyring files.
+const KEYRING_EXTENSION: &str = "keyring";
 
 /// Reads every collection for planning a consolidation.
 ///
@@ -161,7 +166,9 @@ pub(super) struct Passphrases<'a> {
     pub(super) orphan_files: Option<&'a SecretValue>,
 }
 
-/// Applies a consolidation plan; returns true when it waits for a passphrase.
+/// Applies a consolidation plan; returns true when it waits for passphrases
+/// (reported as [`Event::ApplyPassphrasesNeeded`] for `plan_id`, never by
+/// echoing the command).
 ///
 /// Order: write gate, choices shape, orphan file candidates (fresh scan,
 /// limited to the previewed names; their passphrase is required when any
@@ -175,7 +182,7 @@ pub(super) async fn apply_consolidate<S, N>(
     orphan_files: &[String],
     choices: &[Vec<Choice>],
     passes: Passphrases<'_>,
-    original: &Command,
+    plan_id: u64,
 ) -> Result<bool>
 where
     S: SecretStore,
@@ -203,8 +210,12 @@ where
             .collect()
     };
     if !candidates.is_empty() && passes.orphan_files.is_none() {
-        ctx.out
-            .emit(Event::PassphraseNeeded(Box::new(original.clone())));
+        let backup = passes.backup.is_none() && backup_needs_passphrase(ctx.config);
+        ctx.out.emit(Event::ApplyPassphrasesNeeded {
+            plan_id,
+            backup,
+            orphan_files: true,
+        });
         return Ok(true);
     }
     let mut names = vec![plan.target.clone()];
@@ -216,12 +227,19 @@ where
         &names,
         REASON_CONSOLIDATE,
         passes.backup,
-        original,
+        None,
         &CHANGE_WORDING,
     );
     match step {
         BackupStep::Proceed(_) => {}
-        BackupStep::AwaitingPassphrase => return Ok(true),
+        BackupStep::AwaitingPassphrase => {
+            ctx.out.emit(Event::ApplyPassphrasesNeeded {
+                plan_id,
+                backup: true,
+                orphan_files: false,
+            });
+            return Ok(true);
+        }
         BackupStep::Stop => return Ok(false),
     }
     let mut progress = |done: usize, total: usize| {
@@ -245,6 +263,26 @@ where
         }
     }
     Ok(false)
+}
+
+/// Returns true when the keyring backup set holds a plaintext keyring, so a
+/// backup needs a passphrase. Reads only the magic of each file; an
+/// unreadable set or file counts as needing one (the backup reports the error).
+fn backup_needs_passphrase(config: &WorkerConfig) -> bool {
+    let Ok(files) = keyring_backup_set(&config.keyrings_dir) else {
+        return true;
+    };
+    files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|e| e == KEYRING_EXTENSION))
+        .any(|path| {
+            let mut head = [0u8; KEYRING_MAGIC.len()];
+            let read = std::fs::File::open(path).and_then(|mut f| f.read(&mut head));
+            match read {
+                Ok(n) => is_plaintext_keyring(&head[..n]),
+                Err(_) => true,
+            }
+        })
 }
 
 /// Retires the orphan files in one encrypted backup; reports a failure as an error.

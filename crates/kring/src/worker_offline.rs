@@ -22,7 +22,9 @@ use kring_core::transfer::archive::{ExportedItem, write_archive};
 use kring_core::{KringError, MasterPasswordStore, Result, SecretStore};
 use zeroize::Zeroizing;
 
-use crate::worker::{Command, Emitter, Event, MSG_NO_PROVIDER, WorkerConfig, run_store_command};
+use crate::worker::{
+    Command, Emitter, Event, MSG_NO_PROVIDER, WorkerConfig, passphrase_echo, run_store_command,
+};
 
 /// Message for a file name that could escape the keyrings directory.
 const MSG_BAD_NAME: &str = "Invalid keyring file name";
@@ -260,7 +262,7 @@ pub(crate) fn emit_backup<N: Fn()>(out: &Emitter<N>, backup: BackupInfo) {
 
 /// Restores `files` (original paths) of the listed backup `dir`.
 ///
-/// A passphrase needed but missing emits [`Event::PassphraseNeeded`] with `original`.
+/// A passphrase needed but missing emits [`Event::PassphraseNeeded`] with the echo of `original`.
 fn restore_backup<N: Fn()>(
     out: &Emitter<N>,
     config: &WorkerConfig,
@@ -292,7 +294,7 @@ fn restore_backup<N: Fn()>(
     ) {
         Ok(report) => report,
         Err(KringError::PassphraseRequired) => {
-            out.emit(Event::PassphraseNeeded(Box::new(original.clone())));
+            out.emit(passphrase_echo(original));
             return Ok(());
         }
         Err(e) => return Err(e),

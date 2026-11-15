@@ -197,7 +197,20 @@ pub enum Event {
     /// A backup was written.
     BackupCreated(BackupInfo),
     /// A backup needs a passphrase; carries the command to resend with it.
+    ///
+    /// Only Plan 1/2 commands are echoed, always with their passphrase
+    /// fields cleared (see [`passphrase_echo`]); apply commands use
+    /// [`Event::ApplyPassphrasesNeeded`] instead.
     PassphraseNeeded(Box<Command>),
+    /// The pending plan `plan_id` needs passphrases before it can be applied:
+    /// `backup` for the pre-apply backup, `orphan_files` for the retired
+    /// orphan files. The plan stays valid; resend the apply command with all
+    /// of them.
+    ApplyPassphrasesNeeded {
+        plan_id: u64,
+        backup: bool,
+        orphan_files: bool,
+    },
     /// Keyring files found in the keyrings directory.
     Files(Vec<KeyringFileInfo>),
     /// Items read offline from keyring file `name` (secrets are for display only).
@@ -290,6 +303,38 @@ impl<N: Fn()> Emitter<N> {
     pub(crate) fn error(&self, message: impl Into<String>) {
         self.emit(Event::Error(message.into()));
     }
+}
+
+/// Builds the [`Event::PassphraseNeeded`] echo of a Plan 1/2 command with
+/// every passphrase field cleared, so no secret travels back in the event.
+///
+/// Apply commands must never be echoed (they use
+/// [`Event::ApplyPassphrasesNeeded`]); a debug build asserts this.
+pub(crate) fn passphrase_echo(cmd: &Command) -> Event {
+    debug_assert!(
+        !matches!(
+            cmd,
+            Command::ApplyTransfer { .. } | Command::ApplyConsolidation { .. }
+        ),
+        "apply commands are never echoed"
+    );
+    let echo = match cmd.clone() {
+        Command::DeleteItem { item, .. } => Command::DeleteItem {
+            item,
+            backup_passphrase: None,
+        },
+        Command::DeleteCollection { collection, .. } => Command::DeleteCollection {
+            collection,
+            backup_passphrase: None,
+        },
+        Command::RestoreBackup { dir, files, .. } => Command::RestoreBackup {
+            dir,
+            files,
+            passphrase: None,
+        },
+        other => other,
+    };
+    Event::PassphraseNeeded(Box::new(echo))
 }
 
 /// Spawns the worker thread and returns the UI endpoints.
@@ -426,7 +471,7 @@ fn keyring_name(collection: &CollectionId, refusal: &str) -> Result<Option<Strin
 pub(crate) enum BackupStep {
     /// Go ahead; carries the backup directory (`None` when no backup was needed).
     Proceed(Option<PathBuf>),
-    /// A passphrase was requested with [`Event::PassphraseNeeded`]; must not run yet.
+    /// A passphrase is needed (and was requested when `original` was given); must not run yet.
     AwaitingPassphrase,
     /// An error was reported; must not run.
     Stop,
@@ -471,7 +516,7 @@ fn backup_before<N: Fn()>(
         collections,
         reason,
         passphrase,
-        original,
+        Some(original),
         &DELETE_WORDING,
     )
 }
@@ -481,14 +526,16 @@ fn backup_before<N: Fn()>(
 /// Every named collection except the in-memory `session` one must have its
 /// `<decoded name>.keyring` in the backup set, otherwise nothing is backed up
 /// and the operation is refused. When only `session` is named no backup is
-/// needed. A missing passphrase emits [`Event::PassphraseNeeded`] with `original`.
+/// needed. A missing passphrase emits [`Event::PassphraseNeeded`] with the
+/// echo of `original` when one is given (Plan 1/2 commands); apply commands
+/// pass `None` and report [`BackupStep::AwaitingPassphrase`] themselves.
 pub(crate) fn backup_collections<N: Fn()>(
     out: &Emitter<N>,
     config: &WorkerConfig,
     collections: &[CollectionId],
     reason: &str,
     passphrase: Option<&SecretValue>,
-    original: &Command,
+    original: Option<&Command>,
     wording: &BackupWording,
 ) -> BackupStep {
     let mut names: Vec<String> = Vec::new();
@@ -537,7 +584,9 @@ pub(crate) fn backup_collections<N: Fn()>(
             BackupStep::Proceed(Some(dir))
         }
         Err(KringError::PassphraseRequired) => {
-            out.emit(Event::PassphraseNeeded(Box::new(original.clone())));
+            if let Some(original) = original {
+                out.emit(passphrase_echo(original));
+            }
             BackupStep::AwaitingPassphrase
         }
         Err(e) => {

@@ -111,6 +111,20 @@ pub struct TransferPreview {
     pub conflicts: Vec<ConflictView>,
 }
 
+/// Passphrases the pending plan needs before the apply can run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApplyPassphrases {
+    /// Plan id to resend the apply command for.
+    pub plan_id: u64,
+    /// The pre-apply backup needs a passphrase.
+    pub backup: bool,
+    /// The orphan files retire needs a passphrase.
+    pub orphan_files: bool,
+}
+
+/// Prefix of the worker error for an apply of a stale plan.
+const STALE_PLAN_PREFIX: &str = "Plan is out of date";
+
 /// Formats `n noun`, adding `s` unless `n` is 1.
 fn _count(n: usize, noun: &str) -> String {
     let plural = if n == 1 { "" } else { "s" };
@@ -159,6 +173,8 @@ pub struct AppState {
     pub consolidation_preview: Option<(u64, ConsolidationSummary)>,
     /// Progress `(done, total)` of the running consolidation.
     pub consolidation_progress: Option<(usize, usize)>,
+    /// Passphrases the pending plan asked for (resend the apply with all of them).
+    pub pending_apply_passphrases: Option<ApplyPassphrases>,
     /// Outcome of the last consolidation, with the orphan file retire report.
     pub last_consolidation: Option<(ConsolidationReport, Option<RetireBatchReport>)>,
     /// Set when a backup was created or restored since the last listing.
@@ -257,16 +273,22 @@ impl AppState {
                     counts,
                     conflicts,
                 });
+                self.consolidation_preview = None;
+                self.consolidation_progress = None;
+                self.pending_apply_passphrases = None;
             }
             Event::TransferDone(report) => {
                 self.status = transfer_summary(&report);
                 self.last_transfer = Some(report);
                 self.transfer_preview = None;
+                self.pending_apply_passphrases = None;
             }
             Event::ConsolidationPreview { plan_id, summary } => {
                 self.consolidation_preview = Some((plan_id, summary));
                 self.consolidation_progress = None;
                 self.last_consolidation = None;
+                self.transfer_preview = None;
+                self.pending_apply_passphrases = None;
             }
             Event::ConsolidationProgress { done, total } => {
                 self.consolidation_progress = Some((done, total));
@@ -275,10 +297,28 @@ impl AppState {
                 self.status = consolidation_status(&report, retired.as_ref());
                 self.consolidation_preview = None;
                 self.consolidation_progress = None;
+                self.pending_apply_passphrases = None;
                 self.last_consolidation = Some((report, retired));
+            }
+            Event::ApplyPassphrasesNeeded {
+                plan_id,
+                backup,
+                orphan_files,
+            } => {
+                self.pending_apply_passphrases = Some(ApplyPassphrases {
+                    plan_id,
+                    backup,
+                    orphan_files,
+                });
             }
             Event::Done(msg) => self.status = msg,
             Event::Error(msg) => {
+                self.consolidation_progress = None;
+                if msg.starts_with(STALE_PLAN_PREFIX) {
+                    self.transfer_preview = None;
+                    self.consolidation_preview = None;
+                    self.pending_apply_passphrases = None;
+                }
                 // The pending file command survives unrelated errors; it is
                 // dropped on file change, on its items or when its dialog is taken.
                 self.errors.push(msg);
@@ -949,5 +989,91 @@ mod tests {
             s.take_password_request(),
             Some(("a".to_string(), FileAction::Import { target }))
         );
+    }
+
+    /// Builds an empty consolidation summary for state tests.
+    fn empty_summary() -> ConsolidationSummary {
+        ConsolidationSummary {
+            target: CollectionId("/c/t".into()),
+            steps: vec![],
+            delete_empty: vec![],
+            skipped: vec![],
+            locked_count: 0,
+            set_default: false,
+            conflict_count: 0,
+            orphan_files: vec![],
+        }
+    }
+
+    /// Builds a transfer preview event for state tests.
+    fn preview_event(plan_id: u64) -> Event {
+        Event::TransferPreview {
+            plan_id,
+            target: CollectionId("/c/t".into()),
+            mode: TransferMode::Copy,
+            counts: TransferCounts::default(),
+            conflicts: vec![],
+        }
+    }
+
+    /// A transfer preview and a consolidation preview replace each other.
+    #[test]
+    fn previews_replace_each_other() {
+        let mut s = AppState::default();
+        s.apply(preview_event(1));
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 2,
+            summary: empty_summary(),
+        });
+        assert!(s.transfer_preview.is_none());
+        assert_eq!(s.consolidation_preview.as_ref().map(|p| p.0), Some(2));
+        s.apply(preview_event(3));
+        assert!(s.consolidation_preview.is_none());
+        assert_eq!(s.transfer_preview.as_ref().map(|p| p.plan_id), Some(3));
+    }
+
+    /// A stale plan error drops both previews and the passphrase request.
+    #[test]
+    fn stale_plan_error_clears_previews() {
+        let mut s = AppState::default();
+        s.apply(preview_event(1));
+        s.apply(Event::ApplyPassphrasesNeeded {
+            plan_id: 1,
+            backup: true,
+            orphan_files: false,
+        });
+        assert_eq!(
+            s.pending_apply_passphrases.map(|p| (p.plan_id, p.backup)),
+            Some((1, true))
+        );
+        s.apply(Event::Error("Plan is out of date, preview again".into()));
+        assert!(s.transfer_preview.is_none() && s.pending_apply_passphrases.is_none());
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 2,
+            summary: empty_summary(),
+        });
+        s.apply(Event::Error("Plan is out of date, preview again".into()));
+        assert!(s.consolidation_preview.is_none());
+    }
+
+    /// Any error, and the end of a consolidation, drop the progress.
+    #[test]
+    fn progress_cleared_on_error_and_done() {
+        let mut s = AppState::default();
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 2,
+            summary: empty_summary(),
+        });
+        s.apply(Event::ConsolidationProgress { done: 1, total: 3 });
+        s.apply(Event::Error("boom".into()));
+        assert!(s.consolidation_progress.is_none());
+        assert!(s.consolidation_preview.is_some());
+        s.apply(Event::ConsolidationProgress { done: 2, total: 3 });
+        let done = ConsolidationReport {
+            outcomes: vec![],
+            completed: true,
+        };
+        s.apply(Event::ConsolidationDone(done, None));
+        assert!(s.consolidation_progress.is_none());
     }
 }

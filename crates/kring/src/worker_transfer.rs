@@ -332,7 +332,7 @@ where
                 return Ok(());
             };
             let pass = backup_passphrase.as_ref();
-            let Some(job) = apply_job(ctx, job, choices, pass, cmd).await? else {
+            let Some(job) = apply_job(ctx, job, choices, pass, *plan_id).await? else {
                 return Ok(());
             };
             plans.restore(*plan_id, PendingPlan::Transfer(job));
@@ -360,9 +360,15 @@ where
                 backup: backup_passphrase.as_ref(),
                 orphan_files: orphan_files_passphrase.as_ref(),
             };
-            let waiting =
-                consolidate::apply_consolidate(ctx, &plan, &orphan_files, choices, passes, cmd)
-                    .await?;
+            let waiting = consolidate::apply_consolidate(
+                ctx,
+                &plan,
+                &orphan_files,
+                choices,
+                passes,
+                *plan_id,
+            )
+            .await?;
             if waiting {
                 let plan = PendingPlan::Consolidation { plan, orphan_files };
                 plans.restore(*plan_id, plan);
@@ -623,7 +629,8 @@ fn emit_preview<N: Fn()>(out: &Emitter<N>, plans: &mut PlanState, job: TransferJ
     });
 }
 
-/// Applies a transfer plan; returns the job when it must wait for a passphrase.
+/// Applies a transfer plan; returns the job when it must wait for a passphrase
+/// (reported as [`Event::ApplyPassphrasesNeeded`] for `plan_id`).
 ///
 /// Move or any `UseIncoming` needs a writable provider and ONE backup first:
 /// of the target and (for Move) of every source collection. Copy without
@@ -634,7 +641,7 @@ async fn apply_job<S, N>(
     job: TransferJob,
     choices: &[Choice],
     passphrase: Option<&SecretValue>,
-    original: &Command,
+    plan_id: u64,
 ) -> Result<Option<TransferJob>>
 where
     S: SecretStore,
@@ -670,12 +677,19 @@ where
             &names,
             REASON_TRANSFER,
             passphrase,
-            original,
+            None,
             &CHANGE_WORDING,
         );
         match step {
             BackupStep::Proceed(_) => {}
-            BackupStep::AwaitingPassphrase => return Ok(Some(job)),
+            BackupStep::AwaitingPassphrase => {
+                ctx.out.emit(Event::ApplyPassphrasesNeeded {
+                    plan_id,
+                    backup: true,
+                    orphan_files: false,
+                });
+                return Ok(Some(job));
+            }
             BackupStep::Stop => return Ok(None),
         }
     }
@@ -720,7 +734,7 @@ async fn sources_unchanged<S: SecretStore>(store: &S, incoming: &[Incoming]) -> 
         let Some(info) = found else {
             return Ok(false);
         };
-        if info.attributes != item.attributes {
+        if info.label != item.label || info.attributes != item.attributes {
             return Ok(false);
         }
         let secret = store.read_secret(id).await?;
