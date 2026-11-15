@@ -9,3 +9,4 @@
   `scripts/check-no-gui-toolkits.sh` guard against GTK/Qt/GNOME crates.
 - Added `kring-core` model types (`SecretValue` zeroized and redacted), `KringError`, and input validation.
 - Added `SecretStore`/`MasterPasswordStore` traits and in-memory `FakeStore` (feature `fake`).
+- Added `scripts/it-session.sh` (private dbus session + throwaway gnome-keyring) and the `it_smoke` integration test.
