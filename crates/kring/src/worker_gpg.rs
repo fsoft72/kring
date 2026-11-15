@@ -3,12 +3,13 @@
 //!
 //! Every command locates `gpg` again (a cheap `PATH` lookup) and addresses keys
 //! by full primary fingerprint, checked against a fresh listing; only the import
-//! source and the export destination are paths, chosen by the user. None of
+//! source and the export destinations are paths, chosen by the user. None of
 //! these commands needs a Secret Service.
 //!
 //! gpg missing, or an agent refusing loopback passphrase entry, is
-//! [`Event::GpgUnavailable`] with the reason; a scan reports nothing else, any
-//! other command adds one [`Event::Error`] with the same text. Key passphrase
+//! [`Event::GpgUnavailable`] with the reason (`scan` set for a scan, which
+//! reports nothing else); any other command adds one [`Event::Error`] with the
+//! same text. Key passphrase
 //! errors are [`Event::Error`] with exactly
 //! [`kring_core::gpg::MSG_GPG_PASSPHRASE_REQUIRED`] or
 //! [`kring_core::gpg::MSG_WRONG_GPG_PASSPHRASE`] (the UI reopens its dialog). A
@@ -35,6 +36,8 @@ use crate::worker::{Command, Emitter, Event, WorkerConfig, passphrase_echo};
 pub(crate) const MSG_RESCAN_FAILED: &str = "Cannot rescan the GPG keys";
 /// Error for a key reference that is not a full fingerprint.
 const MSG_BAD_FINGERPRINT: &str = "A full key fingerprint (40 or 64 hex digits) is required";
+/// Mode of a saved public key file.
+const PUBLIC_FILE_MODE: u32 = 0o644;
 /// Lengths in hex digits of full v4 and v5 fingerprints.
 const FINGERPRINT_LENGTHS: [usize; 2] = [40, 64];
 
@@ -46,6 +49,7 @@ pub(crate) fn is_gpg(cmd: &Command) -> bool {
             | Command::CreateGpgKey { .. }
             | Command::ImportGpgKeys { .. }
             | Command::ExportGpgPublic { .. }
+            | Command::SaveGpgPublic { .. }
             | Command::ExportGpgSecret { .. }
             | Command::ChangeGpgPassphrase { .. }
             | Command::DeleteGpgKey { .. }
@@ -101,8 +105,12 @@ fn is_unusable(e: &KringError) -> bool {
 
 /// Emits [`Event::GpgUnavailable`]; a command other than the scan also gets one error.
 fn unavailable<N: Fn()>(out: &Emitter<N>, cmd: &Command, reason: String) {
-    out.emit(Event::GpgUnavailable(reason.clone()));
-    if !matches!(cmd, Command::ScanGpgKeys) {
+    let scan = matches!(cmd, Command::ScanGpgKeys);
+    out.emit(Event::GpgUnavailable {
+        reason: reason.clone(),
+        scan,
+    });
+    if !scan {
         out.error(reason);
     }
 }
@@ -209,6 +217,16 @@ fn run<N: Fn()>(
             });
             Ok(())
         }
+        Command::SaveGpgPublic { fpr, dest } => {
+            let key = resolve_key(runner, fpr)?;
+            let text = export_public(runner, &key.fingerprint)?;
+            write_new_public(dest, text.as_bytes())?;
+            out.emit(Event::Done(format!(
+                "Public key saved to {}",
+                dest.display()
+            )));
+            Ok(())
+        }
         Command::ExportGpgSecret {
             fpr,
             dest,
@@ -283,6 +301,24 @@ fn read_import(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
         return Err(invalid(format!("{} is too large", path.display())));
     }
     Ok(Zeroizing::new(fs::read(path).map_err(io)?))
+}
+
+/// Writes `bytes` to the new file `path` (mode 0644); an existing file is refused.
+fn write_new_public(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let io = |e: std::io::Error| KringError::Io {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    };
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PUBLIC_FILE_MODE)
+        .open(path)
+        .map_err(io)?;
+    file.write_all(bytes).map_err(io)?;
+    file.sync_all().map_err(io)
 }
 
 /// Success message of an import, e.g. `Imported 1 key (1 secret), 0 unchanged`.

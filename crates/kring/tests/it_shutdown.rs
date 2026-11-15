@@ -45,6 +45,8 @@ fn worker_shuts_down_without_panic() {
     config.backups.root = dir.path().join("backups");
     config.ssh_dir = None;
     config.ssh_agent_sock = None;
+    // A GnuPG home that cannot exist: no gpg command may touch ~/.gnupg.
+    config.gnupg_home = Some("/nonexistent/kring-it-gnupg".into());
     let WorkerHandle { tx, rx } = worker::spawn(connected.store, connected.provider, config, || {});
 
     // Wait until the worker has started and listed the collections.

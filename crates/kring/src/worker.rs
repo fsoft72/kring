@@ -271,6 +271,8 @@ pub enum Command {
     /// Read the armored public key `fpr` (full primary fingerprint); answers
     /// with [`Event::GpgPublicKey`].
     ExportGpgPublic { fpr: String },
+    /// Write the armored public key `fpr` to the new file `dest`.
+    SaveGpgPublic { fpr: String, dest: PathBuf },
     /// Write the armored secret key `fpr` to the new file `dest`, unlocked
     /// with its `passphrase`.
     ExportGpgSecret {
@@ -378,8 +380,10 @@ pub enum Event {
     SshPublicKey { name: String, text: String },
     /// Keys of the GnuPG home (last scan).
     GpgKeys(Vec<GpgKey>),
-    /// gpg cannot be used (not installed, or the agent refuses loopback), with why.
-    GpgUnavailable(String),
+    /// gpg cannot be used (not installed, or the agent refuses loopback), with
+    /// why; `scan` is true when it answers [`Command::ScanGpgKeys`] (only then
+    /// is the key list known to be gone).
+    GpgUnavailable { reason: String, scan: bool },
     /// Armored public key `text` of key `fpr`; not a secret.
     GpgPublicKey { fpr: String, text: String },
     /// An informational notice shown as a toast (not an error).
@@ -1087,6 +1091,7 @@ where
         | Command::CreateGpgKey { .. }
         | Command::ImportGpgKeys { .. }
         | Command::ExportGpgPublic { .. }
+        | Command::SaveGpgPublic { .. }
         | Command::ExportGpgSecret { .. }
         | Command::ChangeGpgPassphrase { .. }
         | Command::DeleteGpgKey { .. } => {

@@ -137,10 +137,11 @@ const STALE_PLAN_PREFIX: &str = "Plan is out of date";
 const MAX_REVEAL_REQUESTS: usize = 32;
 /// Notice shown when a backup was written but old backups could not be pruned.
 const MSG_PRUNE_FAILED: &str = "Backup created but old backups could not be pruned";
-/// Error of a backup passphrase request for an SSH passphrase change: the
-/// key is unencrypted although the dialog did not ask for a backup
-/// passphrase (the request clears the key passphrases, so no resend).
-pub const MSG_SSH_KEY_CHANGED: &str =
+/// Error of a backup passphrase request for an SSH passphrase change or a
+/// GPG key change or delete: the key changed although the dialog did not
+/// ask for a backup passphrase (the request clears the key passphrases, so
+/// no resend).
+pub const MSG_KEY_CHANGED: &str =
     "The key changed since the dialog opened, nothing was changed: try again";
 
 /// Formats `n noun`, adding `s` unless `n` is 1 (e.g. `2 items`).
@@ -210,6 +211,8 @@ pub struct AppState {
     pub gpg_keys: Vec<GpgKey>,
     /// Why gpg cannot be used, `None` once a scan succeeded.
     pub gpg_unavailable: Option<String>,
+    /// Full fingerprint of the GPG key being viewed.
+    pub selected_gpg_key: Option<String>,
     /// Armored public key `(fingerprint, text)` last read (not a secret);
     /// dropped when its key is no longer listed.
     pub gpg_public_key: Option<(String, String)>,
@@ -346,8 +349,13 @@ impl AppState {
                 }
             }
             Event::PassphraseNeeded(cmd) => {
-                if matches!(*cmd, Command::ChangeSshPassphrase { .. }) {
-                    return self.errors.push(MSG_SSH_KEY_CHANGED.to_string());
+                if matches!(
+                    *cmd,
+                    Command::ChangeSshPassphrase { .. }
+                        | Command::ChangeGpgPassphrase { .. }
+                        | Command::DeleteGpgKey { .. }
+                ) {
+                    return self.errors.push(MSG_KEY_CHANGED.to_string());
                 }
                 self.pending_passphrase = Some(*cmd);
             }
@@ -391,9 +399,12 @@ impl AppState {
                 }
             }
             Event::GpgKeys(keys) => self._set_gpg_keys(keys),
-            Event::GpgUnavailable(reason) => {
-                self.gpg_keys.clear();
-                self.gpg_public_key = None;
+            Event::GpgUnavailable { reason, scan } => {
+                if scan {
+                    self.gpg_keys.clear();
+                    self.gpg_public_key = None;
+                    self.selected_gpg_key = None;
+                }
                 self.gpg_unavailable = Some(reason);
             }
             Event::GpgPublicKey { fpr, text } => {
@@ -579,10 +590,17 @@ impl AppState {
     }
 
     /// Replaces the GPG key list (gpg answered, so it is available) and drops
-    /// the public key text of a key that is no longer listed.
+    /// the selection and the public key text of a key that is no longer listed.
     fn _set_gpg_keys(&mut self, keys: Vec<GpgKey>) {
         self.gpg_keys = keys;
         self.gpg_unavailable = None;
+        let selected_listed = self
+            .selected_gpg_key
+            .as_ref()
+            .is_some_and(|fpr| self.gpg_keys.iter().any(|k| &k.fingerprint == fpr));
+        if !selected_listed {
+            self.selected_gpg_key = None;
+        }
         let listed = self
             .gpg_public_key
             .as_ref()
@@ -590,6 +608,18 @@ impl AppState {
         if !listed {
             self.gpg_public_key = None;
         }
+    }
+
+    /// Selects GPG key `fpr`, dropping the public key text of another key.
+    pub fn select_gpg_key(&mut self, fpr: String) {
+        let other = self
+            .gpg_public_key
+            .as_ref()
+            .is_some_and(|(shown, _)| *shown != fpr);
+        if other {
+            self.gpg_public_key = None;
+        }
+        self.selected_gpg_key = Some(fpr);
     }
 
     /// Selects SSH key `name`, dropping the public key text of the previous one.
@@ -2305,19 +2335,24 @@ mod tests {
     }
 
     /// GPG keys and unavailability replace each other; a public key text is
-    /// kept only while its key is listed.
+    /// kept only while its key is listed. Only a scan result clears the
+    /// list: an action finding gpg unusable keeps it (banner only).
     #[test]
     fn gpg_keys_and_unavailability() {
         let listing = include_bytes!("../../kring-core/tests/fixtures/gpg/list-keys.txt");
         let keys = kring_core::gpg::parse_listing(listing);
         let fpr = keys[0].fingerprint.clone();
+        let unavailable = |reason: &str, scan: bool| Event::GpgUnavailable {
+            reason: reason.into(),
+            scan,
+        };
         let mut s = AppState::default();
         s.apply(Event::GpgPublicKey {
             fpr: fpr.clone(),
             text: "armored".into(),
         });
         assert!(s.gpg_public_key.is_none(), "unknown key dropped");
-        s.apply(Event::GpgUnavailable("no gpg".into()));
+        s.apply(unavailable("no gpg", true));
         assert_eq!(s.gpg_unavailable.as_deref(), Some("no gpg"));
         s.apply(Event::GpgKeys(keys.clone()));
         assert!(s.gpg_unavailable.is_none());
@@ -2337,9 +2372,58 @@ mod tests {
             fpr,
             text: "armored".into(),
         });
-        s.apply(Event::GpgUnavailable("refused".into()));
+        s.apply(unavailable("refused", false));
+        assert_eq!(s.gpg_unavailable.as_deref(), Some("refused"));
+        assert_eq!(s.gpg_keys.len(), keys.len(), "an action keeps the list");
+        assert!(s.gpg_public_key.is_some());
+        s.apply(unavailable("refused", true));
         assert!(s.gpg_keys.is_empty() && s.gpg_public_key.is_none());
         assert!(s.errors.is_empty(), "never an error toast");
+    }
+
+    /// Selecting a GPG key drops the public key text of another one; a
+    /// selection whose key is no longer listed is dropped.
+    #[test]
+    fn gpg_key_selection() {
+        let listing = include_bytes!("../../kring-core/tests/fixtures/gpg/list-keys.txt");
+        let keys = kring_core::gpg::parse_listing(listing);
+        let (a, b) = (keys[0].fingerprint.clone(), keys[1].fingerprint.clone());
+        let mut s = AppState::default();
+        s.apply(Event::GpgKeys(keys.clone()));
+        s.select_gpg_key(a.clone());
+        s.apply(Event::GpgPublicKey {
+            fpr: a.clone(),
+            text: "armored".into(),
+        });
+        s.select_gpg_key(a.clone());
+        assert!(s.gpg_public_key.is_some(), "same key keeps its text");
+        s.select_gpg_key(b.clone());
+        assert!(s.gpg_public_key.is_none());
+        assert_eq!(s.selected_gpg_key.as_deref(), Some(b.as_str()));
+        s.apply(Event::GpgKeys(keys[..1].to_vec()));
+        assert!(s.selected_gpg_key.is_none(), "deleted key deselected");
+    }
+
+    /// A backup passphrase request for a GPG command cannot be answered by
+    /// a resend (the key passphrases were cleared): it becomes an error.
+    #[test]
+    fn gpg_passphrase_requests() {
+        let mut s = AppState::default();
+        let delete = Command::DeleteGpgKey {
+            fpr: "A".repeat(40),
+            key_passphrase: None,
+            backup_passphrase: None,
+        };
+        s.apply(Event::PassphraseNeeded(Box::new(delete)));
+        let change = Command::ChangeGpgPassphrase {
+            fpr: "A".repeat(40),
+            old: None,
+            new: None,
+            backup_passphrase: None,
+        };
+        s.apply(Event::PassphraseNeeded(Box::new(change)));
+        assert!(s.pending_passphrase.is_none());
+        assert_eq!(s.errors, [MSG_KEY_CHANGED, MSG_KEY_CHANGED]);
     }
 
     /// Agent identities and unavailability replace each other; a key is in
@@ -2384,7 +2468,7 @@ mod tests {
             },
         )));
         assert!(s.pending_passphrase.is_none());
-        assert_eq!(s.errors, [MSG_SSH_KEY_CHANGED]);
+        assert_eq!(s.errors, [MSG_KEY_CHANGED]);
         let delete = Command::DeleteSshKey {
             name: "k".into(),
             backup_passphrase: None,

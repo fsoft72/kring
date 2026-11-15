@@ -480,6 +480,7 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             }
         }
         DialogKind::Ssh(dialog) => dialog.command_for()?,
+        DialogKind::Gpg(dialog) => dialog.command_for()?,
         DialogKind::Passphrase {
             command,
             passphrase,

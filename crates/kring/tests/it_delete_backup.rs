@@ -54,6 +54,8 @@ fn delete_collection_backs_up_its_keyring_file() {
     config.backups.root = dir.path().join("backups");
     config.ssh_dir = None;
     config.ssh_agent_sock = None;
+    // A GnuPG home that cannot exist: no gpg command may touch ~/.gnupg.
+    config.gnupg_home = Some("/nonexistent/kring-it-gnupg".into());
     let keyrings = config.keyrings_dir.clone();
     let handle = worker::spawn(connected.store, connected.provider, config, || {});
     handle

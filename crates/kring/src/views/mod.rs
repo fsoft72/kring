@@ -7,6 +7,7 @@ pub mod collection;
 pub mod conflict_row;
 pub mod consolidate;
 pub mod dialog_body;
+pub mod dialog_gpg;
 pub mod dialog_remember;
 pub mod dialog_ssh;
 pub mod dialog_submit;
@@ -14,6 +15,8 @@ pub mod dialogs;
 pub mod file_detail;
 pub mod file_items;
 pub mod files_list;
+pub mod gpg_detail;
+pub mod gpg_list;
 pub mod item_detail;
 pub mod item_list;
 pub mod progress;
@@ -89,6 +92,8 @@ pub enum Action {
     AskForgetPassphrase,
     /// Select an SSH key and read its public key.
     SelectSshKey(String),
+    /// Select a GPG key (full fingerprint) and read its public key.
+    SelectGpgKey(String),
     /// Show an informational toast (e.g. after copying a public key).
     Info(String),
 }
@@ -105,6 +110,8 @@ pub enum Area {
     KWallet,
     /// SSH keys of `~/.ssh` and the identities of the ssh-agent.
     Ssh,
+    /// Keys of the GnuPG keyring.
+    Gpg,
     /// Backups of the keyring files and their restore.
     Backups,
     /// Consolidation of the orphan keyrings into one.
@@ -126,7 +133,8 @@ pub fn backups_commands() -> Vec<Command> {
 /// preview. Any switch drops the report of the last import. Entering Files
 /// or Consolidate rescans the keyrings directory (orphan files); entering
 /// Backups lists the backups too; entering KWallet scans the wallets;
-/// entering SSH keys scans the keys and lists the agent.
+/// entering SSH keys scans the keys and lists the agent; entering GPG keys
+/// scans the GnuPG keyring.
 pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     if from == to {
         return Vec::new();
@@ -136,13 +144,14 @@ pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
         Area::KWallet => state.close_wallet(),
         Area::Backups => state.last_restore = None,
         Area::Consolidate => state.set_consolidation_shown(false),
-        Area::Secrets | Area::Ssh => {}
+        Area::Secrets | Area::Ssh | Area::Gpg => {}
     }
     state.last_import = None;
     match to {
         Area::Files => vec![Command::ScanFiles],
         Area::KWallet => vec![Command::ScanWallets],
         Area::Ssh => vec![Command::ScanSshKeys, Command::AgentList],
+        Area::Gpg => vec![Command::ScanGpgKeys],
         Area::Backups => backups_commands(),
         Area::Consolidate => {
             state.set_consolidation_shown(true);

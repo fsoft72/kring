@@ -725,7 +725,7 @@ impl SshDialog {
 }
 
 /// Replaces `buffer` with `text`.
-fn _set(buffer: &mut Zeroizing<String>, text: &str) {
+pub(crate) fn _set(buffer: &mut Zeroizing<String>, text: &str) {
     buffer.clear();
     buffer.push_str(text);
 }
@@ -752,7 +752,7 @@ fn _key_passphrase(
 }
 
 /// Main action of a dialog (`danger` for the destructive ones).
-fn _main(text: &'static str, danger: bool) -> MainAction {
+pub(crate) fn _main(text: &'static str, danger: bool) -> MainAction {
     MainAction {
         text,
         danger,
@@ -761,28 +761,28 @@ fn _main(text: &'static str, danger: bool) -> MainAction {
 }
 
 /// Adds the dialog title.
-fn _title(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn _title(ui: &mut egui::Ui, text: &str) {
     ui.label(semibold(text, TITLE_SIZE));
     ui.add_space(4.0);
 }
 
 /// Adds body text in TEXT colour.
-fn _text(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn _text(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(theme::TEXT));
 }
 
 /// Adds muted body text.
-fn _muted(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn _muted(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(theme::MUTED).size(12.5));
 }
 
 /// Adds a TERTIARY warning line.
-fn _warning(ui: &mut egui::Ui, text: &str) {
+pub(crate) fn _warning(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).color(theme::TERTIARY).size(12.5));
 }
 
 /// Adds a field label above a single-line text field with a hint.
-fn _text_field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) {
+pub(crate) fn _text_field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) {
     field_label(ui, label);
     ui.add(
         input(text)
@@ -804,7 +804,7 @@ fn _path_field(ui: &mut egui::Ui, label: &str, text: &mut String) {
 
 /// Adds a labelled password field; nothing when `hide` (the remembered
 /// passphrase is used instead).
-fn _password(
+pub(crate) fn _password(
     ui: &mut egui::Ui,
     hide: bool,
     label: &str,

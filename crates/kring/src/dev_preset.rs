@@ -16,10 +16,12 @@ use crate::app_state::AppState;
 use crate::views::backups::{BackupView, path_exists, restore_dialog};
 use crate::views::collection::{display_name, export_dialog, shown_name};
 use crate::views::consolidate::{default_target, needs_passphrases};
+use crate::views::dialog_gpg::GpgDialog;
 use crate::views::dialog_ssh::SshDialog;
 use crate::views::dialogs::DialogKind;
 use crate::views::file_detail::{delete_dialog, retire_dialog};
 use crate::views::file_items::displayed_file_items;
+use crate::views::gpg_detail::selected_key as selected_gpg_key;
 use crate::views::item_list::displayed_items;
 use crate::views::ssh_detail::selected_key;
 use crate::views::transfer::default_choices;
@@ -51,7 +53,7 @@ const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
 /// passphrase dialog of the apply) or `consolidate-now` (then applies with
 /// the preselected choices and [`DEV_PASSPHRASE`] for every passphrase).
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
-/// Area to show first: `files`, `kwallet`, `ssh`, `backups` or `consolidate`.
+/// Area to show first: `files`, `kwallet`, `ssh`, `gpg`, `backups` or `consolidate`.
 const VAR_AREA: &str = "KRING_DEV_AREA";
 /// Wallet (name without `.kwl`) to select in the KWallet area. Its dialogs
 /// ([`VAR_DIALOG`]): `wallet-password` (the password dialog), `wallet-open`
@@ -70,6 +72,17 @@ const AREA_SSH: &str = "ssh";
 /// [`DEV_SSH_KEY_PASSPHRASE`]) or `ssh-delete-now` (deletes it, backing up
 /// an unencrypted key with [`DEV_PASSPHRASE`], showing the progress modal).
 const VAR_SSH_KEY: &str = "KRING_DEV_SSH_KEY";
+/// Value of [`VAR_AREA`] selecting the GPG keys area.
+const AREA_GPG: &str = "gpg";
+/// GPG key to select in the GPG keys area: a case-insensitive part of a user
+/// id or of the fingerprint. Its dialogs ([`VAR_DIALOG`]): `gpg-new`,
+/// `gpg-import`, `gpg-save-public`, `gpg-export`, `gpg-change`, `gpg-delete`
+/// (open the dialog) or `gpg-delete-now` (deletes it, a secret key with
+/// [`DEV_GPG_KEY_PASSPHRASE`] and the backup passphrase [`DEV_PASSPHRASE`],
+/// showing the progress modal).
+const VAR_GPG_KEY: &str = "KRING_DEV_GPG_KEY";
+/// Passphrase of the secret fixture key seeded by `scripts/dev-session.sh`.
+const DEV_GPG_KEY_PASSPHRASE: &str = "fixture-pw";
 /// Passphrase of the encrypted fixture key seeded by `scripts/dev-session.sh`.
 const DEV_SSH_KEY_PASSPHRASE: &str = "fixture-pw";
 /// Password of the fixture wallet seeded by `scripts/dev-session.sh`.
@@ -132,6 +145,8 @@ pub struct DevPreset {
     pub wallet_open_sent: bool,
     /// SSH key to select in the SSH keys area.
     pub ssh_key: Option<String>,
+    /// GPG key (part of a user id or fingerprint) to select in the GPG keys area.
+    pub gpg_key: Option<String>,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -160,6 +175,7 @@ pub fn preset_from(
         wallet: var(VAR_WALLET),
         wallet_open_sent: false,
         ssh_key: var(VAR_SSH_KEY),
+        gpg_key: var(VAR_GPG_KEY),
     }
 }
 
@@ -200,6 +216,7 @@ impl DevPreset {
             AREA_FILES => Some(Area::Files),
             AREA_KWALLET => Some(Area::KWallet),
             AREA_SSH => Some(Area::Ssh),
+            AREA_GPG => Some(Area::Gpg),
             AREA_BACKUPS => Some(Area::Backups),
             AREA_CONSOLIDATE => Some(Area::Consolidate),
             _ => None,
@@ -402,6 +419,60 @@ impl DevPreset {
                 backup_passphrase: (info.encrypted == Some(false))
                     .then(|| SecretValue::from_text(DEV_PASSPHRASE)),
             })],
+            _ => Vec::new(),
+        }
+    }
+
+    /// GPG keys area actions due now: selects the preset key once scanned,
+    /// then opens its dialog or sends its command; each fires once.
+    pub fn take_gpg_actions(&mut self, state: &AppState) -> Vec<Action> {
+        if let Some(wanted) = self.gpg_key.as_deref() {
+            let needle = wanted.to_lowercase();
+            let found = state.gpg_keys.iter().find(|k| {
+                k.fingerprint.to_lowercase().contains(&needle)
+                    || k.uids
+                        .iter()
+                        .any(|u| u.uid.to_lowercase().contains(&needle))
+            });
+            let Some(key) = found else {
+                return Vec::new();
+            };
+            self.gpg_key = None;
+            return vec![Action::SelectGpgKey(key.fingerprint.clone())];
+        }
+        let Some(dialog) = self.dialog.as_deref().filter(|d| d.starts_with("gpg-")) else {
+            return Vec::new();
+        };
+        let dialog = dialog.to_string();
+        let open = |d: GpgDialog| vec![Action::Open(DialogKind::Gpg(d))];
+        match dialog.as_str() {
+            "gpg-new" => {
+                self.dialog = None;
+                return open(GpgDialog::create());
+            }
+            "gpg-import" => {
+                self.dialog = None;
+                return open(GpgDialog::import());
+            }
+            _ => {}
+        }
+        let Some(key) = selected_gpg_key(state) else {
+            return Vec::new();
+        };
+        self.dialog = None;
+        match dialog.as_str() {
+            "gpg-save-public" => open(GpgDialog::save_public(key)),
+            "gpg-export" => open(GpgDialog::export_secret(key)),
+            "gpg-change" => open(GpgDialog::change_passphrase(key)),
+            "gpg-delete" => open(GpgDialog::delete(key)),
+            "gpg-delete-now" => {
+                let secret = |text: &str| key.secret.then(|| SecretValue::from_text(text));
+                vec![Action::Send(Command::DeleteGpgKey {
+                    fpr: key.fingerprint.clone(),
+                    key_passphrase: secret(DEV_GPG_KEY_PASSPHRASE),
+                    backup_passphrase: secret(DEV_PASSPHRASE),
+                })]
+            }
             _ => Vec::new(),
         }
     }
@@ -645,6 +716,7 @@ mod tests {
             VAR_REMEMBER => Some("1".into()),
             VAR_WALLET => Some("fixture".into()),
             VAR_SSH_KEY => Some("id_ed25519".into()),
+            VAR_GPG_KEY => Some("fixture".into()),
             _ => None,
         }
     }
@@ -669,6 +741,7 @@ mod tests {
                 wallet: Some("fixture".into()),
                 wallet_open_sent: false,
                 ssh_key: Some("id_ed25519".into()),
+                gpg_key: Some("fixture".into()),
             }
         );
     }
@@ -1231,5 +1304,54 @@ mod tests {
             [Action::Open(DialogKind::Ssh(SshDialog::Generate { .. }))]
         ));
         assert!(p.take_ssh_actions(&s).is_empty());
+    }
+
+    /// The GPG preset selects the key matching a user id part once scanned,
+    /// then deletes it with the fixture passphrases; dialogs open once.
+    #[test]
+    fn gpg_area_preset() {
+        use crate::views::dialog_gpg::tests::{public_key, secret_key};
+        let mut p = DevPreset {
+            area: Some(AREA_GPG.into()),
+            gpg_key: Some("FIXTURE@".into()),
+            dialog: Some("gpg-delete-now".into()),
+            ..DevPreset::default()
+        };
+        assert_eq!(p.take_area(), Some(Area::Gpg));
+        let mut s = AppState::default();
+        assert!(p.take_gpg_actions(&s).is_empty(), "not scanned yet");
+        let key = secret_key();
+        s.apply(Event::GpgKeys(vec![public_key(), key.clone()]));
+        let actions = p.take_gpg_actions(&s);
+        assert!(matches!(&actions[..], [Action::SelectGpgKey(f)] if *f == key.fingerprint));
+        s.select_gpg_key(key.fingerprint.clone());
+        let actions = p.take_gpg_actions(&s);
+        let [
+            Action::Send(Command::DeleteGpgKey {
+                key_passphrase,
+                backup_passphrase,
+                ..
+            }),
+        ] = &actions[..]
+        else {
+            panic!("expected the delete");
+        };
+        let text = |s: &Option<SecretValue>| s.as_ref().and_then(|s| s.as_text()).map(String::from);
+        assert_eq!(
+            text(key_passphrase).as_deref(),
+            Some(DEV_GPG_KEY_PASSPHRASE)
+        );
+        assert_eq!(text(backup_passphrase).as_deref(), Some(DEV_PASSPHRASE));
+        assert!(p.take_gpg_actions(&s).is_empty(), "sent once");
+        let mut p = DevPreset {
+            dialog: Some("gpg-new".into()),
+            ..DevPreset::default()
+        };
+        let actions = p.take_gpg_actions(&s);
+        assert!(matches!(
+            &actions[..],
+            [Action::Open(DialogKind::Gpg(GpgDialog::Create { .. }))]
+        ));
+        assert!(p.take_gpg_actions(&s).is_empty());
     }
 }

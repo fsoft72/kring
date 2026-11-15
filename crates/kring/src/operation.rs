@@ -251,6 +251,15 @@ fn _collection_name(state: &AppState, id: &CollectionId) -> String {
         .map_or_else(|| id.0.clone(), |c| shown_name(&state.collections, c))
 }
 
+/// Returns the shown name of GPG key `fpr` (its fingerprint when not listed).
+fn _gpg_key_name(state: &AppState, fpr: &str) -> String {
+    state
+        .gpg_keys
+        .iter()
+        .find(|k| k.fingerprint == fpr)
+        .map_or_else(|| fpr.to_string(), crate::views::dialog_gpg::key_label)
+}
+
 /// Returns true when the apply of the open transfer preview changes data.
 fn _transfer_destructive(state: &AppState, plan_id: u64, choices: &[Choice]) -> bool {
     state
@@ -311,6 +320,15 @@ pub fn describe(cmd: &Command, state: &AppState, id: u64) -> Option<Operation> {
                 None => "Removing",
             };
             Operation::start(format!("{verb} the passphrase of \"{name}\"..."), true, id)
+        }
+        Command::DeleteGpgKey { fpr, .. } => {
+            let name = _gpg_key_name(state, fpr);
+            Operation::start(format!("Deleting GPG key \"{name}\"..."), true, id)
+        }
+        Command::ChangeGpgPassphrase { fpr, .. } => {
+            let name = _gpg_key_name(state, fpr);
+            let text = format!("Changing the passphrase of GPG key \"{name}\"...");
+            Operation::start(text, true, id)
         }
         _ => return None,
     };
@@ -707,5 +725,44 @@ mod tests {
         };
         assert!(describe(&agent, &state, 6).is_none());
         assert!(describe(&Command::AgentRemoveAll, &state, 7).is_none());
+    }
+
+    /// Deleting a GPG key and changing its passphrase show the progress
+    /// modal with a backup step, named after the key; exports do not.
+    #[test]
+    fn gpg_operations() {
+        use crate::views::dialog_gpg::tests::secret_key;
+        let key = secret_key();
+        let mut state = AppState::default();
+        state.apply(Event::GpgKeys(vec![key.clone()]));
+        let delete = Command::DeleteGpgKey {
+            fpr: key.fingerprint.clone(),
+            key_passphrase: None,
+            backup_passphrase: None,
+        };
+        let op = describe(&delete, &state, 3).expect("delete is destructive");
+        assert_eq!(op.steps().len(), 2, "backup and action");
+        assert_eq!(
+            op.steps()[1].text,
+            "Deleting GPG key \"Fixture User <fixture@example.invalid>\"..."
+        );
+        let change = Command::ChangeGpgPassphrase {
+            fpr: "B".repeat(40),
+            old: None,
+            new: None,
+            backup_passphrase: None,
+        };
+        let op = describe(&change, &state, 4).expect("change is destructive");
+        assert_eq!(
+            op.steps()[1].text,
+            format!(
+                "Changing the passphrase of GPG key \"{}\"...",
+                "B".repeat(40)
+            )
+        );
+        let export = Command::ExportGpgPublic {
+            fpr: key.fingerprint,
+        };
+        assert!(describe(&export, &state, 5).is_none());
     }
 }

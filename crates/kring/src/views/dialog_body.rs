@@ -562,6 +562,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
             _danger("Consolidate (backup first)")
         }
         DialogKind::Ssh(dialog) => dialog.body(ui, hide),
+        DialogKind::Gpg(dialog) => dialog.body(ui, hide),
         DialogKind::Passphrase {
             command,
             passphrase,

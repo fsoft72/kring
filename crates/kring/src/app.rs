@@ -26,8 +26,8 @@ use crate::views::rail::WorkerActivity;
 use crate::views::transfer::{self, TransferView};
 use crate::views::wallet_items::WalletView;
 use crate::views::{
-    Action, Area, Gates, banners, collection, file_detail, files_list, rail, sidebar, ssh_detail,
-    ssh_list, switch_area, wallet_detail, wallets_list,
+    Action, Area, Gates, banners, collection, file_detail, files_list, gpg_detail, gpg_list, rail,
+    sidebar, ssh_detail, ssh_list, switch_area, wallet_detail, wallets_list,
 };
 use crate::worker::{Command, Event, WorkerHandle};
 
@@ -78,6 +78,8 @@ pub struct KringApp {
     ssh_filter: String,
     /// SSH key folder scanned by the worker (`None` when HOME is unset).
     ssh_dir: Option<PathBuf>,
+    /// GPG key search text.
+    gpg_filter: String,
     /// Selected backup and the files checked for a restore.
     backup_view: BackupView,
     /// Choices and shown offline secrets of the transfer preview.
@@ -117,6 +119,7 @@ impl KringApp {
             wallet_view: WalletView::default(),
             ssh_filter: String::new(),
             ssh_dir: kring_core::paths::ssh_dir(),
+            gpg_filter: String::new(),
             backup_view: BackupView::default(),
             transfer_view: TransferView::default(),
             consolidate_view: ConsolidateView::default(),
@@ -370,6 +373,14 @@ impl KringApp {
                     self._send(cmd);
                 }
             }
+            Action::SelectGpgKey(fpr) => {
+                let key = self.state.gpg_keys.iter().find(|k| k.fingerprint == fpr);
+                let cmd = key.map(gpg_detail::select_command);
+                self.state.select_gpg_key(fpr);
+                if let Some(cmd) = cmd {
+                    self._send(cmd);
+                }
+            }
             Action::Info(text) => self.toasts.push(ToastKind::Info, text, Instant::now()),
         }
     }
@@ -433,6 +444,7 @@ impl KringApp {
             }
             Area::Consolidate => self.dev.take_consolidate_actions(&self.state),
             Area::Ssh => self.dev.take_ssh_actions(&self.state),
+            Area::Gpg => self.dev.take_gpg_actions(&self.state),
         };
         let reveal = self.dev.take_transfer_reveal(&self.state);
         for action in actions.into_iter().chain(reveal) {
@@ -712,6 +724,7 @@ impl KringApp {
                         &mut self.ssh_filter,
                         self.ssh_dir.as_deref(),
                     ),
+                    Area::Gpg => gpg_list::show(ui, &self.state, &mut self.gpg_filter),
                     Area::Backups => backups::list(ui, &self.state, &mut self.backup_view),
                     Area::Consolidate => consolidate::list(ui, &self.state, &self.consolidate_view),
                 };
@@ -735,6 +748,7 @@ impl KringApp {
                         wallet_detail::show(ui, &self.state, &mut self.wallet_view, gates)
                     }
                     Area::Ssh => ssh_detail::show(ui, &self.state, gates, self.ssh_dir.as_deref()),
+                    Area::Gpg => gpg_detail::show(ui, &self.state, gates),
                     Area::Backups => {
                         backups::detail(ui, &self.state, &mut self.backup_view, &self.keyrings_dir)
                     }

@@ -23,7 +23,7 @@ const TILES: [(Option<Area>, Ico, &str); 7] = [
     (Some(Area::Files), Ico::Folder, "Offline files"),
     (Some(Area::KWallet), Ico::Wallet, "KWallet"),
     (Some(Area::Ssh), Ico::Terminal, "SSH keys"),
-    (None, Ico::Shield, "GPG keys"),
+    (Some(Area::Gpg), Ico::Shield, "GPG keys"),
     (Some(Area::Backups), Ico::Archive, "Backups"),
     (Some(Area::Consolidate), Ico::Merge, "Consolidate"),
 ];

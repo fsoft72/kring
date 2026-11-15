@@ -16,6 +16,7 @@ use crate::ui::widgets::{danger_button, primary_button, secondary_button};
 use crate::views::collection::{display_name, display_names};
 use crate::views::consolidate::PassphraseNeeds;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
+use crate::views::dialog_gpg::GpgDialog;
 use crate::views::dialog_remember::{
     cleared, fill_passphrases, offers_remember, passphrase_of, remember_row, remembered_row,
     reopens_when_wrong, uses_remembered,
@@ -255,6 +256,8 @@ pub enum DialogKind {
     },
     /// A dialog of the SSH keys area.
     Ssh(SshDialog),
+    /// A dialog of the GPG keys area.
+    Gpg(GpgDialog),
     /// Choose a passphrase for a backup containing plaintext keyrings.
     Passphrase {
         command: Box<Command>,
@@ -586,11 +589,16 @@ impl Dialog {
         }
     }
 
-    /// Reopens an SSH dialog whose key turned out to need a passphrase: it
-    /// now asks for it, under the error "Key passphrase required".
+    /// Reopens an SSH or GPG dialog whose key turned out to need a
+    /// passphrase: it now asks for it, under the error of its area ("Key
+    /// passphrase required", "GPG key passphrase required").
     pub fn key_passphrase_required(kind: DialogKind) -> Self {
+        let error = match &kind {
+            DialogKind::Gpg(_) => kring_core::gpg::MSG_GPG_PASSPHRASE_REQUIRED,
+            _ => kring_core::ssh::MSG_KEY_PASSPHRASE_REQUIRED,
+        };
         Self {
-            error: Some(kring_core::ssh::MSG_KEY_PASSPHRASE_REQUIRED.to_string()),
+            error: Some(error.to_string()),
             retry: true,
             ..Self::new(kind)
         }

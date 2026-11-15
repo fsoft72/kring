@@ -39,9 +39,11 @@ const WRONG_PASSPHRASE: &str = "Wrong passphrase";
 /// Returns true when a worker error says the passphrase or password was
 /// wrong: backups and archives, KWallet wallets
 /// ([`kring_core::kwallet_file::MSG_WRONG_PASSWORD`]), binary keyring
-/// files ([`kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX`])
-/// and SSH keys ([`kring_core::ssh::MSG_WRONG_KEY_PASSPHRASE`]).
+/// files ([`kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX`]),
+/// SSH keys ([`kring_core::ssh::MSG_WRONG_KEY_PASSPHRASE`]) and GPG keys
+/// ([`kring_core::gpg::MSG_WRONG_GPG_PASSPHRASE`]).
 pub fn is_wrong_passphrase(msg: &str) -> bool {
+    use kring_core::gpg::MSG_WRONG_GPG_PASSPHRASE;
     use kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX;
     use kring_core::kwallet_file::MSG_WRONG_PASSWORD;
     use kring_core::ssh::MSG_WRONG_KEY_PASSPHRASE;
@@ -50,9 +52,18 @@ pub fn is_wrong_passphrase(msg: &str) -> bool {
         MSG_WRONG_PASSWORD,
         MSG_WRONG_PASSWORD_PREFIX,
         MSG_WRONG_KEY_PASSPHRASE,
+        MSG_WRONG_GPG_PASSPHRASE,
     ]
     .iter()
     .any(|part| msg.contains(part))
+}
+
+/// Returns true when a worker error says an SSH or GPG key needs a
+/// passphrase that was not sent ([`kring_core::ssh::MSG_KEY_PASSPHRASE_REQUIRED`],
+/// [`kring_core::gpg::MSG_GPG_PASSPHRASE_REQUIRED`]).
+pub fn is_key_passphrase_required(msg: &str) -> bool {
+    msg == kring_core::ssh::MSG_KEY_PASSPHRASE_REQUIRED
+        || msg == kring_core::gpg::MSG_GPG_PASSPHRASE_REQUIRED
 }
 
 /// What the remembered passphrase was used for.
@@ -88,7 +99,7 @@ struct Window {
     error: bool,
     /// An error said the passphrase is wrong.
     wrong: bool,
-    /// An error said the SSH key needs a passphrase that was not sent.
+    /// An error said the SSH or GPG key needs a passphrase that was not sent.
     key_required: bool,
     /// A passphrase was asked for again.
     asked: bool,
@@ -118,8 +129,8 @@ pub enum FollowUp {
         /// Display name.
         label: String,
     },
-    /// Reopen this SSH dialog asking the key passphrase (the key turned out
-    /// to be encrypted).
+    /// Reopen this SSH or GPG dialog asking the key passphrase (the key
+    /// turned out to be protected).
     KeyPassphrase(Box<DialogKind>),
     /// Say that the remembered passphrase was used (successful unlock).
     UsedRemembered,
@@ -308,7 +319,7 @@ impl SessionSecret {
             Event::Error(msg) => {
                 window.error = true;
                 window.wrong |= is_wrong_passphrase(msg);
-                window.key_required |= msg == kring_core::ssh::MSG_KEY_PASSPHRASE_REQUIRED;
+                window.key_required |= is_key_passphrase_required(msg);
             }
             Event::PassphraseNeeded(_) | Event::ApplyPassphrasesNeeded { .. } => {
                 window.asked = true;
@@ -693,5 +704,43 @@ mod tests {
         ];
         feed(&mut s, 3, &wrong);
         assert!(!s.is_remembered());
+    }
+
+    /// A wrong GPG key passphrase counts as a wrong passphrase (shared
+    /// constant) and reopens its dialog; a missing one reopens it with the
+    /// key passphrase required.
+    #[test]
+    fn gpg_key_passphrase_follow_ups() {
+        use crate::views::dialog_gpg::GpgDialog;
+        use crate::views::dialog_gpg::tests::secret_key;
+        use kring_core::gpg::{MSG_GPG_PASSPHRASE_REQUIRED, MSG_WRONG_GPG_PASSPHRASE};
+        assert!(is_wrong_passphrase(MSG_WRONG_GPG_PASSPHRASE));
+        assert!(!is_wrong_passphrase(MSG_GPG_PASSPHRASE_REQUIRED));
+        let key = secret_key();
+        let mut s = SessionSecret::default();
+        s.used_in_dialog(DialogKind::Gpg(GpgDialog::delete(&key)), 1);
+        let wrong = [
+            Event::Error(MSG_WRONG_GPG_PASSPHRASE.into()),
+            Event::CommandFinished(1),
+        ];
+        assert!(matches!(
+            feed(&mut s, 1, &wrong),
+            Some(FollowUp::Dialog(k)) if matches!(*k, DialogKind::Gpg(GpgDialog::Delete { .. }))
+        ));
+        s.used_in_dialog(DialogKind::Gpg(GpgDialog::export_secret(&key)), 2);
+        let required = [
+            Event::Error(MSG_GPG_PASSPHRASE_REQUIRED.into()),
+            Event::CommandFinished(2),
+        ];
+        let Some(FollowUp::KeyPassphrase(kind)) = feed(&mut s, 2, &required) else {
+            panic!("expected the key passphrase dialog");
+        };
+        assert!(matches!(
+            *kind,
+            DialogKind::Gpg(GpgDialog::ExportSecret {
+                key_required: true,
+                ..
+            })
+        ));
     }
 }

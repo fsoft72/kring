@@ -35,6 +35,14 @@
 # a private ssh-agent listening under the temp dir (killed on exit) is given to
 # the app as SSH_AUTH_SOCK, holding id_ecdsa. The real ~/.ssh and the user's
 # agent are never used.
+# For the GPG keys area a temp GnuPG home ($TMP_ROOT/gnupg, mode 0700) is seeded
+# at start: a secret key "Fixture User <fixture@example.invalid>" (ed25519 +
+# cv25519, expires in 2 years, passphrase `fixture-pw`) and the public key of
+# "Public Contact <contact@example.invalid>", generated in a second temp home
+# and imported (its export is left in the temp HOME as contact.asc for the
+# import dialog). Only the app gets it, as GNUPGHOME; the agents of both temp
+# homes are killed and their socket dirs removed on exit. The real ~/.gnupg
+# (or GNUPGHOME) and the user's gpg-agent are never used.
 # The temp dir is deleted on exit unless KRING_DEV_KEEP=1.
 set -u
 
@@ -49,7 +57,11 @@ REAL_KEYRINGS="${XDG_DATA_HOME:-$HOME/.local/share}/keyrings"
 REAL_KWALLET="${XDG_DATA_HOME:-$HOME/.local/share}/kwalletd"
 REAL_SSH="$HOME/.ssh"
 REAL_AGENT_SOCK="${SSH_AUTH_SOCK:-}"
+REAL_GNUPG="${GNUPGHOME:-$HOME/.gnupg}"
 AGENT_PID=""
+# Temp GnuPG homes (set once created, for the cleanup).
+GPG_HOME=""
+GPG_SRC=""
 REAL_XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 if [ -f "$REAL_XAUTHORITY" ]; then
   export XAUTHORITY="$REAL_XAUTHORITY"
@@ -59,28 +71,46 @@ if [ -n "${WAYLAND_DISPLAY:-}" ] && [ "${WAYLAND_DISPLAY#/}" = "$WAYLAND_DISPLAY
   export WAYLAND_DISPLAY="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$WAYLAND_DISPLAY"
 fi
 
-# Prints the modification times of the real keyrings, KWallet and SSH dirs (or `missing`).
+# Prints the modification times of the real keyrings, KWallet, SSH and GnuPG
+# dirs (or `missing`).
 _real_mtime() {
-  echo "$(stat -c %Y "$REAL_KEYRINGS" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_KWALLET" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_SSH" 2>/dev/null || echo missing)"
+  echo "$(stat -c %Y "$REAL_KEYRINGS" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_KWALLET" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_SSH" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_GNUPG" 2>/dev/null || echo missing)"
+}
+
+# Runs gpg on the temp home $1 only (--homedir and GNUPGHOME), batch mode.
+_gpg() {
+  local home="$1"
+  shift
+  GNUPGHOME="$home" gpg --homedir "$home" --batch --no-tty "$@"
+}
+
+# Stops the daemons of the temp GnuPG home $1 and removes its socket dir.
+_stop_gpg_home() {
+  local home="$1"
+  [ -n "$home" ] && [ -d "$home" ] || return 0
+  GNUPGHOME="$home" gpgconf --homedir "$home" --kill all >/dev/null 2>&1
+  GNUPGHOME="$home" gpgconf --homedir "$home" --remove-socketdir >/dev/null 2>&1
 }
 MTIME_BEFORE="$(_real_mtime)"
 
-# Stops the private agent, removes the temp dir (unless kept) and reports
-# whether the real keyrings, kwalletd or ~/.ssh changed.
+# Stops the private agents (ssh and gpg), removes the temp dir (unless kept)
+# and reports whether the real keyrings, kwalletd, ~/.ssh or ~/.gnupg changed.
 _cleanup() {
   if [ -n "$AGENT_PID" ]; then
     kill "$AGENT_PID" 2>/dev/null
     wait "$AGENT_PID" 2>/dev/null
   fi
+  _stop_gpg_home "$GPG_HOME"
+  _stop_gpg_home "$GPG_SRC"
   if [ "${KRING_DEV_KEEP:-0}" = "1" ]; then
     echo "dev-session: kept $TMP_ROOT" >&2
   else
     rm -rf "$TMP_ROOT"
   fi
   MTIME_AFTER="$(_real_mtime)"
-  echo "dev-session: real keyrings/kwalletd/ssh mtimes before=$MTIME_BEFORE after=$MTIME_AFTER" >&2
+  echo "dev-session: real keyrings/kwalletd/ssh/gnupg mtimes before=$MTIME_BEFORE after=$MTIME_AFTER" >&2
   if [ "$MTIME_BEFORE" != "$MTIME_AFTER" ]; then
-    echo "dev-session: WARNING the real keyrings, kwalletd or ~/.ssh directory changed" >&2
+    echo "dev-session: WARNING the real keyrings, kwalletd, ~/.ssh or ~/.gnupg directory changed" >&2
   fi
 }
 trap _cleanup EXIT
@@ -95,7 +125,7 @@ export XDG_CACHE_HOME="$TMP_ROOT/cache"
 export XDG_RUNTIME_DIR="$TMP_ROOT/run"
 # Lets the seed example verify it runs inside this private session.
 export KRING_IT_RUNTIME="$XDG_RUNTIME_DIR"
-unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK DBUS_SESSION_BUS_ADDRESS
+unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK DBUS_SESSION_BUS_ADDRESS GNUPGHOME GPG_AGENT_INFO
 echo "dev-session: temp root $TMP_ROOT (backups in $XDG_DATA_HOME/kring/backups)" >&2
 
 # Seed the temp keyrings dir with the synthetic fixtures (repo files only).
@@ -189,6 +219,50 @@ else
 fi
 export KRING_DEV_AGENT_SOCK
 
+# Seed a temp GnuPG home (never the real one): a secret fixture key and an
+# imported public-only key generated in a second temp home.
+KRING_DEV_GNUPGHOME=""
+if command -v gpg >/dev/null 2>&1 && command -v gpgconf >/dev/null 2>&1; then
+  GPG_HOME="$TMP_ROOT/gnupg"
+  GPG_SRC="$TMP_ROOT/gnupg-src"
+  for home in "$GPG_HOME" "$GPG_SRC"; do
+    case "$home" in
+      "$TMP_ROOT"/*) ;;
+      *) echo "dev-session: refusing a GnuPG home outside $TMP_ROOT" >&2; exit 1 ;;
+    esac
+    if [ "$home" = "$REAL_GNUPG" ]; then
+      echo "dev-session: refusing to use the real GnuPG home" >&2
+      exit 1
+    fi
+    mkdir -p "$home"
+    chmod 700 "$home"
+    echo "allow-loopback-pinentry" >"$home/gpg-agent.conf"
+  done
+  if printf '%s\n' fixture-pw | _gpg "$GPG_HOME" --pinentry-mode loopback --passphrase-fd 0 \
+      --quick-gen-key "Fixture User <fixture@example.invalid>" default default 2y >/dev/null 2>&1 &&
+    printf '\n' | _gpg "$GPG_SRC" --pinentry-mode loopback --passphrase-fd 0 \
+      --quick-gen-key "Public Contact <contact@example.invalid>" default default 1y >/dev/null 2>&1 &&
+    _gpg "$GPG_SRC" --armor --export contact@example.invalid >"$HOME/contact.asc" 2>/dev/null &&
+    _gpg "$GPG_HOME" --import "$HOME/contact.asc" >/dev/null 2>&1; then
+    KRING_DEV_GNUPGHOME="$GPG_HOME"
+  else
+    echo "dev-session: could not seed the temp GnuPG home, the GPG area is empty" >&2
+  fi
+  _stop_gpg_home "$GPG_SRC"
+  rm -rf "$GPG_SRC"
+  GPG_SRC=""
+else
+  echo "dev-session: gpg not installed, the GPG keys area is unavailable" >&2
+fi
+# Without a seeded home the app gets an empty temp one (never ~/.gnupg).
+if [ -z "$KRING_DEV_GNUPGHOME" ]; then
+  GPG_HOME="$TMP_ROOT/gnupg"
+  mkdir -p "$GPG_HOME"
+  chmod 700 "$GPG_HOME"
+  KRING_DEV_GNUPGHOME="$GPG_HOME"
+fi
+export KRING_DEV_GNUPGHOME
+
 cd "$REPO_ROOT" || exit 1
 dbus-run-session -- bash -c '
   unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
@@ -226,11 +300,12 @@ dbus-run-session -- bash -c '
   fi
 
   cargo run -q -p kring-core --example seed_dev || exit 1
-  # The app talks only to the private agent (empty: no agent).
+  # The app talks only to the private agent (empty: no agent) and to the
+  # temp GnuPG home.
   if [ -n "$KRING_DEV_AGENT_SOCK" ]; then
-    SSH_AUTH_SOCK="$KRING_DEV_AGENT_SOCK" cargo run -p kring
+    SSH_AUTH_SOCK="$KRING_DEV_AGENT_SOCK" GNUPGHOME="$KRING_DEV_GNUPGHOME" cargo run -p kring
   else
-    cargo run -p kring
+    GNUPGHOME="$KRING_DEV_GNUPGHOME" cargo run -p kring
   fi
 '
 exit $?

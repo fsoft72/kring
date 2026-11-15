@@ -293,7 +293,7 @@ fn may_carry_secret(event: &Event) -> bool {
         | Event::AgentIdentities(_)
         | Event::SshPublicKey { .. }
         | Event::GpgKeys(_)
-        | Event::GpgUnavailable(_)
+        | Event::GpgUnavailable { .. }
         | Event::GpgPublicKey { .. }
         | Event::Notice(_)
         | Event::TransferPreview { .. }

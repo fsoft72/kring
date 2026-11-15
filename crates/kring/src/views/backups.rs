@@ -43,6 +43,14 @@ const MSG_SSH_NOTE: &str = "These are copies of SSH key files. kring cannot rest
      copy them back by hand (see the README, section SSH keys).";
 /// Tooltip of `Restore selected` when a selected file is not a keyring file.
 const MSG_SSH_BY_HAND: &str = "SSH key backups are restored by hand: see README";
+/// Explanation under the header of a backup of GPG key exports.
+const MSG_GPG_NOTE: &str = "These are armored exports of a GPG key (the secret one \
+     age-encrypted). kring cannot restore them: decrypt the secret export with age and import \
+     it with gpg --import (see the README, section GPG keys).";
+/// Tooltip of `Restore selected` for a backup of GPG key exports.
+const MSG_GPG_BY_HAND: &str = "GPG key backups are restored by hand: see README";
+/// Backup reasons of the GPG key operations.
+const GPG_REASONS: [&str; 2] = ["delete-gpg-key", "change-gpg-passphrase"];
 
 /// Returns a readable reason, e.g. `delete-item` -> `Before deleting an item`.
 pub fn humanize_reason(reason: &str) -> String {
@@ -53,6 +61,8 @@ pub fn humanize_reason(reason: &str) -> String {
         "pre-restore" => Some("Before a restore"),
         "delete-ssh-key" => Some("Before deleting an SSH key"),
         "change-ssh-passphrase" => Some("Before changing an SSH key passphrase"),
+        "delete-gpg-key" => Some("Before deleting a GPG key"),
+        "change-gpg-passphrase" => Some("Before changing a GPG key passphrase"),
         _ => None,
     };
     if let Some(text) = known {
@@ -80,13 +90,30 @@ pub fn is_restorable(file: &BackupFile) -> bool {
     name == "default" || name.ends_with(".keyring")
 }
 
-/// Returns true when any of `files` cannot be restored by kring (SSH keys).
+/// Returns true when `info` holds the exports of a GPG key (its reason).
+pub fn is_gpg_backup(info: &BackupInfo) -> bool {
+    GPG_REASONS.contains(&info.reason.as_str())
+}
+
+/// Returns the tooltip of a refused restore of files of `info`: GPG key
+/// exports or SSH key files are both restored by hand.
+pub fn unrestorable_tip(info: &BackupInfo) -> &'static str {
+    match is_gpg_backup(info) {
+        true => MSG_GPG_BY_HAND,
+        false => MSG_SSH_BY_HAND,
+    }
+}
+
+/// Returns true when any of `files` cannot be restored by kring (SSH or GPG keys).
 pub fn has_unrestorable(files: &[&BackupFile]) -> bool {
     files.iter().any(|f| !is_restorable(f))
 }
 
 /// Returns the restore note matching the content of `info`.
 pub fn restore_note(info: &BackupInfo) -> &'static str {
+    if is_gpg_backup(info) {
+        return MSG_GPG_NOTE;
+    }
     if info.files.iter().any(|f| !is_restorable(f)) {
         return MSG_SSH_NOTE;
     }
@@ -404,7 +431,7 @@ pub fn detail(
             let busy = state.operation_open().then_some(MSG_OPERATION_RUNNING);
             let blocked = busy
                 .or(checked.is_empty().then_some(MSG_NOTHING_SELECTED))
-                .or(has_unrestorable(&checked).then_some(MSG_SSH_BY_HAND));
+                .or(has_unrestorable(&checked).then_some(unrestorable_tip(info)));
             if danger_button(ui, "Restore selected", blocked) {
                 let kind = restore_dialog(info, &checked, &state.files, keyrings_dir, path_exists);
                 action = Some(Action::Open(kind));
@@ -667,5 +694,37 @@ mod tests {
         assert!(!restore_note(&ssh_backup).contains("gnome-keyring"));
         let kr_backup = backup("/b/2", vec![kr]);
         assert!(restore_note(&kr_backup).contains("gnome-keyring"));
+    }
+
+    /// GPG key backups are named after their reason and restored by hand:
+    /// their own note and tooltip, not the SSH ones.
+    #[test]
+    fn gpg_backups_are_restored_by_hand() {
+        assert_eq!(
+            humanize_reason("delete-gpg-key"),
+            "Before deleting a GPG key"
+        );
+        assert_eq!(
+            humanize_reason("change-gpg-passphrase"),
+            "Before changing a GPG key passphrase"
+        );
+        let s = Path::new("/s");
+        let fpr = "F304378CE8CEEF63BB59F93CEF2CA8C2F6A348DC";
+        let public = bfile(&format!("/h/.gnupg/{fpr}.public.asc"), s, false);
+        let secret = bfile(&format!("/h/.gnupg/{fpr}.secret.asc"), s, true);
+        assert!(!is_restorable(&public) && !is_restorable(&secret));
+        let mut gpg = backup("/b/3", vec![public, secret]);
+        gpg.reason = "delete-gpg-key".into();
+        assert!(is_gpg_backup(&gpg));
+        assert_eq!(restore_note(&gpg), MSG_GPG_NOTE);
+        assert_eq!(unrestorable_tip(&gpg), MSG_GPG_BY_HAND);
+        assert_eq!(
+            MSG_GPG_BY_HAND,
+            "GPG key backups are restored by hand: see README"
+        );
+        let ssh = backup("/b/1", vec![bfile("/h/.ssh/id_ed25519", s, false)]);
+        assert!(!is_gpg_backup(&ssh));
+        assert_eq!(restore_note(&ssh), MSG_SSH_NOTE);
+        assert_eq!(unrestorable_tip(&ssh), MSG_SSH_BY_HAND);
     }
 }

@@ -301,6 +301,28 @@ fn export_public_by_primary_fingerprint() {
     }
 }
 
+/// Saving the public key writes the armored export to a new file and never
+/// overwrites an existing one.
+#[test]
+fn save_public_key_to_new_file() {
+    let mut env = env_or_skip!();
+    let key = env.key(None);
+    let dest = env.dir.path().join("public.asc");
+    let save = || Command::SaveGpgPublic {
+        fpr: key.fingerprint.clone(),
+        dest: dest.clone(),
+    };
+    let events = env.run(save());
+    assert!(has_done(&events), "{events:?}");
+    let text = std::fs::read_to_string(&dest).unwrap();
+    assert!(text.starts_with(PUBLIC_ARMOR), "{text}");
+    let events = env.run(save());
+    assert_eq!(errors(&events).len(), 1, "{events:?}");
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), text, "kept");
+    assert!(is_gpg(&save()));
+    assert!(!invalidates_plan(&save()), "read-only");
+}
+
 /// Secret export maps passphrase errors to the shared texts and writes a 0600 file.
 #[test]
 fn export_secret_key() {
@@ -439,7 +461,7 @@ fn gpg_missing_is_unavailable() {
     handle_with(&out, &config, &Command::ScanGpgKeys, locate);
     let events: Vec<Event> = rx.try_iter().collect();
     assert!(
-        matches!(&events[..], [Event::GpgUnavailable(m)] if m == MSG_GPG_NOT_FOUND),
+        matches!(&events[..], [Event::GpgUnavailable { reason, scan: true }] if reason == MSG_GPG_NOT_FOUND),
         "{events:?}"
     );
     let cmd = Command::ExportGpgPublic {
@@ -448,8 +470,9 @@ fn gpg_missing_is_unavailable() {
     handle_with(&out, &config, &cmd, locate);
     let events: Vec<Event> = rx.try_iter().collect();
     match &events[..] {
-        [Event::GpgUnavailable(m), Event::Error(e)] => {
-            assert_eq!(m, MSG_GPG_NOT_FOUND);
+        [Event::GpgUnavailable { reason, scan }, Event::Error(e)] => {
+            assert!(!scan, "not a scan result");
+            assert_eq!(reason, MSG_GPG_NOT_FOUND);
             assert_eq!(e, MSG_GPG_NOT_FOUND);
         }
         other => panic!("{other:?}"),
@@ -467,15 +490,16 @@ fn loopback_refused_is_unavailable() {
 
     let events = env.run(Command::ScanGpgKeys);
     assert!(
-        matches!(&events[..], [Event::GpgUnavailable(m)] if m == MSG_LOOPBACK_REFUSED),
+        matches!(&events[..], [Event::GpgUnavailable { reason, scan: true }] if reason == MSG_LOOPBACK_REFUSED),
         "{events:?}"
     );
     let events = env.run(Command::ExportGpgPublic {
         fpr: key.fingerprint.clone(),
     });
     match &events[..] {
-        [Event::GpgUnavailable(m), Event::Error(e)] => {
-            assert_eq!(m, MSG_LOOPBACK_REFUSED);
+        [Event::GpgUnavailable { reason, scan }, Event::Error(e)] => {
+            assert!(!scan, "not a scan result");
+            assert_eq!(reason, MSG_LOOPBACK_REFUSED);
             assert_eq!(e, MSG_LOOPBACK_REFUSED);
         }
         other => panic!("{other:?}"),

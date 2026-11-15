@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 use crate::session_secret::{MSG_REMEMBER, MSG_REMEMBER_WARNING};
 use crate::ui::theme;
 use crate::ui::widgets::secondary_button;
+use crate::views::dialog_gpg::GpgDialog;
 use crate::views::dialog_ssh::SshDialog;
 use crate::views::dialogs::{DialogKind, RestorePassphrase, WalletTarget};
 use crate::worker::Command;
@@ -35,6 +36,7 @@ pub fn asks_passphrase(kind: &DialogKind) -> bool {
         DialogKind::RestoreBackup { mode, .. } => *mode != RestorePassphrase::NotNeeded,
         DialogKind::ImportWallet { target, .. } => *target == Some(WalletTarget::Create),
         DialogKind::Ssh(dialog) => dialog.asks_passphrase(),
+        DialogKind::Gpg(dialog) => dialog.asks_passphrase(),
         _ => false,
     }
 }
@@ -49,33 +51,38 @@ pub fn uses_remembered(kind: &DialogKind) -> bool {
 
 /// Returns true for the password dialogs that reopen (fields empty, "Wrong
 /// passphrase, try again") after a wrong password, even when typed: the
-/// binary keyring file and KWallet wallet passwords, and the SSH dialogs
-/// sending a key passphrase (they also reopen when the key turned out to
-/// need one, see [`needing_key_passphrase`]).
+/// binary keyring file and KWallet wallet passwords, and the SSH and GPG
+/// dialogs sending a key passphrase (they also reopen when the key turned
+/// out to need one, see [`needing_key_passphrase`]).
 pub fn reopens_when_wrong(kind: &DialogKind) -> bool {
     match kind {
         DialogKind::FilePassword { .. } | DialogKind::WalletPassword { .. } => true,
         DialogKind::Ssh(dialog) => dialog.reopens_when_wrong(),
+        DialogKind::Gpg(dialog) => dialog.reopens_when_wrong(),
         _ => false,
     }
 }
 
 /// Returns a copy of `kind` with every passphrase field emptied (for the
-/// SSH dialogs the new key passphrases too).
+/// SSH and GPG dialogs the new key passphrases too).
 pub fn cleared(kind: &DialogKind) -> DialogKind {
     let mut kind = kind.clone();
     fill_passphrases(&mut kind, &SecretValue::from_text(""));
-    if let DialogKind::Ssh(dialog) = &mut kind {
-        dialog.clear_secrets();
+    match &mut kind {
+        DialogKind::Ssh(dialog) => dialog.clear_secrets(),
+        DialogKind::Gpg(dialog) => dialog.clear_secrets(),
+        _ => {}
     }
     kind
 }
 
-/// Returns `kind` asking the key passphrase: an SSH dialog sent without
-/// one for a key the worker found encrypted. Other dialogs are unchanged.
+/// Returns `kind` asking the key passphrase: an SSH or GPG dialog sent
+/// without one for a key the worker found protected. Other dialogs are
+/// unchanged.
 pub fn needing_key_passphrase(kind: DialogKind) -> DialogKind {
     match kind {
         DialogKind::Ssh(dialog) => DialogKind::Ssh(dialog.needing_key_passphrase()),
+        DialogKind::Gpg(dialog) => DialogKind::Gpg(dialog.needing_key_passphrase()),
         other => other,
     }
 }
@@ -153,6 +160,7 @@ pub fn fill_passphrases(kind: &mut DialogKind, secret: &SecretValue) {
             }
         }
         DialogKind::Ssh(dialog) => dialog.fill(text),
+        DialogKind::Gpg(dialog) => dialog.fill(text),
         _ => {}
     }
 }
@@ -209,17 +217,28 @@ pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
         Command::DeleteSshKey {
             backup_passphrase, ..
         } => backup_passphrase.as_ref(),
+        // As for SSH, nothing is remembered for ChangeGpgPassphrase.
+        Command::ExportGpgSecret { passphrase, .. } => passphrase.as_ref(),
+        Command::DeleteGpgKey {
+            key_passphrase,
+            backup_passphrase,
+            ..
+        } => key_passphrase.as_ref().or(backup_passphrase.as_ref()),
         _ => None,
     }
 }
 
 /// Returns true when the dialog offers the "Remember for this session"
 /// checkbox: it asks a passphrase whose value is actually stored on submit.
-/// Changing an SSH key passphrase stores nothing (see [`passphrase_of`]),
+/// Changing an SSH or GPG key passphrase stores nothing (see [`passphrase_of`]),
 /// so no checkbox is shown there even though the remembered value can still
 /// fill the old passphrase.
 pub fn offers_remember(kind: &DialogKind) -> bool {
-    if matches!(kind, DialogKind::Ssh(SshDialog::ChangePassphrase { .. })) {
+    if matches!(
+        kind,
+        DialogKind::Ssh(SshDialog::ChangePassphrase { .. })
+            | DialogKind::Gpg(GpgDialog::ChangePassphrase { .. })
+    ) {
         return false;
     }
     asks_passphrase(kind)
@@ -486,5 +505,46 @@ mod tests {
             lifetime_secs: None,
         };
         assert_eq!(passphrase_of(&agent).unwrap().as_text(), Some(PASS));
+    }
+
+    /// The GPG key dialogs take the remembered passphrase (key and backup
+    /// fields) and reopen when wrong; a GPG key passphrase change stores
+    /// nothing; deleting a public key asks no passphrase.
+    #[test]
+    fn gpg_dialogs_remember() {
+        use crate::views::dialog_gpg::GpgDialog;
+        use crate::views::dialog_gpg::tests::{public_key, secret_key};
+        let key = secret_key();
+        for dialog in [GpgDialog::export_secret(&key), GpgDialog::delete(&key)] {
+            let mut kind = DialogKind::Gpg(dialog);
+            assert!(uses_remembered(&kind) && reopens_when_wrong(&kind));
+            assert!(offers_remember(&kind));
+            fill_passphrases(&mut kind, &SecretValue::from_text(PASS));
+            let cmd = command_for(&kind).unwrap();
+            assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+            let cleared = cleared(&kind);
+            let again = command_for(&cleared);
+            assert!(again.is_err() || passphrase_of(&again.unwrap()).is_none());
+        }
+        let change = DialogKind::Gpg(GpgDialog::change_passphrase(&key));
+        assert!(uses_remembered(&change) && reopens_when_wrong(&change));
+        assert!(!offers_remember(&change), "nothing stored");
+        let change_cmd = Command::ChangeGpgPassphrase {
+            fpr: key.fingerprint.clone(),
+            old: Some(SecretValue::from_text(PASS)),
+            new: Some(SecretValue::from_text("n")),
+            backup_passphrase: Some(SecretValue::from_text(PASS)),
+        };
+        assert!(passphrase_of(&change_cmd).is_none());
+        let public = DialogKind::Gpg(GpgDialog::delete(&public_key()));
+        assert!(!asks_passphrase(&public) && !reopens_when_wrong(&public));
+        let required = needing_key_passphrase(DialogKind::Gpg(GpgDialog::export_secret(&key)));
+        assert!(matches!(
+            required,
+            DialogKind::Gpg(GpgDialog::ExportSecret {
+                key_required: true,
+                ..
+            })
+        ));
     }
 }
