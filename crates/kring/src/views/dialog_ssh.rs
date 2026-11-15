@@ -20,6 +20,7 @@ use crate::ui::password_field::{
 use crate::ui::theme;
 use crate::ui::widgets::{field_label, input, semibold};
 use crate::views::dialog_body::{FIELD_WIDTH, MainAction};
+use crate::views::dialog_remember::{MSG_BACKUP_REMEMBERED, shows_backup_note};
 use crate::views::dialog_submit::{new_passphrase, required_secret, user_path};
 use crate::worker::Command;
 
@@ -665,6 +666,9 @@ impl SshDialog {
                 if *remove {
                     _warning(ui, MSG_UNENCRYPTED_WARNING);
                 }
+                if shows_backup_note(hide, !*encrypted) {
+                    _muted(ui, MSG_BACKUP_REMEMBERED);
+                }
                 if !*encrypted {
                     _warning(ui, MSG_BACKUP_PLAINTEXT);
                     _password(ui, hide, "Backup passphrase", FIELD_SECOND, backup);
@@ -705,6 +709,9 @@ impl SshDialog {
                         ui,
                         "The agent keeps the key loaded until it is removed there.",
                     );
+                }
+                if shows_backup_note(hide, *needs_backup_passphrase) {
+                    _muted(ui, MSG_BACKUP_REMEMBERED);
                 }
                 if *needs_backup_passphrase {
                     _warning(ui, MSG_BACKUP_PLAINTEXT);

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Align, Layout, RichText, Sense, Ui, UiBuilder};
 use kring_core::backup::{BackupFile, BackupInfo, RESTART_HINT};
+use kring_core::gpg::{CHANGE_REASON, DELETE_REASON};
 use kring_core::keyring_file::KeyringFileInfo;
 
 use crate::app_state::AppState;
@@ -50,7 +51,7 @@ const MSG_GPG_NOTE: &str = "These are armored exports of a GPG key (the secret o
 /// Tooltip of `Restore selected` for a backup of GPG key exports.
 const MSG_GPG_BY_HAND: &str = "GPG key backups are restored by hand: see README";
 /// Backup reasons of the GPG key operations.
-const GPG_REASONS: [&str; 2] = ["delete-gpg-key", "change-gpg-passphrase"];
+const GPG_REASONS: [&str; 2] = [DELETE_REASON, CHANGE_REASON];
 
 /// Returns a readable reason, e.g. `delete-item` -> `Before deleting an item`.
 pub fn humanize_reason(reason: &str) -> String {

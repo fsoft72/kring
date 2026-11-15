@@ -219,9 +219,7 @@ a key by hand from `$XDG_DATA_HOME/kring/backups/<date>-delete-gpg-key` (or
 
 ```sh
 cd ~/.local/share/kring/backups/<date>-delete-gpg-key
-age -d -o /tmp/key-secret.asc <FINGERPRINT>.secret.asc.age   # asks the backup passphrase
-gpg --import /tmp/key-secret.asc                             # asks the key passphrase (as it was then)
-shred -u /tmp/key-secret.asc
+age -d <FINGERPRINT>.secret.asc.age | gpg --import   # age asks the backup passphrase on the terminal, gpg the key passphrase
 gpg --import <FINGERPRINT>.public.asc                        # public-only keys
 ```
 

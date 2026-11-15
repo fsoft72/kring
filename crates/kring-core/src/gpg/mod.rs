@@ -12,9 +12,9 @@ mod runner;
 
 pub use colons::{GpgAlgorithm, GpgKey, GpgSubkey, GpgUid, parse_listing};
 pub use ops::{
-    GpgAlgo, ImportReport, MSG_GPG_PASSPHRASE_REQUIRED, MSG_LOOPBACK_REFUSED,
-    MSG_PRIMARY_SECRET_UNAVAILABLE, MSG_WRONG_GPG_PASSPHRASE, change_passphrase, create_key,
-    delete_key, export_public, export_secret, import_keys,
+    CHANGE_REASON, DELETE_REASON, GpgAlgo, ImportReport, MSG_GPG_PASSPHRASE_REQUIRED,
+    MSG_LOOPBACK_REFUSED, MSG_PRIMARY_SECRET_UNAVAILABLE, MSG_WRONG_GPG_PASSPHRASE,
+    change_passphrase, create_key, delete_key, export_public, export_secret, import_keys,
 };
 pub use runner::{
     GPG_CONNECT_AGENT, GpgOutput, GpgRunner, MAX_OUTPUT, MSG_GPG_NOT_FOUND, MSG_PASSPHRASE_NEWLINE,

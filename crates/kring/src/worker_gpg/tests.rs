@@ -542,13 +542,18 @@ fn backup_info() -> BackupInfo {
     }
 }
 
-/// Every GPG command is routed here; read-only ones keep plans, the others drop them.
+/// Every GPG command is routed here; read-only ones and exports (new file only) keep plans, the others drop them.
 #[test]
 fn routing_and_plan_invalidation() {
     let fpr = || "A".repeat(40);
     let keeps = [
         Command::ScanGpgKeys,
         Command::ExportGpgPublic { fpr: fpr() },
+        Command::ExportGpgSecret {
+            fpr: fpr(),
+            dest: PathBuf::from("/x"),
+            passphrase: None,
+        },
     ];
     let drops = [
         Command::CreateGpgKey {
@@ -559,11 +564,6 @@ fn routing_and_plan_invalidation() {
         },
         Command::ImportGpgKeys {
             path: PathBuf::from("/x"),
-        },
-        Command::ExportGpgSecret {
-            fpr: fpr(),
-            dest: PathBuf::from("/x"),
-            passphrase: None,
         },
         Command::ChangeGpgPassphrase {
             fpr: fpr(),

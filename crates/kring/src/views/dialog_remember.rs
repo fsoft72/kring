@@ -16,6 +16,15 @@ use crate::worker::Command;
 
 /// Note shown instead of the passphrase fields when the remembered one is used.
 pub const MSG_USING_REMEMBERED: &str = "Using the remembered passphrase";
+
+/// Note shown in place of hidden backup passphrase fields.
+pub const MSG_BACKUP_REMEMBERED: &str = "The backup is encrypted with the remembered passphrase";
+
+/// Returns true when the backup note replaces the backup fields: they are
+/// hidden (`hide`) and the dialog asks a backup passphrase (`backup_asked`).
+pub fn shows_backup_note(hide: bool, backup_asked: bool) -> bool {
+    hide && backup_asked
+}
 /// Button showing the passphrase fields again.
 const MSG_TYPE_ANOTHER: &str = "Type another";
 
@@ -274,6 +283,15 @@ mod tests {
     use crate::views::dialogs::DeleteSpec;
     use kring_core::model::{CollectionId, ItemId};
     use std::path::PathBuf;
+
+    /// The backup note replaces hidden backup fields only.
+    #[test]
+    fn backup_note_rules() {
+        assert!(shows_backup_note(true, true));
+        assert!(!shows_backup_note(true, false));
+        assert!(!shows_backup_note(false, true));
+        assert!(!shows_backup_note(false, false));
+    }
 
     /// Remembered test value.
     const PASS: &str = "remembered-pass";

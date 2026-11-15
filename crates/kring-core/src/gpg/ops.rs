@@ -58,10 +58,10 @@ const MSG_STALE: &str = "The key changed during the backup, nothing was changed"
 const MSG_NO_KEYS: &str = "No OpenPGP keys found in the data";
 
 /// Backup reason of [`delete_key`].
-const DELETE_REASON: &str = "delete-gpg-key";
+pub const DELETE_REASON: &str = "delete-gpg-key";
 
 /// Backup reason of [`change_passphrase`].
-const CHANGE_REASON: &str = "change-gpg-passphrase";
+pub const CHANGE_REASON: &str = "change-gpg-passphrase";
 
 /// libgpg-error code of a wrong passphrase (`GPG_ERR_BAD_PASSPHRASE`).
 const GPG_ERR_BAD_PASSPHRASE: u32 = 11;

@@ -23,6 +23,7 @@ use crate::ui::password_field::{
 use crate::ui::theme;
 use crate::ui::widgets::{field_label, input};
 use crate::views::dialog_body::{FIELD_WIDTH, MainAction};
+use crate::views::dialog_remember::{MSG_BACKUP_REMEMBERED, shows_backup_note};
 use crate::views::dialog_ssh::{
     _main, _muted, _password, _set, _text, _text_field, _title, _warning,
 };
@@ -470,6 +471,7 @@ impl GpgDialog {
                     ui,
                     "A signing primary key and an encryption subkey are created.",
                 );
+                _muted(ui, "Key generation can take a while.");
                 _main("Create key", false)
             }
             Self::Import { source } => {
@@ -608,6 +610,9 @@ fn _backup_fields(
     backup: &mut Zeroizing<String>,
     confirm: &mut Zeroizing<String>,
 ) {
+    if shows_backup_note(hide, true) {
+        _muted(ui, MSG_BACKUP_REMEMBERED);
+    }
     if hide {
         return;
     }

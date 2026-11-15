@@ -317,8 +317,13 @@ fn write_new_public(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(PUBLIC_FILE_MODE)
         .open(path)
         .map_err(io)?;
-    file.write_all(bytes).map_err(io)?;
-    file.sync_all().map_err(io)
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    if let Err(e) = written {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(io(e));
+    }
+    Ok(())
 }
 
 /// Success message of an import, e.g. `Imported 1 key (1 secret), 0 unchanged`.

@@ -216,7 +216,7 @@ pub(crate) fn is_transfer(cmd: &Command) -> bool {
 /// Returns true for commands that drop the pending plan: everything that may
 /// change keyring data or what a plan could read. Only pure reads keep it
 /// (deny-list: a new command drops the plan unless listed here; SSH key and
-/// agent changes drop it too).
+/// agent changes drop it too; exports only write a new file).
 pub(crate) fn invalidates_plan(cmd: &Command) -> bool {
     !matches!(
         cmd,
@@ -233,6 +233,7 @@ pub(crate) fn invalidates_plan(cmd: &Command) -> bool {
             | Command::ReadSshPublicKey { .. }
             | Command::AgentList
             | Command::ExportSshPrivate { .. }
+            | Command::ExportGpgSecret { .. }
             | Command::ScanGpgKeys
             | Command::ExportGpgPublic { .. }
             | Command::SaveGpgPublic { .. }
