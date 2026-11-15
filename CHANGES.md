@@ -67,3 +67,4 @@
   words), and the `QDataStream` folders/entries (password, map, stream). Wrong password yields
   `Wrong wallet password`; other formats are named in the error. `kwallet-session.sh` now only accepts a
   private bus address.
+- Plan 4 Task 3: `kwallet_file::read_attributes` (flat `"<folder>/<key>"` attributes JSON, tolerant) and `to_incoming` (wallet entries to `Incoming` with `TransferSource::Offline`): app entries keep exact attributes, dates and the daemon's label (`__N_` suffix removed, `<folder>/` prefix except `Secret Service`); native entries and synthesized `{server,user,type}` records use label `<folder>/<key>` with `kwallet-folder/key/type` and `xdg:schema=org.kde.KWallet.Entry`; maps become sorted JSON (`application/json`). Task 2 follow-ups: hard-coded known-answer digest for KWallet's SHA-1 and the size bound now excludes the trailing digest.

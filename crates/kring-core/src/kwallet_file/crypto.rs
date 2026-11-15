@@ -98,7 +98,7 @@ pub(super) fn decrypt_payload(body: &[u8], key: &[u8]) -> Result<Zeroizing<Vec<u
 /// Returns the payload of a decrypted body after checking its size and SHA-1.
 ///
 /// As `BlowfishPersistHandler::read`: skip one random block, read the
-/// big-endian size, reject a size larger than the rest (`-9`), and compare
+/// big-endian size, reject a size larger than the rest without the digest (`-9`), and compare
 /// SHA-1 of the payload with the last 20 bytes (`-8`). With a wrong key both
 /// checks fail on garbage, so both yield `InvalidInput("Wrong wallet password")`.
 pub(super) fn checked_payload(plain: &[u8]) -> Result<&[u8]> {
@@ -110,7 +110,7 @@ pub(super) fn checked_payload(plain: &[u8]) -> Result<&[u8]> {
     let size = u32::from_be_bytes([size_field[0], size_field[1], size_field[2], size_field[3]]);
     let start = BLOCK_LEN + SIZE_LEN;
     let size = size as usize;
-    if size > plain.len() - start {
+    if size > plain.len() - start - SHA1_LEN {
         return Err(wrong());
     }
     let payload = &plain[start..start + size];
@@ -157,6 +157,12 @@ mod tests {
     use super::*;
     use blowfish::cipher::BlockCipherEncrypt;
 
+    /// Known-answer digest of "abc" under KWallet's SHA-1 variant (hard-coded).
+    const KWALLET_SHA1_ABC: [u8; SHA1_LEN] = [
+        0x90, 0x06, 0xc2, 0x14, 0x16, 0xfb, 0x53, 0xf6, 0x80, 0x4f, 0x6e, 0x39, 0xb4, 0xaf, 0x9d,
+        0x4c, 0x4f, 0x3d, 0x51, 0x6e,
+    ];
+
     /// Encrypts like `BlowfishPersistHandler::write` + `CipherBlockChain::encrypt`.
     fn _encrypt(plain: &[u8], key: &[u8]) -> Vec<u8> {
         let cipher: Blowfish = Blowfish::new_from_slice(key).expect("key");
@@ -202,6 +208,7 @@ mod tests {
         sha1::block_api::compress(&mut state, &[block]);
         let expected: Vec<u8> = state.iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(kwallet_sha1(b"abc").to_vec(), expected);
+        assert_eq!(kwallet_sha1(b"abc"), KWALLET_SHA1_ABC);
         let standard = Sha1::digest(b"abc");
         assert_ne!(kwallet_sha1(b"abc").as_slice(), standard.as_slice());
     }

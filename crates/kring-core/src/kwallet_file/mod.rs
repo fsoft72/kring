@@ -16,9 +16,14 @@
 //! Only modern wallets (version 0.1, Blowfish CBC, PBKDF2-SHA512) are
 //! supported; other formats yield a clear `InvalidInput` naming the format.
 
+mod attributes;
 mod crypto;
 mod format;
+mod mapping;
 mod parse;
+
+pub use attributes::{FdoMeta, read_attributes};
+pub use mapping::to_incoming;
 
 pub use format::{WalletHeader, read_header};
 
