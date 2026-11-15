@@ -29,6 +29,9 @@ pub enum KringError {
     /// No Secret Service provider is available.
     #[error("no Secret Service provider available")]
     NoProvider,
+    /// Running the `gpg` binary failed (not started, timed out, failed or too much output).
+    #[error("gpg: {0}")]
+    Gpg(String),
 }
 
 /// Result alias using [`KringError`].

@@ -5,6 +5,7 @@ pub mod dev_guard;
 pub mod error;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake_store;
+pub mod gpg;
 pub mod keyring_file;
 pub mod kwallet_file;
 pub mod model;
