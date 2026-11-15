@@ -10,15 +10,15 @@ use kring_core::keyring_file::{
 };
 use kring_core::model::{CollectionId, CollectionInfo, SecretValue};
 use kring_core::transfer::consolidate::{
-    CollectionSnapshot, ConsolidationPlan, SkipReason, plan_consolidation, protected_reason,
+    ConsolidationPlan, SkipReason, plan_consolidation, snapshot_collections,
 };
 use kring_core::transfer::consolidate_apply::apply_consolidation;
-use kring_core::transfer::plan::{Choice, Existing};
-use kring_core::{KringError, Result, SecretStore};
+use kring_core::transfer::plan::Choice;
+use kring_core::{Result, SecretStore};
 
 use super::{
     ConsolidationSummary, Ctx, DEFAULT_ALIAS, Origin, PendingPlan, PlanState, REASON_CONSOLIDATE,
-    StepSummary, conflict_view, existing_of, invalid,
+    StepSummary, conflict_view, invalid,
 };
 use crate::worker::{
     BackupStep, CHANGE_WORDING, Event, WorkerConfig, backup_collections, load_items, refresh,
@@ -30,45 +30,6 @@ use crate::worker_offline::emit_backup;
 pub(crate) const MSG_ORPHANS_NOT_RETIRED: &str = "Orphan files not retired";
 /// Extension of keyring files.
 const KEYRING_EXTENSION: &str = "keyring";
-
-/// Reads every collection for planning a consolidation.
-///
-/// Locked collections, and protected ones that are not the target (login,
-/// session, aliases: never consolidated), are not read and become
-/// `items: None`; a collection that reports `Locked` while read does too.
-async fn snapshots<S: SecretStore>(
-    store: &S,
-    collections: &[CollectionInfo],
-    target: &CollectionId,
-) -> Result<Vec<CollectionSnapshot>> {
-    let mut out = Vec::with_capacity(collections.len());
-    for info in collections {
-        let skip = info.locked || (&info.id != target && protected_reason(&info.id).is_some());
-        let items = if skip {
-            None
-        } else {
-            match read_items(store, &info.id).await {
-                Ok(items) => Some(items),
-                Err(KringError::Locked(_)) => None,
-                Err(e) => return Err(e),
-            }
-        };
-        out.push(CollectionSnapshot {
-            info: info.clone(),
-            items,
-        });
-    }
-    Ok(out)
-}
-
-/// Reads all items of a collection with their secrets.
-async fn read_items<S: SecretStore>(store: &S, id: &CollectionId) -> Result<Vec<Existing>> {
-    let mut out = Vec::new();
-    for info in store.list_items(id).await? {
-        out.push(existing_of(store, info).await?);
-    }
-    Ok(out)
-}
 
 /// Returns the empty plaintext orphan files of the keyrings dir (fresh scan).
 ///
@@ -108,7 +69,7 @@ where
         return Ok(());
     }
     let collections = ctx.store.list_collections().await?;
-    let snapshots = snapshots(ctx.store, &collections, target).await?;
+    let snapshots = snapshot_collections(ctx.store, &collections, target).await?;
     let current_default = ctx.store.read_alias(DEFAULT_ALIAS).await?;
     let plan = plan_consolidation(&snapshots, target, current_default.as_ref())?;
     let orphan_files: Vec<String> = if include_orphan_files {

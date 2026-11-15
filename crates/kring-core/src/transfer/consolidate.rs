@@ -23,6 +23,7 @@
 
 use crate::error::{KringError, Result};
 use crate::model::{CollectionId, CollectionInfo, ItemId, LOGIN_COLLECTION_PATH};
+use crate::store::SecretStore;
 use crate::transfer::plan::{
     Action, Existing, Incoming, TransferPlan, TransferSource, plan_transfer,
 };
@@ -104,6 +105,55 @@ pub fn protected_reason(id: &CollectionId) -> Option<&'static str> {
         return Some("session");
     }
     None
+}
+
+/// Reads every collection of `collections` for planning a consolidation into `target`.
+///
+/// Locked collections, and protected ones that are not the target (login,
+/// session, aliases: never consolidated), are not read and become
+/// `items: None`; a collection that reports `Locked` while read does too.
+pub async fn snapshot_collections<S: SecretStore + ?Sized>(
+    store: &S,
+    collections: &[CollectionInfo],
+    target: &CollectionId,
+) -> Result<Vec<CollectionSnapshot>> {
+    let mut out = Vec::with_capacity(collections.len());
+    for info in collections {
+        let skip = info.locked || (&info.id != target && protected_reason(&info.id).is_some());
+        let items = if skip {
+            None
+        } else {
+            match read_existing(store, &info.id).await {
+                Ok(items) => Some(items),
+                Err(KringError::Locked(_)) => None,
+                Err(e) => return Err(e),
+            }
+        };
+        out.push(CollectionSnapshot {
+            info: info.clone(),
+            items,
+        });
+    }
+    Ok(out)
+}
+
+/// Reads all items of a collection with their secrets.
+async fn read_existing<S: SecretStore + ?Sized>(
+    store: &S,
+    id: &CollectionId,
+) -> Result<Vec<Existing>> {
+    let mut out = Vec::new();
+    for info in store.list_items(id).await? {
+        let secret = store.read_secret(&info.id).await?;
+        out.push(Existing {
+            id: info.id,
+            label: info.label,
+            attributes: info.attributes,
+            secret,
+            modified: info.modified,
+        });
+    }
+    Ok(out)
 }
 
 /// Plans the consolidation of `snapshots` into `target` (pure).
