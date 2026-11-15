@@ -242,6 +242,12 @@ chmod +x kring-0.1.0-x86_64
 ./kring-0.1.0-x86_64
 ```
 
+To release a new version run `scripts/release.sh 0.1.2` on a clean
+`master`: it sets the workspace version in `Cargo.toml` and `Cargo.lock`,
+commits `chore: release v0.1.2`, creates the tag `v0.1.2` and pushes branch
+and tag. The release workflow runs only for such tags (`--force` skips the
+"on master" and "clean working tree" checks).
+
 There is no static musl build: winit loads libwayland, libX11 and EGL/GL at
 runtime, which a static musl binary cannot do, so its window would never open.
 
