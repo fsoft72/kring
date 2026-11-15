@@ -150,6 +150,7 @@ fn dirs(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, WorkerConfig) {
         },
         keyrings_dir: keyrings.clone(),
         pam_dir: pam,
+        kwallet_dir: keyrings.join("kwalletd-unused"),
     };
     (dir, keyrings, config)
 }

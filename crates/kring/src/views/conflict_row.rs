@@ -160,10 +160,10 @@ fn _incoming_secret(state: &AppState, c: &ConflictView, offline_shown: bool) -> 
         let shown = state.transfer_secret(id).map(secret_display);
         return SideSecret::Live(id.clone(), shown);
     }
-    let Some(item) = state.offline_incoming(c) else {
+    let Some(secret) = state.offline_incoming_secret(c) else {
         return SideSecret::Unavailable(MSG_NOT_AVAILABLE);
     };
-    let shown = offline_shown.then(|| secret_display(&item.secret));
+    let shown = offline_shown.then(|| secret_display(secret));
     SideSecret::Offline(shown)
 }
 

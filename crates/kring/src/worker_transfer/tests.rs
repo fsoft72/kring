@@ -93,6 +93,7 @@ fn env(kind: ProviderKind) -> Env {
         },
         keyrings_dir: keyrings.clone(),
         pam_dir: pam,
+        kwallet_dir: keyrings.join("kwalletd-unused"),
     };
     let store = Arc::new(FakeStore::new());
     let main = store.add_collection("Main", "pw", false);
@@ -268,7 +269,10 @@ impl Env {
 /// Exhaustive on purpose: a new variant must be classified here.
 fn may_carry_secret(event: &Event) -> bool {
     match event {
-        Event::Secret(..) | Event::FileItems { .. } | Event::PassphraseNeeded(_) => true,
+        Event::Secret(..)
+        | Event::FileItems { .. }
+        | Event::WalletItems { .. }
+        | Event::PassphraseNeeded(_) => true,
         Event::Provider(_)
         | Event::ProviderUnavailable
         | Event::Pam(_)
@@ -281,6 +285,8 @@ fn may_carry_secret(event: &Event) -> bool {
         | Event::ImportDone(_)
         | Event::Backups(_)
         | Event::RestoreDone(_)
+        | Event::Wallets(_)
+        | Event::Notice(_)
         | Event::TransferPreview { .. }
         | Event::TransferDone(_)
         | Event::ConsolidationPreview { .. }

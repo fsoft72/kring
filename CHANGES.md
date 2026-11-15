@@ -87,3 +87,17 @@
   dialog with its fields and "Wrong passphrase, try again"; a successful automatic unlock shows "Used the
   remembered passphrase". Waiting operations without a dialog are dropped, a stopped worker fails the
   running operation, the quick Retire of the files list is disabled while an operation is open.
+- Plan 4 Task 4: worker commands for KWallet wallets (`crates/kring/src/worker_wallet.rs`).
+  `WorkerConfig.kwallet_dir` (default `$XDG_DATA_HOME/kwalletd`, `paths::kwallet_dir_from` / `kwallet_dir`).
+  `ScanWallets` -> `Event::Wallets` (name, path, size, modified, header, has_attributes and the suggested
+  import target: a collection labelled like the wallet, where the kwalletd6 shim looks). `OpenWallet` ->
+  `Event::WalletItems` (label, attributes, folder, key, kind, app entry flag and the secret; the only new
+  secret-bearing event). `PlanWalletImport` reuses the Plan 3 import path (direct apply + `ImportDone`
+  without conflicts, `TransferPreview` with `offline_index` into the wallet items otherwise).
+  `CreateWalletCollection` creates the keyring labelled like the wallet (master password gate). Names come
+  from a fresh scan only (regular `<name>.kwl` files); the wallet password is never echoed and a wrong one
+  is the error "Wrong wallet password". After a successful wallet import with a KWallet competitor on the
+  bus, `Event::Notice` (new, queued as a toast) says KWallet may still claim org.freedesktop.secrets.
+  `AppState` keeps wallets, the selected wallet and its items (`select_wallet`, `close_wallet`, cleared on
+  wallet change and rescan), and keeps the offline side of a wallet preview revealable only while that
+  wallet is open (`wallet_incoming`, `offline_incoming_secret`, used by the conflict row).

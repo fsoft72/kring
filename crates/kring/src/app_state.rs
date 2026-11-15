@@ -15,7 +15,9 @@ use kring_core::transfer::plan::TransferCounts;
 
 use crate::operation::{self, Operation};
 use crate::session_secret::SessionSecret;
-use crate::worker::{Command, ConflictView, ConsolidationSummary, Event};
+use crate::worker::{
+    Command, ConflictView, ConsolidationSummary, Event, OfflineItemView, WalletInfo,
+};
 use crate::worker_transfer::{MSG_ORPHANS_NOT_RETIRED, invalidates_plan};
 
 /// Maximum number of error messages kept.
@@ -168,6 +170,15 @@ pub struct AppState {
     pub pending_file_password: Option<String>,
     /// Command of the selected file sent without a password, resent with one when asked.
     pub pending_file_action: Option<FileAction>,
+    /// KWallet wallets of the KWallet directory (last scan).
+    pub wallets: Vec<WalletInfo>,
+    /// Name of the wallet being viewed.
+    pub selected_wallet: Option<String>,
+    /// Entries of the selected wallet; holds secrets, cleared on wallet
+    /// change and when leaving the KWallet area ([`AppState::close_wallet`]).
+    pub wallet_items: Vec<OfflineItemView>,
+    /// True once the entries of the selected wallet arrived (even zero).
+    pub wallet_opened: bool,
     /// Backups, newest first.
     pub backups: Vec<BackupInfo>,
     /// Outcome of the last import.
@@ -209,6 +220,9 @@ pub struct AppState {
     /// Keyring file of the last file import sent: its items in `file_items`
     /// back the offline side of the preview conflicts.
     import_file: Option<String>,
+    /// Wallet of the last wallet import sent: its entries in `wallet_items`
+    /// back the offline side of the preview conflicts while it is open.
+    import_wallet: Option<String>,
     /// Set when a backup was created or restored since the last listing.
     backups_stale: bool,
     /// Notices shown as toasts besides `status` (e.g. pruned backups).
@@ -307,6 +321,16 @@ impl AppState {
                 self.file_opened = true;
                 self.pending_file_action = None;
             }
+            Event::Wallets(v) => self._set_wallets(v),
+            Event::WalletItems { name, items } => {
+                if self.selected_wallet.as_ref() != Some(&name) {
+                    return;
+                }
+                self.wallet_items = items;
+                self.wallet_opened = true;
+                self._sync_wallet_reveal();
+            }
+            Event::Notice(text) => self.notices.push(text),
             Event::PasswordNeeded(name) => {
                 if self.selected_file.as_ref() == Some(&name) {
                     self.pending_file_password = Some(name);
@@ -339,6 +363,7 @@ impl AppState {
                     counts,
                     conflicts,
                 });
+                self._sync_wallet_reveal();
                 self.consolidation_preview = None;
                 self.consolidation_progress = None;
                 self.pending_apply_passphrases = None;
@@ -432,6 +457,56 @@ impl AppState {
             .is_some_and(|s| self.files.iter().any(|f| &f.name == s));
         if !exists {
             self.close_file();
+        }
+    }
+
+    /// Replaces the wallet list, closing a selected wallet that no longer exists.
+    fn _set_wallets(&mut self, wallets: Vec<WalletInfo>) {
+        self.wallets = wallets;
+        let exists = self
+            .selected_wallet
+            .as_ref()
+            .is_some_and(|s| self.wallets.iter().any(|w| &w.name == s));
+        if !exists {
+            self.close_wallet();
+        }
+    }
+
+    /// Selects a wallet, dropping the entries (and secrets) of the previous one.
+    pub fn select_wallet(&mut self, name: String) {
+        self.close_wallet();
+        self.selected_wallet = Some(name);
+    }
+
+    /// Closes the selected wallet and drops its entries and secrets (on
+    /// wallet change and when leaving the KWallet area); the offline side
+    /// of a wallet preview stops being revealable.
+    pub fn close_wallet(&mut self) {
+        self.selected_wallet = None;
+        self.wallet_items.clear();
+        self.wallet_opened = false;
+        self._sync_wallet_reveal();
+    }
+
+    /// Returns true when the entries of wallet `name` are open (selected and loaded).
+    fn _wallet_open(&self, name: &str) -> bool {
+        self.wallet_opened && self.selected_wallet.as_deref() == Some(name)
+    }
+
+    /// Makes the offline conflicts of a wallet import preview revealable
+    /// exactly while that wallet is open with its entries loaded.
+    fn _sync_wallet_reveal(&mut self) {
+        let Some(name) = self.import_wallet.clone() else {
+            return;
+        };
+        let open = self._wallet_open(&name);
+        let Some(preview) = &mut self.transfer_preview else {
+            return;
+        };
+        for c in &mut preview.conflicts {
+            if c.incoming_item.is_none() && c.offline_index.is_some() {
+                c.incoming_revealable = open;
+            }
         }
     }
 
@@ -633,8 +708,30 @@ impl AppState {
             .filter(|i| i.label == c.label_incoming)
     }
 
+    /// Returns the wallet entry backing the offline side of conflict `c` of
+    /// a wallet import, only while that wallet is open and the label matches.
+    pub fn wallet_incoming(&self, c: &ConflictView) -> Option<&OfflineItemView> {
+        let index = c.offline_index?;
+        let name = self.import_wallet.as_deref()?;
+        if c.incoming_item.is_some() || !self._wallet_open(name) {
+            return None;
+        }
+        self.wallet_items
+            .get(index)
+            .filter(|i| i.label == c.label_incoming)
+    }
+
+    /// Returns the secret of the offline side of conflict `c`: from the
+    /// imported keyring file or from the imported wallet, whichever backs it.
+    pub fn offline_incoming_secret(&self, c: &ConflictView) -> Option<&SecretValue> {
+        if let Some(item) = self.offline_incoming(c) {
+            return Some(&item.secret);
+        }
+        self.wallet_incoming(c).map(|i| &i.secret)
+    }
+
     /// Records what a sent command means for the transfer preview: an apply
-    /// in flight, or the keyring file being imported.
+    /// in flight, or the keyring file or wallet being imported.
     ///
     /// Any other command that drops the worker's pending plan also closes
     /// the consolidation preview (e.g. an Unlock from its shortcut), so a
@@ -648,6 +745,12 @@ impl AppState {
             }
             Command::ImportFile { name, .. } | Command::PlanFileImport { name, .. } => {
                 self.import_file = Some(name.clone());
+                self.import_wallet = None;
+                self.close_consolidation_preview();
+            }
+            Command::PlanWalletImport { name, .. } => {
+                self.import_wallet = Some(name.clone());
+                self.import_file = None;
                 self.close_consolidation_preview();
             }
             // A card asks for this secret: an older preview request of the
@@ -1703,6 +1806,128 @@ mod tests {
         c.label_incoming = "y".into();
         s.select_file("b".into());
         assert!(s.offline_incoming(&c).is_none(), "another file selected");
+    }
+
+    /// Builds a wallet info named `name`.
+    fn wallet(name: &str) -> WalletInfo {
+        WalletInfo {
+            name: name.into(),
+            path: format!("/w/{name}.kwl").into(),
+            size: 0,
+            modified: 0,
+            header: None,
+            has_attributes: false,
+            suggested_target: None,
+        }
+    }
+
+    /// Builds a wallet entry view labelled `label` with secret `secret`.
+    fn wallet_view(label: &str, secret: &str) -> OfflineItemView {
+        OfflineItemView {
+            label: label.into(),
+            attributes: Default::default(),
+            folder: "F".into(),
+            key: label.into(),
+            kind: crate::worker::WalletEntryKind::Password,
+            app_entry: false,
+            modified: 0,
+            secret: SecretValue::from_text(secret),
+        }
+    }
+
+    /// Builds the event of the entries of wallet `name`.
+    fn wallet_items(name: &str, labels: &[&str]) -> Event {
+        Event::WalletItems {
+            name: name.into(),
+            items: labels.iter().map(|l| wallet_view(l, "ws")).collect(),
+        }
+    }
+
+    /// Entries of another wallet are ignored; changing or closing the wallet
+    /// and a rescan without it drop the secrets.
+    #[test]
+    fn wallet_items_follow_selection() {
+        let mut s = AppState::default();
+        s.apply(Event::Wallets(vec![wallet("a"), wallet("b")]));
+        s.select_wallet("a".into());
+        s.apply(wallet_items("b", &["x"]));
+        assert!(s.wallet_items.is_empty() && !s.wallet_opened);
+        s.apply(wallet_items("a", &["x"]));
+        assert_eq!(s.wallet_items.len(), 1);
+        assert!(s.wallet_opened);
+        s.select_wallet("b".into());
+        assert!(s.wallet_items.is_empty() && !s.wallet_opened);
+        s.apply(wallet_items("b", &["y"]));
+        s.close_wallet();
+        assert!(s.wallet_items.is_empty());
+        assert_eq!(s.selected_wallet, None);
+        s.select_wallet("a".into());
+        s.apply(wallet_items("a", &["x"]));
+        s.apply(Event::Wallets(vec![wallet("b")]));
+        assert_eq!(s.selected_wallet, None, "vanished wallet closed");
+        assert!(s.wallet_items.is_empty());
+    }
+
+    /// The offline side of a wallet import preview is revealable only while
+    /// the imported wallet is open with its entries.
+    #[test]
+    fn wallet_preview_reveal_needs_open_wallet() {
+        let mut s = AppState::default();
+        s.apply(Event::Wallets(vec![wallet("a"), wallet("b")]));
+        let mut c = live_conflict("/c/t/1", "/unused");
+        c.incoming_item = None;
+        c.offline_index = Some(1);
+        c.label_incoming = "y".into();
+        let import = Command::PlanWalletImport {
+            name: "a".into(),
+            password: SecretValue::from_text("pw"),
+            target: CollectionId("/c/t".into()),
+        };
+        s.track_transfer_command(&import);
+        s.apply(preview_with(1, vec![c.clone()]));
+        let shown = |s: &AppState| s.transfer_preview.as_ref().unwrap().conflicts[0].clone();
+        assert!(!shown(&s).incoming_revealable, "wallet not open");
+        assert!(s.wallet_incoming(&shown(&s)).is_none());
+        s.select_wallet("a".into());
+        s.apply(wallet_items("a", &["x", "y"]));
+        assert!(shown(&s).incoming_revealable);
+        let secret = s
+            .offline_incoming_secret(&shown(&s))
+            .and_then(|v| v.as_text());
+        assert_eq!(secret, Some("ws"));
+        s.select_wallet("b".into());
+        s.apply(wallet_items("b", &["x", "y"]));
+        assert!(!shown(&s).incoming_revealable, "another wallet open");
+        assert!(s.offline_incoming_secret(&shown(&s)).is_none());
+        s.select_wallet("a".into());
+        s.apply(wallet_items("a", &["x", "y"]));
+        s.apply(preview_with(2, vec![c.clone()]));
+        assert!(
+            shown(&s).incoming_revealable,
+            "new preview of the open wallet"
+        );
+        s.close_wallet();
+        assert!(!shown(&s).incoming_revealable, "closed on area switch");
+        s.track_transfer_command(&Command::PlanFileImport {
+            name: "f".into(),
+            password: None,
+            target: CollectionId("/c/t".into()),
+        });
+        s.select_wallet("a".into());
+        s.apply(wallet_items("a", &["x", "y"]));
+        assert!(
+            s.wallet_incoming(&c).is_none(),
+            "a file import is not the wallet's"
+        );
+    }
+
+    /// A worker notice is queued as a toast, not as an error.
+    #[test]
+    fn notice_is_queued() {
+        let mut s = AppState::default();
+        s.apply(Event::Notice("KWallet is still running".into()));
+        assert_eq!(s.drain_notices(), ["KWallet is still running"]);
+        assert!(s.errors.is_empty());
     }
 
     /// The remembered passphrase never shows in the `Debug` output of the state.

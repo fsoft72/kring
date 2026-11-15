@@ -29,6 +29,8 @@ use kring_core::{KringError, MasterPasswordStore, SecretStore};
 use crate::worker_offline;
 use crate::worker_transfer::{self, PlanState};
 pub use crate::worker_transfer::{ConflictView, ConsolidationSummary, StepSummary};
+use crate::worker_wallet;
+pub use crate::worker_wallet::{OfflineItemView, WalletEntryKind, WalletInfo};
 
 /// Default PAM configuration directory.
 const PAM_DIR: &str = "/etc/pam.d";
@@ -184,6 +186,21 @@ pub enum Command {
     },
     /// Drop the pending plan.
     DiscardPlan,
+    /// Scan the KWallet directory for `*.kwl` wallets; answers with [`Event::Wallets`].
+    ScanWallets,
+    /// Decrypt wallet `name` and show its entries ([`Event::WalletItems`]).
+    /// A wrong password is an [`Event::Error`], never a passphrase request.
+    OpenWallet { name: String, password: SecretValue },
+    /// Plan importing wallet `name` into `target`, with the same rule as
+    /// [`Command::PlanFileImport`] (applied directly when there are no conflicts).
+    PlanWalletImport {
+        name: String,
+        password: SecretValue,
+        target: CollectionId,
+    },
+    /// Create a keyring labelled like wallet `name` (where the kwalletd6 shim
+    /// looks for the wallet), protected by `password`.
+    CreateWalletCollection { name: String, password: SecretValue },
 }
 
 /// A notification from the worker to the UI.
@@ -253,6 +270,16 @@ pub enum Event {
     ConsolidationProgress { done: usize, total: usize },
     /// A consolidation finished, with the orphan file retire report when one ran.
     ConsolidationDone(ConsolidationReport, Option<RetireBatchReport>),
+    /// KWallet wallets of the KWallet directory, sorted by name.
+    Wallets(Vec<WalletInfo>),
+    /// Entries of wallet `name` with their secrets (display only; the UI
+    /// drops them on wallet change and when leaving the KWallet area).
+    WalletItems {
+        name: String,
+        items: Vec<OfflineItemView>,
+    },
+    /// An informational notice shown as a toast (not an error).
+    Notice(String),
     /// An operation finished with a message.
     Done(String),
     /// An operation failed with a message.
@@ -274,6 +301,8 @@ pub struct WorkerConfig {
     pub keyrings_dir: PathBuf,
     /// PAM configuration directory.
     pub pam_dir: PathBuf,
+    /// Directory holding the KWallet wallets (`$XDG_DATA_HOME/kwalletd`).
+    pub kwallet_dir: PathBuf,
 }
 
 impl WorkerConfig {
@@ -286,6 +315,7 @@ impl WorkerConfig {
             },
             keyrings_dir: paths::keyrings_dir(),
             pam_dir: PathBuf::from(PAM_DIR),
+            kwallet_dir: paths::kwallet_dir(),
         }
     }
 }
@@ -646,7 +676,9 @@ pub(crate) fn gate<N: Fn()>(
         | Command::DeleteCollection { .. }
         | Command::RenameCollection { .. } => (true, false),
         Command::ChangePassword { .. } => (true, true),
-        Command::CreateCollection { .. } | Command::Unlock { .. } => (false, true),
+        Command::CreateCollection { .. }
+        | Command::CreateWalletCollection { .. }
+        | Command::Unlock { .. } => (false, true),
         _ => (false, false),
     };
     let allowed = match provider {
@@ -665,7 +697,8 @@ pub(crate) fn gate<N: Fn()>(
 ///
 /// Plans, imports and applies go to [`worker_transfer`]; any other command
 /// that may change keyring data drops the pending plan first. Offline
-/// commands (files, backups, archives) are routed to [`worker_offline`].
+/// commands (files, backups, archives) are routed to [`worker_offline`],
+/// KWallet commands to [`worker_wallet`].
 async fn handle<S, N>(
     out: &Emitter<N>,
     store: Option<&S>,
@@ -685,6 +718,9 @@ async fn handle<S, N>(
     }
     if worker_offline::is_offline(&cmd) {
         return worker_offline::handle(out, store, provider, config, cmd).await;
+    }
+    if worker_wallet::is_wallet(&cmd) {
+        return worker_wallet::handle(out, store, provider, config, plans, cmd).await;
     }
     let Some(store) = store else {
         return out.error(MSG_NO_PROVIDER);
@@ -839,7 +875,11 @@ where
         | Command::ApplyTransfer { .. }
         | Command::PlanConsolidation { .. }
         | Command::ApplyConsolidation { .. }
-        | Command::DiscardPlan => {
+        | Command::DiscardPlan
+        | Command::ScanWallets
+        | Command::OpenWallet { .. }
+        | Command::PlanWalletImport { .. }
+        | Command::CreateWalletCollection { .. } => {
             return Err(KringError::InvalidInput(
                 "Offline or transfer command sent to the store path".into(),
             ));

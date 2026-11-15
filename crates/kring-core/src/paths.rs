@@ -2,6 +2,9 @@
 
 use std::path::PathBuf;
 
+/// Directory of the KWallet wallets inside the data home (`ksecretd`, `kwalletd`).
+const KWALLET_DIR_NAME: &str = "kwalletd";
+
 /// Resolves the XDG data home from explicit values (pure, testable).
 ///
 /// Empty values are treated as unset, as the XDG spec requires.
@@ -25,6 +28,16 @@ pub fn keyrings_dir() -> PathBuf {
     data_home().join("keyrings")
 }
 
+/// Resolves the KWallet wallets directory from explicit values (pure, testable).
+pub fn kwallet_dir_from(xdg: Option<&str>, home: Option<&str>) -> PathBuf {
+    data_home_from(xdg, home).join(KWALLET_DIR_NAME)
+}
+
+/// Returns the KWallet wallets directory, `$XDG_DATA_HOME/kwalletd`.
+pub fn kwallet_dir() -> PathBuf {
+    data_home().join(KWALLET_DIR_NAME)
+}
+
 /// Returns the kring backups root directory.
 pub fn backups_dir() -> PathBuf {
     data_home().join("kring").join("backups")
@@ -40,6 +53,19 @@ mod tests {
         assert_eq!(
             data_home_from(Some("/x/data"), Some("/home/u")),
             PathBuf::from("/x/data")
+        );
+    }
+
+    /// The KWallet directory is `kwalletd` inside the data home, with the same fallbacks.
+    #[test]
+    fn kwallet_dir_in_data_home() {
+        assert_eq!(
+            kwallet_dir_from(Some("/x/data"), Some("/home/u")),
+            PathBuf::from("/x/data/kwalletd")
+        );
+        assert_eq!(
+            kwallet_dir_from(Some(""), Some("/home/u")),
+            PathBuf::from("/home/u/.local/share/kwalletd")
         );
     }
 

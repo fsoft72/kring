@@ -14,6 +14,8 @@
 //! backup, pure addition) and answered with [`Event::ImportDone`]; with
 //! conflicts they are answered with [`Event::TransferPreview`] and wait for
 //! [`Command::ApplyTransfer`]. Offline secrets stay in the pending plan.
+//! KWallet imports (`PlanWalletImport`, read in [`crate::worker_wallet`])
+//! follow the same rule through [`plan_wallet_import`].
 
 use kring_core::keyring_file::textual::OfflineItem;
 use kring_core::model::{CollectionId, CollectionInfo, ItemId, ItemInfo, SecretValue};
@@ -33,6 +35,7 @@ use crate::worker::{
     WorkerConfig, backup_collections, collection_of, load_items, refresh,
 };
 use crate::worker_offline::{read_file, resolve_file};
+use crate::worker_wallet::competitor_notice;
 
 /// Message for an apply whose plan is missing or was replaced.
 pub(crate) const MSG_STALE_PLAN: &str = "Plan is out of date, preview again";
@@ -66,9 +69,11 @@ pub struct ConflictView {
     pub default_choice: Choice,
     /// Live source item, revealed with `RevealSecret`; `None` for offline items.
     pub incoming_item: Option<ItemId>,
-    /// True when the UI can show the incoming secret: a live item, or an item
-    /// of a keyring file import (`AppState::file_items[offline_index]`).
-    /// Archive items are never revealable (their secrets stay in the worker).
+    /// True when the UI can show the incoming secret: a live item, an item
+    /// of a keyring file import (`AppState::file_items[offline_index]`) or
+    /// of a wallet import (`AppState::wallet_items[offline_index]`; the UI
+    /// keeps it true only while that wallet is open). Archive items are
+    /// never revealable (their secrets stay in the worker).
     pub incoming_revealable: bool,
     /// Target item, revealed with `RevealSecret`; `None` when it is only
     /// planned by an earlier consolidation step (see `existing_planned`).
@@ -76,7 +81,8 @@ pub struct ConflictView {
     /// True when the target side is an item an earlier consolidation step
     /// will create; it has no id yet and must never be revealed.
     pub existing_planned: bool,
-    /// Index of the incoming item in the imported keyring file (file imports only).
+    /// Index of the incoming item in the imported keyring file or in the
+    /// wallet items (file and wallet imports only).
     pub offline_index: Option<usize>,
 }
 
@@ -126,6 +132,8 @@ enum Origin {
     File,
     /// Items of an archive (only the worker holds them).
     Archive,
+    /// Entries of a KWallet wallet (the UI holds them in `AppState::wallet_items`).
+    Wallet,
 }
 
 /// A transfer plan held by the worker, with the secrets of its items.
@@ -215,6 +223,8 @@ pub(crate) fn invalidates_plan(cmd: &Command) -> bool {
             | Command::RevealSecret(_)
             | Command::ScanFiles
             | Command::OpenFile { .. }
+            | Command::ScanWallets
+            | Command::OpenWallet { .. }
             | Command::ListBackups
             | Command::ExportCollection { .. }
     )
@@ -308,7 +318,7 @@ where
             let Some((items, _)) = read_file(ctx.out, &info, password.as_ref()).await? else {
                 return Ok(());
             };
-            plan_import(ctx, plans, target, items, Origin::File).await
+            plan_import(ctx, plans, target, offline_incoming(items), Origin::File).await
         }
         Command::ImportArchive {
             path,
@@ -325,7 +335,7 @@ where
                 .into_iter()
                 .map(|e| e.item)
                 .collect();
-            plan_import(ctx, plans, target, items, Origin::Archive).await
+            plan_import(ctx, plans, target, offline_incoming(items), Origin::Archive).await
         }
         Command::ApplyTransfer {
             plan_id,
@@ -479,22 +489,41 @@ where
     Ok(())
 }
 
-/// Plans importing offline `items` into `target`: applies directly when there
-/// are no conflicts (copy, no backup), otherwise emits the preview.
-async fn plan_import<S, N>(
-    ctx: &Ctx<'_, S, N>,
+/// Plans importing the decrypted entries of a KWallet wallet into `target`
+/// (same rule as a keyring file import), reporting failures as [`Event::Error`].
+///
+/// The pending plan must already be cleared by the caller. A successful
+/// import (direct, or later through [`Command::ApplyTransfer`]) is followed
+/// by the KWallet competitor notice when one is running.
+pub(crate) async fn plan_wallet_import<S, N>(
+    out: &Emitter<N>,
+    store: &S,
+    provider: Option<&ProviderInfo>,
+    config: &WorkerConfig,
     plans: &mut PlanState,
     target: &CollectionId,
-    items: Vec<OfflineItem>,
-    origin: Origin,
-) -> Result<()>
-where
+    incoming: Vec<Incoming>,
+) where
     S: SecretStore,
     N: Fn(),
 {
-    let collections = ctx.store.list_collections().await?;
-    unlocked(&collections, target)?;
-    let incoming: Vec<Incoming> = items
+    let ctx = Ctx {
+        out,
+        store,
+        provider,
+        config,
+    };
+    if let Err(e) = plan_import(&ctx, plans, target, incoming, Origin::Wallet).await {
+        out.error(e.to_string());
+        if matches!(e, KringError::NotFound(_)) {
+            refresh(out, store).await;
+        }
+    }
+}
+
+/// Maps offline items to transfer items, `TransferSource::Offline(position)`.
+fn offline_incoming(items: Vec<OfflineItem>) -> Vec<Incoming> {
+    items
         .into_iter()
         .enumerate()
         .map(|(index, item)| Incoming {
@@ -505,7 +534,24 @@ where
             secret_missing: item.secret_missing,
             modified: item.modified,
         })
-        .collect();
+        .collect()
+}
+
+/// Plans importing offline `incoming` items into `target`: applies directly
+/// when there are no conflicts (copy, no backup), otherwise emits the preview.
+async fn plan_import<S, N>(
+    ctx: &Ctx<'_, S, N>,
+    plans: &mut PlanState,
+    target: &CollectionId,
+    incoming: Vec<Incoming>,
+    origin: Origin,
+) -> Result<()>
+where
+    S: SecretStore,
+    N: Fn(),
+{
+    let collections = ctx.store.list_collections().await?;
+    unlocked(&collections, target)?;
     let existing = target_existing(ctx.store, target, &incoming).await?;
     let plan = plan_transfer(&incoming, &existing);
     if plan.conflicts.is_empty() {
@@ -513,6 +559,9 @@ where
             apply_transfer(ctx.store, target, &incoming, &plan, &[], TransferMode::Copy).await?;
         ctx.out
             .emit(Event::ImportDone(import_report(&incoming, &plan, report)));
+        if origin == Origin::Wallet {
+            competitor_notice(ctx.out, ctx.provider);
+        }
         load_items(ctx.out, ctx.store, target).await;
         refresh(ctx.out, ctx.store).await;
         return Ok(());
@@ -595,8 +644,11 @@ fn conflict_view(conflict: &Conflict, incoming: &[Incoming], origin: Origin) -> 
         Some(TransferSource::Live(id)) => Some(id.clone()),
         _ => None,
     };
+    // File items are listed in plan order; wallet views are one per
+    // incoming item, so the incoming position is their index.
     let offline_index = match (origin, source) {
         (Origin::File, Some(TransferSource::Offline(index))) => Some(*index),
+        (Origin::Wallet, Some(TransferSource::Offline(_))) => Some(conflict.incoming),
         _ => None,
     };
     let existing_planned = conflict.existing.0.starts_with(PLANNED_ID_PREFIX);
@@ -714,6 +766,9 @@ where
     )
     .await?;
     ctx.out.emit(Event::TransferDone(report));
+    if job.origin == Origin::Wallet {
+        competitor_notice(ctx.out, ctx.provider);
+    }
     load_items(ctx.out, ctx.store, &job.target).await;
     if is_move {
         for source in &job.sources {
