@@ -2,7 +2,7 @@
 //!
 //! Field numbers follow GnuPG's `doc/DETAILS` (1-based): 1 record type, 2 validity,
 //! 3 key length, 4 algorithm, 5 key id, 6 creation date, 7 expiration date,
-//! 9 ownertrust (primary keys), 10 user id or fingerprint, 12 capabilities,
+//! 9 ownertrust (primary keys), 10 user id, fingerprint or keygrip, 12 capabilities,
 //! 15 token serial number (secret keys), 17 curve name. Dates are epoch seconds
 //! (`--fixed-list-mode`). Unknown records and malformed fields are ignored; parsing
 //! never panics.
@@ -98,6 +98,8 @@ pub struct GpgSubkey {
     pub expires: Option<u64>,
     /// Capabilities (field 12), e.g. `e` or `s`.
     pub capabilities: String,
+    /// Keygrip (from a `grp` record, needs `--with-keygrip`), empty when not listed.
+    pub keygrip: String,
 }
 
 /// A primary key with its user ids and subkeys.
@@ -129,9 +131,15 @@ pub struct GpgKey {
     pub secret: bool,
     /// True when the secret key or a secret subkey lives on a smartcard.
     pub card: bool,
+    /// True when the secret primary key itself is on disk: not an offline stub
+    /// (`#`) and not on a smartcard. Needed to export or re-protect the key.
+    pub primary_secret: bool,
+    /// Keygrip of the primary key (from a `grp` record), empty when not listed.
+    pub keygrip: String,
 }
 
-/// What the last `fpr` record belongs to.
+/// What the next `fpr` or `grp` record belongs to.
+#[derive(Clone, Copy)]
 enum FprTarget {
     /// The current primary key.
     Primary,
@@ -148,6 +156,7 @@ pub fn parse_listing(output: &[u8]) -> Vec<GpgKey> {
     let text = String::from_utf8_lossy(output);
     let mut keys: Vec<GpgKey> = Vec::new();
     let mut target = FprTarget::None;
+    let mut grp_target = FprTarget::None;
     for line in text.lines() {
         let fields: Vec<&str> = line.trim_end_matches('\r').split(':').collect();
         let field = |n: usize| fields.get(n - 1).copied().unwrap_or("");
@@ -155,10 +164,12 @@ pub fn parse_listing(output: &[u8]) -> Vec<GpgKey> {
             kind @ ("pub" | "sec") => {
                 keys.push(primary_from(&field, kind == "sec"));
                 target = FprTarget::Primary;
+                grp_target = FprTarget::Primary;
             }
             kind @ ("sub" | "ssb") => {
                 let Some(key) = keys.last_mut() else {
                     target = FprTarget::None;
+                    grp_target = FprTarget::None;
                     continue;
                 };
                 if kind == "ssb" {
@@ -167,8 +178,10 @@ pub fn parse_listing(output: &[u8]) -> Vec<GpgKey> {
                 }
                 key.subkeys.push(subkey_from(&field));
                 target = FprTarget::Subkey;
+                grp_target = FprTarget::Subkey;
             }
             "uid" => {
+                grp_target = FprTarget::None;
                 let Some(key) = keys.last_mut() else { continue };
                 key.uids.push(GpgUid {
                     uid: unescape(field(10)),
@@ -188,6 +201,20 @@ pub fn parse_listing(output: &[u8]) -> Vec<GpgKey> {
                     FprTarget::None => {}
                 }
                 target = FprTarget::None;
+            }
+            "grp" => {
+                let grip = field(10).to_ascii_uppercase();
+                let Some(key) = keys.last_mut() else { continue };
+                match grp_target {
+                    FprTarget::Primary => key.keygrip = grip,
+                    FprTarget::Subkey => {
+                        if let Some(sub) = key.subkeys.last_mut() {
+                            sub.keygrip = grip;
+                        }
+                    }
+                    FprTarget::None => {}
+                }
+                grp_target = FprTarget::None;
             }
             _ => {}
         }
@@ -212,6 +239,8 @@ fn primary_from<'a>(field: &dyn Fn(usize) -> &'a str, is_secret: bool) -> GpgKey
         subkeys: Vec::new(),
         secret: is_secret && secret_available(field(15)),
         card: is_secret && on_card(field(15)),
+        primary_secret: is_secret && on_disk(field(15)),
+        keygrip: String::new(),
     }
 }
 
@@ -224,6 +253,7 @@ fn subkey_from<'a>(field: &dyn Fn(usize) -> &'a str) -> GpgSubkey {
         created: field(6).parse().unwrap_or(0),
         expires: expiry(field(7)),
         capabilities: field(12).to_string(),
+        keygrip: String::new(),
     }
 }
 
@@ -232,6 +262,11 @@ fn subkey_from<'a>(field: &dyn Fn(usize) -> &'a str) -> GpgSubkey {
 /// An empty field (older GnuPG) counts as available; a stub (`#`) does not.
 fn secret_available(serial: &str) -> bool {
     serial != SECRET_STUB
+}
+
+/// True when the secret key is stored on disk (`+`, or empty for older GnuPG).
+fn on_disk(serial: &str) -> bool {
+    serial.is_empty() || serial == SECRET_AVAILABLE
 }
 
 /// True when the serial field names a smartcard.
@@ -249,27 +284,55 @@ fn flag(field: &str) -> char {
     field.chars().next().unwrap_or(NO_FLAG)
 }
 
-/// Undoes GnuPG's C-style `\xNN` escaping of colon listing strings.
+/// Undoes GnuPG's escaping of colon listing strings.
 ///
-/// The bytes are decoded as UTF-8 (lossy); a malformed escape is kept verbatim.
+/// GnuPG writes `\\`, `\n`, `\r`, `\f`, `\v`, `\b`, `\0` and `\xNN` (exactly two
+/// hex digits) for special bytes. The result is decoded as UTF-8 (lossy); a
+/// malformed or unknown escape is kept verbatim.
 fn unescape(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        let escaped = bytes.get(i..i + 4).and_then(|chunk| {
-            let hex = chunk.strip_prefix(b"\\x")?;
-            u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()
-        });
-        if let Some(byte) = escaped {
-            out.push(byte);
-            i += 4;
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
             continue;
         }
-        out.push(bytes[i]);
-        i += 1;
+        let Some((byte, len)) = escape_at(&bytes[i..]) else {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        };
+        out.push(byte);
+        i += len;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decodes the escape at the start of `rest` (which starts with a backslash).
+///
+/// Returns the byte and the length of the escape, or `None` when malformed.
+fn escape_at(rest: &[u8]) -> Option<(u8, usize)> {
+    let byte = match rest.get(1)? {
+        b'\\' => b'\\',
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b'f' => 0x0c,
+        b'v' => 0x0b,
+        b'b' => 0x08,
+        b'0' => 0,
+        b'x' => {
+            let hex = rest.get(2..4)?;
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            let hex = std::str::from_utf8(hex).ok()?;
+            return Some((u8::from_str_radix(hex, 16).ok()?, 4));
+        }
+        _ => return None,
+    };
+    Some((byte, 2))
 }
 
 #[cfg(test)]
@@ -280,6 +343,13 @@ mod tests {
     const LIST_KEYS: &[u8] = include_bytes!("../../tests/fixtures/gpg/list-keys.txt");
     /// Secret listing captured from the same home directory.
     const LIST_SECRET_KEYS: &[u8] = include_bytes!("../../tests/fixtures/gpg/list-secret-keys.txt");
+
+    /// Secret listing of a key whose primary secret is an offline stub.
+    const LIST_SECRET_KEYS_STUB: &[u8] =
+        include_bytes!("../../tests/fixtures/gpg/list-secret-keys-stub.txt");
+
+    /// Fingerprint of the stub fixture key.
+    const STUB_FPR: &str = "0878172F13BA3CE341387F9A2477E871320A5AC9";
 
     /// Fingerprint of the Ed25519 fixture key.
     const ED_FPR: &str = "F304378CE8CEEF63BB59F93CEF2CA8C2F6A348DC";
@@ -321,6 +391,7 @@ mod tests {
                 created: 1794761568,
                 expires: None,
                 capabilities: "e".into(),
+                keygrip: String::new(),
             }]
         );
 
@@ -394,6 +465,83 @@ mod tests {
         assert_eq!(unescape(r"bad\xzz"), r"bad\xzz");
         assert_eq!(unescape(r"end\x3"), r"end\x3");
         assert_eq!(unescape(""), "");
+    }
+
+    /// GnuPG's two-character escapes are decoded; `\x` needs exactly two hex digits.
+    #[test]
+    fn unescape_two_char_escapes_and_strict_hex() {
+        assert_eq!(
+            unescape(r"a\nb\rc\fd\ve\bf\0g"),
+            "a\nb\rc\x0cd\x0be\x08f\0g"
+        );
+        assert_eq!(unescape(r"back\\slash"), "back\\slash");
+        assert_eq!(
+            unescape(r"\\x3a"),
+            r"\x3a",
+            "an escaped backslash is not an escape"
+        );
+        assert_eq!(
+            unescape(r"sign\x+f"),
+            r"sign\x+f",
+            "a sign is not a hex digit"
+        );
+        assert_eq!(unescape(r"sign\x-1"), r"sign\x-1");
+        assert_eq!(unescape(r"unknown\q"), r"unknown\q");
+        assert_eq!(unescape("trailing\\"), "trailing\\");
+    }
+
+    /// The primary secret is usable only when on disk: not a stub, not on a card.
+    #[test]
+    fn primary_secret_state() {
+        let secret = parse_listing(LIST_SECRET_KEYS);
+        assert!(secret[0].primary_secret);
+
+        let stub = parse_listing(LIST_SECRET_KEYS_STUB);
+        assert_eq!(stub.len(), 1);
+        assert_eq!(stub[0].fingerprint, STUB_FPR);
+        assert!(!stub[0].primary_secret, "'#' marks an offline stub");
+        assert!(stub[0].secret, "the subkey secret is available");
+        assert!(!stub[0].card);
+
+        let card = parse_listing(
+            b"sec:u:255:22:AAAA:1:::u:::scESC:::D2760001240100000006012345670000::ed25519:::0:\n\
+              fpr:::::::::AAAA:\n",
+        );
+        assert!(card[0].card);
+        assert!(card[0].secret);
+        assert!(
+            !card[0].primary_secret,
+            "a card key cannot be exported or re-protected"
+        );
+
+        let public = parse_listing(LIST_KEYS);
+        assert!(public.iter().all(|k| !k.primary_secret));
+    }
+
+    /// Keygrips (`grp` records) are attached to the key or subkey they follow.
+    #[test]
+    fn keygrips() {
+        let stub = parse_listing(LIST_SECRET_KEYS_STUB);
+        assert_eq!(stub[0].keygrip, "1F4C3A1219A83F7B6A22E8F0CC0B5A1512721A4E");
+        assert_eq!(
+            stub[0].subkeys[0].keygrip,
+            "D53F02958A15792DF5DF35FB8348B0BE2E27059C"
+        );
+        let secret = parse_listing(LIST_SECRET_KEYS);
+        assert_eq!(
+            secret[0].keygrip,
+            "B9A11E4A00C444B0D89A320F7B595C89EAF50E8B"
+        );
+        assert_eq!(
+            secret[0].subkeys[0].keygrip,
+            "2BA1D6EDFE1C42184D3471E98668E63C196E8B81"
+        );
+        assert!(
+            parse_listing(LIST_KEYS)[0].keygrip.is_empty(),
+            "no grp records"
+        );
+        let orphan = parse_listing(b"grp:::::::::AAAA:\npub:u:1:1:K:1::::::sc:\nfpr:::::::::FF:\n");
+        assert!(orphan[0].keygrip.is_empty());
     }
 
     /// Records before any key, unknown records, CRLF and junk are ignored.

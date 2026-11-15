@@ -46,8 +46,10 @@ impl Drop for TempGnupgHome {
 }
 
 /// Runs `gpgconf --homedir <dir> --kill all` scoped to `dir`.
+///
+/// Failures cannot fail a test from `Drop`, so they are reported on stderr.
 fn kill_daemons(gpgconf: &Path, dir: &Path) {
-    let _ = Command::new(gpgconf)
+    let status = Command::new(gpgconf)
         .arg("--homedir")
         .arg(dir)
         .args(["--kill", "all"])
@@ -56,6 +58,19 @@ fn kill_daemons(gpgconf: &Path, dir: &Path) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "WARNING: {} --kill all for {} exited with {s}",
+            gpgconf.display(),
+            dir.display()
+        ),
+        Err(e) => eprintln!(
+            "WARNING: cannot run {} to stop the daemons of {}: {e}",
+            gpgconf.display(),
+            dir.display()
+        ),
+    }
 }
 
 /// A generated key is listed with its secret; its public export imported elsewhere is not.
@@ -117,7 +132,12 @@ fn generate_list_export_import() {
     };
     let imported = other
         .runner
-        .run(["--import"], Some(&export.stdout), None, TIMEOUT_DEFAULT)
+        .run(
+            ["--import"],
+            Some(&export.stdout[..]),
+            None,
+            TIMEOUT_DEFAULT,
+        )
         .unwrap();
     assert!(imported.success(), "{}", imported.stderr_text());
     assert!(imported.has_status("IMPORT_OK"));
@@ -137,8 +157,9 @@ fn listing_in_a_missing_home_fails() {
         return;
     };
     let missing = home.dir.path().join("absent");
-    let runner = home.runner.clone().with_homedir(missing);
+    let runner = home.runner.clone().with_homedir(missing.clone());
     let r = list_keys(&runner);
+    kill_daemons(&home.runner.gpg().with_file_name("gpgconf"), &missing);
     assert!(
         matches!(&r, Err(KringError::Gpg(m)) if m.starts_with("--list-keys failed")),
         "{r:?}"

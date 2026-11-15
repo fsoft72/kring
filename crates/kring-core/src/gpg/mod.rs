@@ -9,18 +9,21 @@ mod runner;
 
 pub use colons::{GpgAlgorithm, GpgKey, GpgSubkey, GpgUid, parse_listing};
 pub use runner::{
-    GpgOutput, GpgRunner, MAX_OUTPUT, MSG_GPG_NOT_FOUND, MSG_PASSPHRASE_NEWLINE, TIMEOUT_DEFAULT,
-    TIMEOUT_KEYGEN,
+    GPG_CONNECT_AGENT, GpgOutput, GpgRunner, MAX_OUTPUT, MSG_GPG_NOT_FOUND, MSG_PASSPHRASE_NEWLINE,
+    Reply, TIMEOUT_DEFAULT, TIMEOUT_KEYGEN,
 };
+
+use zeroize::Zeroizing;
 
 use crate::error::{KringError, Result};
 
 /// Options of every colon listing.
-const LIST_OPTIONS: [&str; 4] = [
+const LIST_OPTIONS: [&str; 5] = [
     "--with-colons",
     "--fixed-list-mode",
     "--with-fingerprint",
     "--with-subkey-fingerprint",
+    "--with-keygrip",
 ];
 
 /// Lists all public keys, with `secret`/`card` taken from the secret key listing.
@@ -33,7 +36,7 @@ pub fn list_keys(runner: &GpgRunner) -> Result<Vec<GpgKey>> {
 }
 
 /// Runs one colon listing command and returns its stdout.
-fn listing(runner: &GpgRunner, command: &str) -> Result<Vec<u8>> {
+fn listing(runner: &GpgRunner, command: &str) -> Result<Zeroizing<Vec<u8>>> {
     let mut args: Vec<&str> = LIST_OPTIONS.to_vec();
     args.push(command);
     let out = runner.run(args, None, None, TIMEOUT_DEFAULT)?;
@@ -48,12 +51,15 @@ fn listing(runner: &GpgRunner, command: &str) -> Result<Vec<u8>> {
 }
 
 /// Marks public keys that have a secret counterpart and appends secret-only keys.
+///
+/// `secret`, `card` and `primary_secret` come from the secret listing.
 fn merge(mut public: Vec<GpgKey>, secret: Vec<GpgKey>) -> Vec<GpgKey> {
     for sec in secret {
         match public.iter_mut().find(|k| k.fingerprint == sec.fingerprint) {
             Some(key) => {
                 key.secret = sec.secret;
                 key.card = sec.card;
+                key.primary_secret = sec.primary_secret;
             }
             None => public.push(sec),
         }
@@ -76,7 +82,9 @@ mod tests {
         let keys = merge(parse_listing(LIST_KEYS), parse_listing(LIST_SECRET_KEYS));
         assert_eq!(keys.len(), 2);
         assert!(keys[0].secret, "ed25519 key has its secret");
+        assert!(keys[0].primary_secret, "including the primary secret");
         assert!(!keys[1].secret, "rsa key is public only");
+        assert!(!keys[1].primary_secret);
         assert_eq!(keys[0].uids.len(), 1, "public uids are kept");
     }
 

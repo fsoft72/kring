@@ -20,3 +20,8 @@ gpgconf --homedir "$H" --kill all; rm -rf "$H"
 - `list-keys.txt`: Ed25519 primary (`scESC`, no expiry) with a cv25519 encryption subkey, and an
   RSA 2048 key (`scSC`, expires 2030-01-01) whose uid contains an escaped colon (`\x3a`).
 - `list-secret-keys.txt`: only the Ed25519 key and its subkey (secret available, `+` in field 15).
+
+`list-secret-keys-stub.txt` (with `--with-keygrip`): a `default` key generated in a second
+throwaway home with passphrase `fixture-pw`, exported with `--export-secret-subkeys` and imported
+into a third throwaway home, so its primary secret is an offline stub (`#` in field 15) while the
+cv25519 subkey secret is available (`+`). Both homes had their agents killed and were removed.

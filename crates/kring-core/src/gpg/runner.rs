@@ -3,10 +3,16 @@
 //! Every invocation gets `--batch --no-tty --pinentry-mode loopback --status-fd 4`, so
 //! no pinentry window ever appears. A passphrase is written to a dedicated pipe that
 //! the child sees as fd 3 (`--passphrase-fd 3`); it never appears in argv or the
-//! environment. stdout, stderr and the status lines are each capped at
-//! [`MAX_OUTPUT`]; the child is killed when it runs past its timeout.
+//! environment. [`GpgRunner::run_interactive`] instead answers gpg's prompts over
+//! `--command-fd 0` while it runs. stdout, stderr and the status lines are each
+//! capped at [`MAX_OUTPUT`]; the child is killed when it runs past its timeout.
+//!
+//! Captured bytes live in zeroizing buffers that are moved to a larger zeroizing
+//! buffer before they would reallocate, so no stale copy is left on the heap. What
+//! remains outside kring's control: the kernel pipe buffers and gpg's own memory.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
@@ -15,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{KringError, Result};
 use crate::model::SecretValue;
@@ -35,11 +41,17 @@ pub const MSG_GPG_NOT_FOUND: &str = "GnuPG (gpg) was not found in PATH: install 
 /// Error message for a passphrase gpg cannot read as one line.
 pub const MSG_PASSPHRASE_NEWLINE: &str = "The passphrase must not contain a line break";
 
+/// Name of the agent client binary, looked up next to `gpg`.
+pub const GPG_CONNECT_AGENT: &str = "gpg-connect-agent";
+
 /// File descriptor number the child reads the passphrase from.
 const PASSPHRASE_FD: RawFd = 3;
 
 /// File descriptor number the child writes status lines to.
 const STATUS_FD: RawFd = 4;
+
+/// File descriptor number gpg reads prompt answers from in interactive mode (stdin).
+const COMMAND_FD: RawFd = 0;
 
 /// Lowest fd used to park pipe ends in the child before moving them to 3 and 4.
 const PARK_FD_MIN: RawFd = 10;
@@ -53,20 +65,42 @@ const READ_CHUNK: usize = 64 * 1024;
 /// Replacement for passphrase bytes found in stderr or status output.
 const REDACTED: &[u8] = b"<redacted>";
 
+/// Secrets shorter than this are not redacted (it would mangle unrelated text and
+/// reveal the secret by the pattern of replacements).
+const MIN_REDACT_LEN: usize = 4;
+
 /// Prefix of a GnuPG status line.
 const STATUS_PREFIX: &str = "[GNUPG:] ";
 
+/// Index of the status fd in the reader array of [`pump`].
+const STATUS: usize = 2;
+/// Index of stdin in the writer array of [`pump`].
+const STDIN: usize = 0;
+/// Index of the passphrase pipe in the writer array of [`pump`].
+const PASS: usize = 1;
+
 /// Captured result of one `gpg` invocation.
-#[derive(Debug)]
 pub struct GpgOutput {
     /// Exit status of the child.
     pub status: ExitStatus,
-    /// Everything written to stdout.
-    pub stdout: Vec<u8>,
+    /// Everything written to stdout (may be secret key material, zeroized on drop).
+    pub stdout: Zeroizing<Vec<u8>>,
     /// Everything written to stderr (passphrase bytes redacted).
     pub stderr: Vec<u8>,
     /// Everything written to the status fd (passphrase bytes redacted).
     pub status_lines: Vec<u8>,
+}
+
+impl fmt::Debug for GpgOutput {
+    /// Shows the exit status, stderr and status lines, but only the length of stdout.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GpgOutput")
+            .field("status", &self.status)
+            .field("stdout", &format_args!("<{} bytes>", self.stdout.len()))
+            .field("stderr", &String::from_utf8_lossy(&self.stderr))
+            .field("status_lines", &String::from_utf8_lossy(&self.status_lines))
+            .finish()
+    }
 }
 
 impl GpgOutput {
@@ -77,16 +111,36 @@ impl GpgOutput {
 
     /// True when a status line with `keyword` (e.g. `BAD_PASSPHRASE`) was written.
     pub fn has_status(&self, keyword: &str) -> bool {
+        !self.status_args(keyword).is_empty()
+    }
+
+    /// The arguments (text after the keyword) of every status line with `keyword`.
+    pub fn status_args(&self, keyword: &str) -> Vec<String> {
         String::from_utf8_lossy(&self.status_lines)
             .lines()
             .filter_map(|l| l.strip_prefix(STATUS_PREFIX))
-            .any(|l| l.split(' ').next() == Some(keyword))
+            .filter_map(|l| match l.split_once(' ') {
+                Some((k, rest)) if k == keyword => Some(rest.to_string()),
+                None if l == keyword => Some(String::new()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// stderr as trimmed text (lossy UTF-8).
     pub fn stderr_text(&self) -> String {
         String::from_utf8_lossy(&self.stderr).trim().to_string()
     }
+}
+
+/// What to do with a status line in [`GpgRunner::run_interactive`].
+pub enum Reply<'a> {
+    /// Nothing: keep reading.
+    Ignore,
+    /// Write this passphrase (and a newline) to gpg's command fd.
+    Answer(&'a SecretValue),
+    /// Close the command fd, so gpg's pending prompt fails.
+    Close,
 }
 
 /// Location of the `gpg` binary and the GnuPG home directory to use.
@@ -96,6 +150,22 @@ pub struct GpgRunner {
     gpg: PathBuf,
     /// Home directory (`--homedir` and `GNUPGHOME`); `None` uses gpg's default.
     homedir: Option<PathBuf>,
+}
+
+/// One child process to run and feed.
+struct Invocation<'r, 'a> {
+    /// Program to run.
+    program: PathBuf,
+    /// Complete argument list.
+    args: Vec<OsString>,
+    /// Bytes fed to stdin, which is closed afterwards.
+    stdin: Option<&'r [u8]>,
+    /// Passphrase fed to fd 3.
+    passphrase: Option<&'r SecretValue>,
+    /// Prompt handler; stdin then stays open as the command channel.
+    responder: Option<&'r mut dyn FnMut(&str) -> Reply<'a>>,
+    /// Time after which the child is killed.
+    timeout: Duration,
 }
 
 impl GpgRunner {
@@ -162,11 +232,96 @@ impl GpgRunner {
         if passphrase.is_some_and(|p| p.as_bytes().contains(&b'\n')) {
             return Err(KringError::InvalidInput(MSG_PASSPHRASE_NEWLINE.into()));
         }
-        let mut cmd = Command::new(&self.gpg);
-        cmd.args(self.fixed_args(passphrase.is_some()))
-            .args(args)
+        let mut full = self.fixed_args(passphrase.is_some());
+        full.extend(args.into_iter().map(|a| a.as_ref().to_os_string()));
+        self.execute(Invocation {
+            program: self.gpg.clone(),
+            args: full,
+            stdin,
+            passphrase,
+            responder: None,
+            timeout,
+        })
+    }
+
+    /// Runs gpg with `--command-fd 0` and answers its prompts while it runs.
+    ///
+    /// `responder` sees every status line (without the `[GNUPG:] ` prefix) as it
+    /// arrives and decides whether to answer it with a passphrase, ignore it or
+    /// close the command fd. Answers are written with a trailing newline and are
+    /// redacted from stderr and the status lines. An answer containing a line
+    /// break stops gpg with `MSG_PASSPHRASE_NEWLINE`.
+    pub fn run_interactive<'a, I, S>(
+        &self,
+        args: I,
+        responder: &mut dyn FnMut(&str) -> Reply<'a>,
+        timeout: Duration,
+    ) -> Result<GpgOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut full = self.fixed_args(false);
+        full.push("--command-fd".into());
+        full.push(COMMAND_FD.to_string().into());
+        full.extend(args.into_iter().map(|a| a.as_ref().to_os_string()));
+        self.execute(Invocation {
+            program: self.gpg.clone(),
+            args: full,
+            stdin: None,
+            passphrase: None,
+            responder: Some(responder),
+            timeout,
+        })
+    }
+
+    /// Sends `commands` to gpg-agent with `gpg-connect-agent` (found next to `gpg`).
+    ///
+    /// The tool gets the same home directory as gpg; the commands are followed by
+    /// `/bye`. Use only for commands without secrets (e.g. `KEYINFO --list`).
+    pub fn agent_commands(&self, commands: &[&str], timeout: Duration) -> Result<GpgOutput> {
+        let program = self.gpg.with_file_name(GPG_CONNECT_AGENT);
+        if !is_executable(&program) {
+            return Err(KringError::NotFound(format!(
+                "{GPG_CONNECT_AGENT} was not found next to {}",
+                self.gpg.display()
+            )));
+        }
+        let mut args: Vec<OsString> = Vec::new();
+        if let Some(dir) = &self.homedir {
+            args.push("--homedir".into());
+            args.push(dir.into());
+        }
+        args.extend(commands.iter().map(OsString::from));
+        args.push("/bye".into());
+        self.execute(Invocation {
+            program,
+            args,
+            stdin: None,
+            passphrase: None,
+            responder: None,
+            timeout,
+        })
+    }
+
+    /// Spawns one child, moves data until it is done and collects its output.
+    ///
+    /// The program is checked up front: the child moves pipes onto fds 3 and 4,
+    /// which may be where the standard library keeps its exec-error pipe, so a
+    /// failing `exec` would otherwise look like a child that exited at once.
+    fn execute(&self, inv: Invocation<'_, '_>) -> Result<GpgOutput> {
+        if !is_executable(&inv.program) {
+            let e = io::Error::from(io::ErrorKind::NotFound);
+            return Err(KringError::Gpg(format!(
+                "cannot start {}: {e}",
+                inv.program.display()
+            )));
+        }
+        let interactive = inv.responder.is_some();
+        let mut cmd = Command::new(&inv.program);
+        cmd.args(&inv.args)
             .env_remove("GPG_AGENT_INFO")
-            .stdin(if stdin.is_some() {
+            .stdin(if inv.stdin.is_some() || interactive {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -178,7 +333,7 @@ impl GpgRunner {
         }
 
         let (status_read, status_write) = pipe_cloexec().map_err(|e| self.error("pipe", e))?;
-        let pass_pipe = match passphrase {
+        let pass_pipe = match inv.passphrase {
             Some(_) => Some(pipe_cloexec().map_err(|e| self.error("pipe", e))?),
             None => None,
         };
@@ -193,44 +348,54 @@ impl GpgRunner {
         drop(status_write);
         let pass_write = pass_pipe.map(|(_, write)| write);
 
-        let mut line = Zeroizing::new(Vec::new());
-        if let Some(p) = passphrase {
-            line.extend_from_slice(p.as_bytes());
-            line.push(b'\n');
-        }
-        let streams = Streams {
-            stdout: child.stdout.take().map(OwnedFd::from),
-            stderr: child.stderr.take().map(OwnedFd::from),
-            status: Some(status_read),
-            stdin: child.stdin.take().map(OwnedFd::from),
-            passphrase: pass_write,
-        };
-        let deadline = Instant::now() + timeout;
-        let captured = match pump(
-            streams,
-            stdin.unwrap_or_default(),
-            &line,
+        let mut stdin_data = Zeroizing::new(Vec::new());
+        append_zeroizing(&mut stdin_data, inv.stdin.unwrap_or_default());
+        let readers = [
+            Reader::new(child.stdout.take().map(OwnedFd::from)),
+            Reader::new(child.stderr.take().map(OwnedFd::from)),
+            Reader::new(Some(status_read)),
+        ];
+        let writers = [
+            Writer {
+                fd: child.stdin.take().map(OwnedFd::from),
+                data: stdin_data,
+                written: 0,
+                keep_open: interactive,
+            },
+            Writer {
+                fd: pass_write,
+                data: inv.passphrase.map(passphrase_line).unwrap_or_default(),
+                written: 0,
+                keep_open: false,
+            },
+        ];
+        let mut secrets: Vec<&SecretValue> = inv.passphrase.into_iter().collect();
+        let mut answered: Vec<&SecretValue> = Vec::new();
+        let deadline = Instant::now() + inv.timeout;
+        let pumped = pump(
+            readers,
+            writers,
+            inv.responder,
+            &mut answered,
             &mut child,
             deadline,
-        ) {
-            Ok(captured) => captured,
+        );
+        let [stdout, stderr, status_lines] = match pumped {
+            Ok(buffers) => buffers,
             Err(e) => {
                 kill(&mut child);
                 return Err(e);
             }
         };
         let status = wait_until(&mut child, deadline)?;
-        let mut output = GpgOutput {
+        secrets.extend(answered);
+        let secret_bytes: Vec<&[u8]> = secrets.iter().map(|s| s.as_bytes()).collect();
+        Ok(GpgOutput {
             status,
-            stdout: captured.stdout,
-            stderr: captured.stderr,
-            status_lines: captured.status,
-        };
-        if let Some(p) = passphrase {
-            redact(&mut output.stderr, p.as_bytes());
-            redact(&mut output.status_lines, p.as_bytes());
-        }
-        Ok(output)
+            stdout,
+            stderr: redact(&stderr, &secret_bytes),
+            status_lines: redact(&status_lines, &secret_bytes),
+        })
     }
 
     /// Options passed before the caller's arguments.
@@ -256,6 +421,29 @@ impl GpgRunner {
     fn error(&self, what: &str, e: io::Error) -> KringError {
         KringError::Gpg(format!("cannot {what} {}: {e}", self.gpg.display()))
     }
+}
+
+/// The passphrase plus a newline, in a buffer allocated once at its final size.
+fn passphrase_line(passphrase: &SecretValue) -> Zeroizing<Vec<u8>> {
+    let bytes = passphrase.as_bytes();
+    let mut line = Zeroizing::new(Vec::with_capacity(bytes.len() + 1));
+    line.extend_from_slice(bytes);
+    line.push(b'\n');
+    line
+}
+
+/// Appends `data` to `buf`, moving to a larger zeroizing buffer instead of reallocating.
+///
+/// A plain `extend` could reallocate and free the old block without wiping it; here
+/// the old buffer is dropped as a [`Zeroizing`] and thus overwritten.
+fn append_zeroizing(buf: &mut Zeroizing<Vec<u8>>, data: &[u8]) {
+    if buf.capacity() - buf.len() < data.len() {
+        let needed = buf.len() + data.len();
+        let mut grown = Zeroizing::new(Vec::with_capacity(needed.max(buf.capacity() * 2)));
+        grown.extend_from_slice(buf);
+        *buf = grown;
+    }
+    buf.extend_from_slice(data);
 }
 
 /// True when `path` is a regular file with an execute bit.
@@ -309,107 +497,84 @@ fn install_child_fds(passphrase: Option<RawFd>, status: RawFd) -> io::Result<()>
     Ok(())
 }
 
-/// Parent ends of the child's pipes.
-struct Streams {
-    /// Child stdout (read).
-    stdout: Option<OwnedFd>,
-    /// Child stderr (read).
-    stderr: Option<OwnedFd>,
-    /// Status fd (read).
-    status: Option<OwnedFd>,
-    /// Child stdin (write).
-    stdin: Option<OwnedFd>,
-    /// Passphrase pipe (write).
-    passphrase: Option<OwnedFd>,
-}
-
-/// Bytes read from the child.
-#[derive(Default)]
-struct Captured {
-    /// From stdout.
-    stdout: Vec<u8>,
-    /// From stderr.
-    stderr: Vec<u8>,
-    /// From the status fd.
-    status: Vec<u8>,
-}
-
-/// A pipe end being read into a buffer.
-struct Reader<'a> {
+/// A pipe end being read into a zeroizing buffer.
+struct Reader {
     /// Open fd, `None` after EOF.
     fd: Option<OwnedFd>,
-    /// Destination buffer.
-    buf: &'a mut Vec<u8>,
+    /// Bytes read so far.
+    buf: Zeroizing<Vec<u8>>,
 }
 
-/// A pipe end being written from a buffer.
-struct Writer<'a> {
-    /// Open fd, `None` once everything is written or the reader went away.
+impl Reader {
+    /// A reader for `fd` with an empty buffer.
+    fn new(fd: Option<OwnedFd>) -> Self {
+        Self {
+            fd,
+            buf: Zeroizing::new(Vec::new()),
+        }
+    }
+}
+
+/// A pipe end being written from a zeroizing buffer.
+struct Writer {
+    /// Open fd, `None` once closed.
     fd: Option<OwnedFd>,
-    /// Bytes to write.
-    data: &'a [u8],
-    /// Bytes already written.
+    /// Bytes to write (answers are appended in interactive mode).
+    data: Zeroizing<Vec<u8>>,
+    /// Bytes of `data` already written.
     written: usize,
+    /// Stay open when drained (command channel waiting for the next answer).
+    keep_open: bool,
+}
+
+impl Writer {
+    /// True when bytes are waiting to be written.
+    fn pending(&self) -> bool {
+        self.written < self.data.len()
+    }
 }
 
 /// Moves data between the parent and the child until all pipes close or the child exits.
 ///
-/// Fails at `deadline` or when a stream exceeds [`MAX_OUTPUT`]; the caller kills the child.
-fn pump(
-    streams: Streams,
-    stdin: &[u8],
-    passphrase: &[u8],
+/// With a `responder`, each complete status line is passed to it and its answers are
+/// queued on the stdin writer (recorded in `answered` for redaction). Fails at
+/// `deadline`, on a read error, or when a stream exceeds [`MAX_OUTPUT`]; the caller
+/// kills the child. Returns the stdout, stderr and status buffers.
+fn pump<'a>(
+    mut readers: [Reader; 3],
+    mut writers: [Writer; 2],
+    mut responder: Option<&mut dyn FnMut(&str) -> Reply<'a>>,
+    answered: &mut Vec<&'a SecretValue>,
     child: &mut Child,
     deadline: Instant,
-) -> Result<Captured> {
-    let mut captured = Captured::default();
-    let mut readers = [
-        Reader {
-            fd: streams.stdout,
-            buf: &mut captured.stdout,
-        },
-        Reader {
-            fd: streams.stderr,
-            buf: &mut captured.stderr,
-        },
-        Reader {
-            fd: streams.status,
-            buf: &mut captured.status,
-        },
-    ];
-    let mut writers = [
-        Writer {
-            fd: streams.stdin,
-            data: stdin,
-            written: 0,
-        },
-        Writer {
-            fd: streams.passphrase,
-            data: passphrase,
-            written: 0,
-        },
-    ];
+) -> Result<[Zeroizing<Vec<u8>>; 3]> {
     for fd in readers.iter().filter_map(|r| r.fd.as_ref()) {
         set_nonblocking(fd.as_raw_fd())?;
     }
     for fd in writers.iter().filter_map(|w| w.fd.as_ref()) {
         set_nonblocking(fd.as_raw_fd())?;
     }
-    let mut chunk = vec![0u8; READ_CHUNK];
+    let mut chunk = Zeroizing::new(vec![0u8; READ_CHUNK]);
+    let mut status_seen = 0;
     loop {
+        for w in writers.iter_mut() {
+            if !w.pending() && !w.keep_open {
+                w.fd = None;
+            }
+        }
         let mut polls: Vec<libc::pollfd> = Vec::new();
         for r in &readers {
             if let Some(fd) = &r.fd {
                 polls.push(pollfd(fd.as_raw_fd(), libc::POLLIN));
             }
         }
-        for w in &writers {
+        for w in writers.iter().filter(|w| w.pending()) {
             if let Some(fd) = &w.fd {
                 polls.push(pollfd(fd.as_raw_fd(), libc::POLLOUT));
             }
         }
-        if polls.is_empty() {
-            return Ok(captured);
+        if readers.iter().all(|r| r.fd.is_none()) && polls.is_empty() {
+            return Ok(readers.map(|r| r.buf));
         }
         let now = Instant::now();
         if now >= deadline {
@@ -434,17 +599,56 @@ fn pump(
         if ready == 0 {
             // A child that exited while a grandchild (gpg-agent) keeps a pipe open is done.
             if child.try_wait().ok().flatten().is_some() {
-                return Ok(captured);
+                return Ok(readers.map(|r| r.buf));
             }
             continue;
         }
         for r in readers.iter_mut() {
             read_ready(r, &polls, &mut chunk)?;
         }
+        if let Some(respond) = responder.as_mut() {
+            let status = &readers[STATUS].buf;
+            while let Some(end) = status[status_seen..].iter().position(|&b| b == b'\n') {
+                let line = &status[status_seen..status_seen + end];
+                status_seen += end + 1;
+                let text = String::from_utf8_lossy(line);
+                let Some(record) = text.trim_end_matches('\r').strip_prefix(STATUS_PREFIX) else {
+                    continue;
+                };
+                apply_reply(&mut writers[STDIN], respond(record), answered)?;
+            }
+        }
         for w in writers.iter_mut() {
             write_ready(w, &polls);
         }
+        // The passphrase is no longer needed once it is written.
+        if writers[PASS].fd.is_none() {
+            writers[PASS].data.zeroize();
+        }
     }
+}
+
+/// Queues a responder's answer on the command channel, or closes it.
+fn apply_reply<'a>(
+    command: &mut Writer,
+    reply: Reply<'a>,
+    answered: &mut Vec<&'a SecretValue>,
+) -> Result<()> {
+    match reply {
+        Reply::Ignore => {}
+        Reply::Close => {
+            command.fd = None;
+            command.keep_open = false;
+        }
+        Reply::Answer(secret) => {
+            if secret.as_bytes().contains(&b'\n') {
+                return Err(KringError::InvalidInput(MSG_PASSPHRASE_NEWLINE.into()));
+            }
+            answered.push(secret);
+            append_zeroizing(&mut command.data, &passphrase_line(secret));
+        }
+    }
+    Ok(())
 }
 
 /// A pollfd for `fd` waiting for `events`.
@@ -461,8 +665,11 @@ fn is_ready(polls: &[libc::pollfd], fd: RawFd) -> bool {
     polls.iter().any(|p| p.fd == fd && p.revents != 0)
 }
 
-/// Reads what is available on a ready reader; closes it on EOF or error.
-fn read_ready(r: &mut Reader<'_>, polls: &[libc::pollfd], chunk: &mut [u8]) -> Result<()> {
+/// Reads what is available on a ready reader; closes it on EOF.
+///
+/// A read error other than EAGAIN/EINTR fails the run instead of silently
+/// truncating the output.
+fn read_ready(r: &mut Reader, polls: &[libc::pollfd], chunk: &mut [u8]) -> Result<()> {
     let Some(fd) = &r.fd else { return Ok(()) };
     if !is_ready(polls, fd.as_raw_fd()) {
         return Ok(());
@@ -478,7 +685,7 @@ fn read_ready(r: &mut Reader<'_>, polls: &[libc::pollfd], chunk: &mut [u8]) -> R
             return Ok(());
         }
         r.fd = None;
-        return Ok(());
+        return Err(KringError::Gpg(format!("cannot read gpg output: {e}")));
     }
     if n == 0 {
         r.fd = None;
@@ -490,18 +697,16 @@ fn read_ready(r: &mut Reader<'_>, polls: &[libc::pollfd], chunk: &mut [u8]) -> R
             MAX_OUTPUT / (1024 * 1024)
         )));
     }
-    r.buf.extend_from_slice(&chunk[..n as usize]);
+    append_zeroizing(&mut r.buf, &chunk[..n as usize]);
     Ok(())
 }
 
-/// Writes the next part of a ready writer; closes it when done or when the reader is gone.
-fn write_ready(w: &mut Writer<'_>, polls: &[libc::pollfd]) {
+/// Writes the next part of a ready writer; closes it when the reader is gone.
+///
+/// A drained command channel (`keep_open`) is wiped and reused for later answers.
+fn write_ready(w: &mut Writer, polls: &[libc::pollfd]) {
     let Some(fd) = &w.fd else { return };
-    if w.written >= w.data.len() {
-        w.fd = None;
-        return;
-    }
-    if !is_ready(polls, fd.as_raw_fd()) {
+    if !w.pending() || !is_ready(polls, fd.as_raw_fd()) {
         return;
     }
     let rest = &w.data[w.written..];
@@ -520,9 +725,15 @@ fn write_ready(w: &mut Writer<'_>, polls: &[libc::pollfd]) {
         return;
     }
     w.written += n as usize;
-    if w.written >= w.data.len() {
-        w.fd = None;
+    if w.pending() {
+        return;
     }
+    if w.keep_open {
+        w.data.zeroize();
+        w.written = 0;
+        return;
+    }
+    w.fd = None;
 }
 
 /// Sets O_NONBLOCK on a parent pipe end.
@@ -567,23 +778,30 @@ fn timed_out() -> KringError {
     KringError::Gpg("gpg did not finish in time and was stopped".into())
 }
 
-/// Replaces every occurrence of `secret` in `buf` with [`REDACTED`].
-fn redact(buf: &mut Vec<u8>, secret: &[u8]) {
-    if secret.is_empty() || buf.len() < secret.len() {
-        return;
-    }
+/// Returns a copy of `buf` with every occurrence of each secret replaced by [`REDACTED`].
+///
+/// Secrets shorter than [`MIN_REDACT_LEN`] bytes are left alone. The caller drops
+/// `buf` as a zeroizing buffer, so the unredacted bytes do not linger.
+fn redact(buf: &[u8], secrets: &[&[u8]]) -> Vec<u8> {
+    let secrets: Vec<&[u8]> = secrets
+        .iter()
+        .copied()
+        .filter(|s| s.len() >= MIN_REDACT_LEN)
+        .collect();
     let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
-    while i < buf.len() {
-        if buf[i..].starts_with(secret) {
-            out.extend_from_slice(REDACTED);
-            i += secret.len();
-            continue;
+    'scan: while i < buf.len() {
+        for secret in &secrets {
+            if buf[i..].starts_with(secret) {
+                out.extend_from_slice(REDACTED);
+                i += secret.len();
+                continue 'scan;
+            }
         }
         out.push(buf[i]);
         i += 1;
     }
-    *buf = out;
+    out
 }
 
 #[cfg(test)]
@@ -619,6 +837,26 @@ cat
     /// Fake gpg that exits 2 without reading its stdin.
     const FAKE_FAIL: &str = "#!/bin/sh\necho 'gpg: no such key' >&2\nexit 2\n";
 
+    /// Fake gpg that prompts twice on the status fd, reads the answers from stdin
+    /// (the command fd), then asks a question that must hit EOF.
+    const FAKE_PROMPT: &str = r#"#!/bin/sh
+printf 'ARGS %s\n' "$*"
+echo '[GNUPG:] GET_HIDDEN passphrase.enter' >&4
+IFS= read -r a
+echo '[GNUPG:] GOT_IT' >&4
+echo '[GNUPG:] GET_HIDDEN passphrase.enter' >&4
+IFS= read -r b
+printf 'first=%s second=%s\n' "${#a}" "${#b}"
+echo "leak $a $b" >&2
+echo "[GNUPG:] ECHO $b" >&4
+echo '[GNUPG:] GET_BOOL confirm' >&4
+if IFS= read -r c; then echo 'got c'; else echo 'eof'; fi
+"#;
+
+    /// Fake gpg-connect-agent: prints its args and GNUPGHOME.
+    const FAKE_AGENT: &str =
+        "#!/bin/sh\nprintf 'ARGS %s\\n' \"$*\"\nprintf 'HOME %s\\n' \"${GNUPGHOME-unset}\"\n";
+
     /// Directory with all fake scripts, written once before any of them runs
     /// (writing an executable while another thread forks can fail with ETXTBSY).
     fn fakes() -> &'static Path {
@@ -631,6 +869,8 @@ cat
                 ("sleep", FAKE_SLEEP),
                 ("flood", FAKE_FLOOD),
                 ("fail", FAKE_FAIL),
+                ("prompt", FAKE_PROMPT),
+                (GPG_CONNECT_AGENT, FAKE_AGENT),
             ] {
                 let path = dir.path().join(name);
                 std::fs::write(&path, body).unwrap();
@@ -660,7 +900,7 @@ cat
             )
             .unwrap();
         assert!(out.success());
-        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        let stdout = String::from_utf8(out.stdout.to_vec()).unwrap();
         assert!(stdout.contains(
             "ARGS --homedir /tmp/kring-home --batch --no-tty --pinentry-mode loopback \
              --status-fd 4 --passphrase-fd 3 --list-keys x\n"
@@ -680,7 +920,7 @@ cat
         let out = fake("echo")
             .run(["--list-keys"], None, None, TIMEOUT_DEFAULT)
             .unwrap();
-        let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+        let stdout = String::from_utf8(out.stdout.to_vec()).unwrap();
         assert!(!stdout.contains("--passphrase-fd"));
         assert!(!stdout.contains("--homedir"));
         assert!(out.has_status("NO_PASSPHRASE_FD"));
@@ -739,7 +979,10 @@ cat
             GpgRunner::new(fakes().join("absent"))
                 .unwrap()
                 .run(["x"], None, None, TIMEOUT_DEFAULT);
-        assert!(matches!(r, Err(KringError::Gpg(m)) if m.contains("cannot start")));
+        assert!(
+            matches!(&r, Err(KringError::Gpg(m)) if m.contains("cannot start")),
+            "{r:?}"
+        );
     }
 
     /// PATH lookup takes the first absolute dir with an executable `gpg`.
@@ -766,14 +1009,173 @@ cat
         assert!(GpgRunner::new(PathBuf::from("gpg")).is_err());
     }
 
-    /// Redaction replaces every occurrence and leaves other bytes alone.
+    /// Redaction replaces every occurrence of each secret and leaves other bytes alone.
     #[test]
     fn redact_cases() {
-        let mut buf = b"pw x pw".to_vec();
-        redact(&mut buf, b"pw");
-        assert_eq!(buf, b"<redacted> x <redacted>");
-        let mut short = b"p".to_vec();
-        redact(&mut short, b"pw");
-        assert_eq!(short, b"p");
+        assert_eq!(
+            redact(b"pass x pass", &[b"pass"]),
+            b"<redacted> x <redacted>"
+        );
+        assert_eq!(redact(b"p", &[b"pass"]), b"p");
+        assert_eq!(
+            redact(b"old1 new22", &[b"old1", b"new22"]),
+            b"<redacted> <redacted>"
+        );
+        assert_eq!(redact(b"a abc", &[b"abc"]), b"a abc", "too short");
+        assert_eq!(redact(b"", &[]), b"");
+    }
+
+    /// A passphrase shorter than 4 bytes is not redacted (it would mangle the text).
+    #[test]
+    fn short_passphrase_is_not_redacted() {
+        let pw = SecretValue::from_text("abc");
+        let out = fake("leak")
+            .run(Vec::<&str>::new(), None, Some(&pw), TIMEOUT_DEFAULT)
+            .unwrap();
+        assert_eq!(out.stderr_text(), "bad abc here");
+    }
+
+    /// The passphrase line is allocated once at its final size.
+    #[test]
+    fn passphrase_line_has_exact_capacity() {
+        let pw = SecretValue::from_text("correct horse");
+        let line = passphrase_line(&pw);
+        assert_eq!(line.as_slice(), b"correct horse\n");
+        assert_eq!(line.capacity(), pw.len() + 1);
+        assert_eq!(
+            passphrase_line(&SecretValue::from_text("")).as_slice(),
+            b"\n"
+        );
+    }
+
+    /// Growing a zeroizing buffer keeps its content and never reallocates in place.
+    #[test]
+    fn append_zeroizing_grows_into_a_new_buffer() {
+        let mut buf = Zeroizing::new(Vec::new());
+        append_zeroizing(&mut buf, b"abc");
+        assert_eq!(buf.capacity(), 3);
+        let before = buf.as_ptr();
+        append_zeroizing(&mut buf, b"defg");
+        assert_eq!(buf.as_slice(), b"abcdefg");
+        assert!(buf.capacity() >= 7);
+        assert_ne!(buf.as_ptr(), before, "moved to a new allocation");
+        let cap = buf.capacity();
+        let at = buf.as_ptr();
+        let fill = vec![b'x'; cap - buf.len()];
+        append_zeroizing(&mut buf, &fill);
+        assert_eq!(buf.as_ptr(), at, "fits without growing");
+    }
+
+    /// A read error other than EAGAIN/EINTR fails instead of truncating the output.
+    #[test]
+    fn read_error_is_reported() {
+        let (_read, write) = pipe_cloexec().unwrap();
+        let raw = write.as_raw_fd();
+        // Reading the write end of a pipe fails with EBADF.
+        let mut r = Reader::new(Some(write));
+        let mut polls = [pollfd(raw, libc::POLLIN)];
+        polls[0].revents = libc::POLLIN;
+        let mut chunk = [0u8; 16];
+        let res = read_ready(&mut r, &polls, &mut chunk);
+        assert!(
+            matches!(&res, Err(KringError::Gpg(m)) if m.starts_with("cannot read gpg output")),
+            "{res:?}"
+        );
+        assert!(r.fd.is_none());
+    }
+
+    /// Debug output shows the stdout length, never its bytes.
+    #[test]
+    fn debug_hides_stdout() {
+        let out = fake("echo")
+            .run(["x"], Some(b"TOPSECRET"), None, TIMEOUT_DEFAULT)
+            .unwrap();
+        assert!(out.stdout.ends_with(b"TOPSECRET"));
+        let shown = format!("{out:?}");
+        assert!(!shown.contains("TOPSECRET"), "{shown}");
+        assert!(shown.contains(&format!("<{} bytes>", out.stdout.len())));
+        assert!(shown.contains("NO_PASSPHRASE_FD"));
+    }
+
+    /// Status arguments are returned per keyword; a bare keyword has empty arguments.
+    #[test]
+    fn status_args_by_keyword() {
+        let out = fake("echo")
+            .run(["x"], None, None, TIMEOUT_DEFAULT)
+            .unwrap();
+        assert_eq!(out.status_args("NO_PASSPHRASE_FD"), [""]);
+        assert!(out.status_args("NO").is_empty());
+        let pw = SecretValue::from_text("12345");
+        let out = fake("echo")
+            .run(["x"], None, Some(&pw), TIMEOUT_DEFAULT)
+            .unwrap();
+        assert_eq!(out.status_args("GOT_PASSPHRASE"), ["5"]);
+    }
+
+    /// Interactive mode answers prompts in order over stdin and redacts the answers.
+    #[test]
+    fn interactive_answers_prompts_in_order() {
+        let old = SecretValue::from_text("old-pass");
+        let new = SecretValue::from_text("new-passphrase");
+        let mut seen: Vec<String> = Vec::new();
+        let mut prompts = 0;
+        let mut responder = |line: &str| {
+            seen.push(line.to_string());
+            match line {
+                "GET_HIDDEN passphrase.enter" => {
+                    prompts += 1;
+                    Reply::Answer(if prompts == 1 { &old } else { &new })
+                }
+                l if l.starts_with("GET_") => Reply::Close,
+                _ => Reply::Ignore,
+            }
+        };
+        let out = fake("prompt")
+            .run_interactive(["--passwd", "FPR"], &mut responder, TIMEOUT_DEFAULT)
+            .unwrap();
+        assert!(out.success(), "{out:?}");
+        let stdout = String::from_utf8(out.stdout.to_vec()).unwrap();
+        assert!(
+            stdout.contains("ARGS --batch --no-tty --pinentry-mode loopback --status-fd 4 --command-fd 0 --passwd FPR\n"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("first=8 second=14\n"), "{stdout}");
+        assert!(stdout.ends_with("eof\n"), "{stdout}");
+        assert_eq!(out.stderr_text(), "leak <redacted> <redacted>");
+        assert!(out.has_status("ECHO"));
+        assert_eq!(out.status_args("ECHO"), ["<redacted>"]);
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert_eq!(seen[4], "GET_BOOL confirm");
+    }
+
+    /// An interactive answer with a line break stops gpg.
+    #[test]
+    fn interactive_newline_answer_is_refused() {
+        let bad = SecretValue::from_text("a\nb");
+        let mut responder = |line: &str| {
+            if line.starts_with("GET_HIDDEN") {
+                return Reply::Answer(&bad);
+            }
+            Reply::Ignore
+        };
+        let r = fake("prompt").run_interactive(["x"], &mut responder, TIMEOUT_DEFAULT);
+        assert!(matches!(r, Err(KringError::InvalidInput(m)) if m == MSG_PASSPHRASE_NEWLINE));
+    }
+
+    /// Agent commands go to gpg-connect-agent next to gpg, with the home dir and `/bye`.
+    #[test]
+    fn agent_commands_use_connect_agent() {
+        let runner = fake("echo").with_homedir(PathBuf::from("/tmp/kring-home"));
+        let out = runner
+            .agent_commands(&["KEYINFO --list"], TIMEOUT_DEFAULT)
+            .unwrap();
+        let stdout = String::from_utf8(out.stdout.to_vec()).unwrap();
+        assert_eq!(
+            stdout,
+            "ARGS --homedir /tmp/kring-home KEYINFO --list /bye\nHOME /tmp/kring-home\n"
+        );
+        let missing = GpgRunner::new(PathBuf::from("/nonexistent-kring/gpg")).unwrap();
+        let r = missing.agent_commands(&["x"], TIMEOUT_DEFAULT);
+        assert!(matches!(r, Err(KringError::NotFound(m)) if m.contains(GPG_CONNECT_AGENT)));
     }
 }
