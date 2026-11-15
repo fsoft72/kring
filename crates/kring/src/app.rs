@@ -582,12 +582,18 @@ impl KringApp {
                 }
             }
             Outcome::Submitted(cmd) => {
+                let id = self.next_seq;
                 if let Some(value) = dialog.to_remember(&cmd) {
-                    self.state.session.remember(value);
+                    // A password that reopens the dialog when wrong is kept
+                    // only once its command proves it right.
+                    if dialog.reopens_when_wrong() {
+                        self.state.session.remember_if_correct(value, id);
+                    } else {
+                        self.state.session.remember(value);
+                    }
                 }
                 let retry = dialog.retry_kind();
                 self.dialog = None;
-                let id = self.next_seq;
                 self._send(cmd);
                 if let Some(kind) = retry {
                     self.state.session.used_in_dialog(kind, id);

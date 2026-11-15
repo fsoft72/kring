@@ -602,6 +602,11 @@ impl Dialog {
         }
     }
 
+    /// Returns true when a wrong password reopens this dialog.
+    pub fn reopens_when_wrong(&self) -> bool {
+        reopens_when_wrong(&self.kind)
+    }
+
     /// Returns the passphrase to remember from the sent command, when
     /// "Remember for this session" was checked.
     pub fn to_remember(&self, cmd: &Command) -> Option<SecretValue> {

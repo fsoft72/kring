@@ -116,11 +116,22 @@ pub enum FollowUp {
     UsedRemembered,
 }
 
+/// A typed passphrase waiting for its command to prove it right.
+struct Candidate {
+    /// Number of the command carrying it.
+    id: u64,
+    /// The typed passphrase.
+    value: SecretValue,
+    /// An error said the passphrase is wrong.
+    wrong: bool,
+}
+
 /// The passphrase remembered for the session and its last automatic use.
 #[derive(Default)]
 pub struct SessionSecret {
     value: Option<SecretValue>,
     auto: Option<AutoUse>,
+    candidate: Option<Candidate>,
 }
 
 impl std::fmt::Debug for SessionSecret {
@@ -143,10 +154,42 @@ impl SessionSecret {
         self.value = Some(value);
     }
 
-    /// Forgets the remembered passphrase (zeroized on drop).
+    /// Keeps `value`, typed in a dialog that reopens when wrong and sent as
+    /// command number `id`, to remember it only when that command finishes
+    /// without a wrong-passphrase error (see [`Self::observe`]).
+    pub fn remember_if_correct(&mut self, value: SecretValue, id: u64) {
+        self.candidate = Some(Candidate {
+            id,
+            value,
+            wrong: false,
+        });
+    }
+
+    /// Forgets the remembered passphrase and any candidate (zeroized on drop).
     pub fn forget(&mut self) {
         self.value = None;
         self.auto = None;
+        self.candidate = None;
+    }
+
+    /// Follows the events of the candidate's command; remembers it when the
+    /// command finished without a wrong-passphrase error, drops it otherwise.
+    fn _observe_candidate(&mut self, event: &Event, running: u64) {
+        let Some(c) = self.candidate.as_mut() else {
+            return;
+        };
+        match event {
+            Event::CommandFinished(id) if *id == c.id => {
+                let Some(c) = self.candidate.take() else {
+                    return;
+                };
+                if !c.wrong {
+                    self.value = Some(c.value);
+                }
+            }
+            Event::Error(msg) if running == c.id => c.wrong |= is_wrong_passphrase(msg),
+            _ => {}
+        }
     }
 
     /// Returns true when a passphrase is remembered.
@@ -236,6 +279,7 @@ impl SessionSecret {
     /// (`running` is the number of the command the event belongs to) and
     /// judges it on its [`Event::CommandFinished`].
     pub fn observe(&mut self, event: &Event, running: u64) -> Option<FollowUp> {
+        self._observe_candidate(event, running);
         let auto = self.auto.as_mut().filter(|a| !a.finished)?;
         if let Event::CommandFinished(id) = event {
             if *id != auto.id {
@@ -322,6 +366,23 @@ mod tests {
             files: vec![PathBuf::from("/k/a.keyring")],
             passphrase: None,
         }
+    }
+
+    /// A typed candidate is remembered only after a clean command window.
+    #[test]
+    fn candidate_remembered_only_when_correct() {
+        let wrong = Event::Error(kring_core::kwallet_file::MSG_WRONG_PASSWORD.into());
+        let mut s = remembered();
+        s.remember_if_correct(SecretValue::from_text("bad"), 7);
+        feed(&mut s, 7, &[wrong, Event::CommandFinished(7)]);
+        assert_eq!(s.value().and_then(|v| v.as_text()), Some(PASS));
+        s.remember_if_correct(SecretValue::from_text("good"), 8);
+        feed(
+            &mut s,
+            8,
+            &[Event::Done(Default::default()), Event::CommandFinished(8)],
+        );
+        assert_eq!(s.value().and_then(|v| v.as_text()), Some("good"));
     }
 
     /// Feeds `events` handled as command `running`, returning the last follow-up.
