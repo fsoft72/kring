@@ -4,6 +4,7 @@ pub mod error;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake_store;
 pub mod model;
+pub mod secret_service;
 pub mod store;
 pub mod validate;
 

@@ -35,6 +35,8 @@ export XDG_DATA_HOME="$TMP_ROOT/data"
 export XDG_CONFIG_HOME="$TMP_ROOT/config"
 export XDG_CACHE_HOME="$TMP_ROOT/cache"
 export XDG_RUNTIME_DIR="$TMP_ROOT/run"
+# Lets the integration tests verify they run inside this private session.
+export KRING_IT_RUNTIME="$XDG_RUNTIME_DIR"
 unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK DBUS_SESSION_BUS_ADDRESS
 
 dbus-run-session -- bash -c '
@@ -46,7 +48,6 @@ dbus-run-session -- bash -c '
 
   OUT="$(echo -n test | gnome-keyring-daemon --unlock --components=secrets --daemonize 2>&1)"
   DAEMON_PID="$(printf "%s\n" "$OUT" | sed -n "s/^GNOME_KEYRING_PID=//p" | head -n1)"
-  [ -z "$DAEMON_PID" ] && DAEMON_PID="$(pgrep -u "$(id -u)" -n -f "gnome-keyring-daemon.*$XDG_RUNTIME_DIR" || true)"
   unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
 
   for _ in $(seq 1 50); do
@@ -55,7 +56,14 @@ dbus-run-session -- bash -c '
   done
   if ! busctl --user status org.freedesktop.secrets >/dev/null 2>&1; then
     echo "it-session: org.freedesktop.secrets not available on the private bus" >&2
+    printf "%s\n" "$OUT" >&2
     exit 1
+  fi
+
+  # Fall back to the bus owner PID when the daemon did not print it.
+  if [ -z "$DAEMON_PID" ]; then
+    DAEMON_PID="$(busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+      org.freedesktop.DBus GetConnectionUnixProcessID s org.freedesktop.secrets 2>/dev/null | awk "{print \$2}")"
   fi
 
   # Make sure the default alias points to the login collection.
