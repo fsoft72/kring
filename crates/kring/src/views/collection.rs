@@ -4,10 +4,12 @@ use eframe::egui;
 use kring_core::model::{Attributes, CollectionInfo, ItemInfo, decode_path_segment};
 
 use crate::app_state::AppState;
+use crate::local_time;
 use crate::ui::glyphs::Ico;
 use crate::ui::theme;
 use crate::ui::widgets::{chip, glyph_tile, heading, ico_button, muted, note, semibold};
 use crate::views::dialogs::DialogKind;
+use crate::views::file_detail::import_report;
 use crate::views::item_detail::AttrEditor;
 use crate::views::{Action, Gates, item_list};
 use crate::worker::Command;
@@ -29,6 +31,9 @@ const MSG_PAM_MISSING: &str = "PAM does not unlock this keyring at login";
 /// Information always shown on the login keyring.
 const MSG_LOGIN_PASSWORD: &str =
     "Auto-unlock works only if this keyring password equals your login password";
+
+/// Tooltip of actions that need an unlocked keyring.
+pub const MSG_UNLOCK_FIRST: &str = "Unlock the keyring first";
 
 /// Delete warning for the login keyring.
 const MSG_DELETE_LOGIN: &str = "This is your login keyring, unlocked at login";
@@ -117,6 +122,13 @@ pub fn header_subline(c: &CollectionInfo) -> String {
     format!("{} {noun} - {lock}", c.item_count)
 }
 
+/// Returns the export dialog of `c`, suggesting a file in `$HOME` dated today.
+pub fn export_dialog(c: &CollectionInfo) -> DialogKind {
+    let home = std::env::var_os("HOME").map_or_else(|| "/".into(), std::path::PathBuf::from);
+    let date = local_time::today_compact(local_time::offset());
+    DialogKind::export_collection(c, &home, &date)
+}
+
 /// Renders the chips of a collection header.
 fn _chips(ui: &mut egui::Ui, c: &CollectionInfo) {
     for badge in badges(c) {
@@ -132,6 +144,10 @@ fn _chips(ui: &mut egui::Ui, c: &CollectionInfo) {
 /// Renders the right-aligned icon actions of a collection header.
 fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<Action> {
     let mut action = None;
+    let locked = c.locked.then_some(MSG_UNLOCK_FIRST);
+    if ico_button(ui, Ico::Export, "Export to an archive", locked, false) {
+        action = Some(Action::Open(export_dialog(c)));
+    }
     let delete = Action::Open(DialogKind::DeleteCollection {
         collection: c.id.clone(),
         label: display_name(c),
@@ -243,6 +259,7 @@ pub fn show(
     };
     let mut action = _header(ui, c, gates);
     _notes(ui, state, c);
+    import_report(ui, state);
     ui.add_space(10.0);
     action = item_list::show(ui, state, c, filter, editor, gates).or(action);
     action

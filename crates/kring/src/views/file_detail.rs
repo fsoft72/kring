@@ -262,7 +262,7 @@ fn _encrypted_card(ui: &mut egui::Ui, info: &KeyringFileInfo) -> Option<Action> 
 }
 
 /// Renders the conflicts and failures of the last import, if any.
-fn _import_report(ui: &mut egui::Ui, state: &AppState) {
+pub fn import_report(ui: &mut egui::Ui, state: &AppState) {
     let Some(report) = &state.last_import else {
         return;
     };
@@ -333,10 +333,9 @@ pub fn show(
     let live = live_collection(info, &state.collections);
     let mut action = _header(ui, state, info, live.is_some(), gates);
     _notes(ui, state, info, live);
-    _import_report(ui, state);
+    import_report(ui, state);
     ui.add_space(10.0);
-    let opened = !state.file_items.is_empty() || !state.file_warnings.is_empty();
-    if info.format == KeyringFormat::BinaryV0 && !opened {
+    if info.format == KeyringFormat::BinaryV0 && !state.file_opened {
         return _encrypted_card(ui, info).or(action);
     }
     if info.format == KeyringFormat::Unknown {

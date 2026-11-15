@@ -9,7 +9,7 @@ use eframe::egui::{self, Align, Layout, RichText};
 use kring_core::keyring_file::textual::OfflineItem;
 
 use crate::app_state::AppState;
-use crate::secret_display::{can_copy, secret_display};
+use crate::secret_display::secret_display;
 use crate::ui::glyphs::Ico;
 use crate::ui::theme;
 use crate::ui::widgets::{card_frame, field_label, ico_button, muted, search_box};
@@ -119,7 +119,7 @@ fn _secret_row(
         if ico_button(ui, ico, tip, None, false) {
             view.toggle_revealed(index);
         }
-        let binary = (!can_copy(&secret_display(&item.secret))).then_some(MSG_BINARY);
+        let binary = item.secret.as_text().is_none().then_some(MSG_BINARY);
         if ico_button(ui, Ico::Copy, "Copy (clears in 30 s)", binary, false) {
             action = Some(Action::CopyFileSecret(index));
         }

@@ -177,6 +177,12 @@ pub fn search_box(ui: &mut Ui, text: &mut String, hint: &str) -> Response {
     resp
 }
 
+/// Parses a path typed by the user: strips surrounding whitespace and quotes
+/// (ported from Paranoid's `clean_path`).
+pub fn clean_path(s: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(s.trim().trim_matches('"').trim_matches('\''))
+}
+
 /// Rounded tile with a glyph, as used by empty states (64 px) and the brand.
 pub fn glyph_tile(ui: &mut Ui, ico: Ico, size: f32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
@@ -189,4 +195,24 @@ pub fn glyph_tile(ui: &mut Ui, ico: Ico, size: f32) {
         egui::StrokeKind::Inside,
     );
     glyphs::paint(ui.painter(), rect, ico, theme::SECONDARY);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Whitespace and surrounding quotes are removed, inner text is kept.
+    #[test]
+    fn clean_path_strips_quotes_and_spaces() {
+        assert_eq!(
+            clean_path("  /tmp/a b.age \n"),
+            PathBuf::from("/tmp/a b.age")
+        );
+        assert_eq!(clean_path("\"/tmp/x.age\""), PathBuf::from("/tmp/x.age"));
+        assert_eq!(clean_path("'/tmp/x.age'"), PathBuf::from("/tmp/x.age"));
+        assert_eq!(clean_path(" \"'/tmp/q'\" "), PathBuf::from("/tmp/q"));
+        assert_eq!(clean_path("/tmp/it's.age"), PathBuf::from("/tmp/it's.age"));
+        assert_eq!(clean_path("   "), PathBuf::from(""));
+    }
 }

@@ -1,10 +1,14 @@
 //! Validation of dialog fields and the command each dialog sends.
 
+use std::path::{Path, PathBuf};
+
 use kring_core::model::{ItemUpdate, NewItem, SecretValue};
 use kring_core::validate;
 use zeroize::Zeroizing;
 
 use crate::app_state::FileAction;
+use crate::ui::widgets::clean_path;
+use crate::views::backups::RestorePassphrase;
 use crate::views::dialogs::DialogKind;
 use crate::worker::Command;
 
@@ -14,6 +18,46 @@ const MSG_NO_TARGET: &str = "Choose a keyring to import into";
 const MSG_TARGET_LOCKED: &str = "The chosen keyring is locked, unlock it first";
 /// Error of an empty file password.
 const MSG_NO_PASSWORD: &str = "Enter the password of the keyring file";
+
+/// Error of an empty archive path.
+pub const MSG_NO_PATH: &str = "Enter the path of the archive file";
+/// Error of a path that is not absolute.
+pub const MSG_RELATIVE_PATH: &str = "Enter an absolute path (or one starting with ~/)";
+/// Error of an empty archive passphrase.
+pub const MSG_NO_ARCHIVE_PASSPHRASE: &str = "Enter the passphrase of the archive";
+/// Error of an empty backup passphrase.
+const MSG_NO_BACKUP_PASSPHRASE: &str = "Enter the passphrase of the backup";
+
+/// Resolves a typed path: cleaned (quotes, spaces), `~` and `~/...` expanded
+/// with `home`; the result must be absolute.
+pub fn typed_path(text: &str, home: Option<&Path>) -> Result<PathBuf, String> {
+    let path = clean_path(text);
+    if path.as_os_str().is_empty() {
+        return Err(MSG_NO_PATH.into());
+    }
+    let path = match (path.strip_prefix("~"), home) {
+        (Ok(rest), Some(home)) => home.join(rest),
+        _ => path,
+    };
+    if !path.is_absolute() {
+        return Err(MSG_RELATIVE_PATH.into());
+    }
+    Ok(path)
+}
+
+/// Resolves a typed path against the `HOME` of the process.
+fn _user_path(text: &str) -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    typed_path(text, home.as_deref())
+}
+
+/// Returns the passphrase as a secret, or `message` when it is empty.
+fn _required(buffer: &Zeroizing<String>, message: &str) -> Result<SecretValue, String> {
+    if buffer.is_empty() {
+        return Err(message.into());
+    }
+    Ok(_secret(buffer))
+}
 
 /// Rejects a blank item label.
 fn _item_label(label: &str) -> Result<(), String> {
@@ -33,6 +77,11 @@ pub fn with_backup_passphrase(cmd: Command, passphrase: SecretValue) -> Command 
         Command::DeleteCollection { collection, .. } => Command::DeleteCollection {
             collection,
             backup_passphrase: Some(passphrase),
+        },
+        Command::RestoreBackup { dir, files, .. } => Command::RestoreBackup {
+            dir,
+            files,
+            passphrase: Some(passphrase),
         },
         other => other,
     }
@@ -191,14 +240,243 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             name: name.clone(),
             backup_passphrase: _new_password(passphrase, confirm)?,
         },
+        DialogKind::RestoreBackup {
+            dir,
+            files,
+            mode,
+            passphrase,
+            confirm,
+            ..
+        } => {
+            let passphrase = match mode {
+                RestorePassphrase::NotNeeded => None,
+                RestorePassphrase::Existing => {
+                    Some(_required(passphrase, MSG_NO_BACKUP_PASSPHRASE)?)
+                }
+                RestorePassphrase::New => Some(_new_password(passphrase, confirm)?),
+            };
+            Command::RestoreBackup {
+                dir: dir.clone(),
+                files: files.clone(),
+                passphrase,
+            }
+        }
+        DialogKind::ExportCollection {
+            collection,
+            path,
+            passphrase,
+            confirm,
+            ..
+        } => Command::ExportCollection {
+            collection: collection.clone(),
+            path: _user_path(path)?,
+            passphrase: _new_password(passphrase, confirm)?,
+        },
+        DialogKind::ImportArchive {
+            target,
+            path,
+            passphrase,
+            ..
+        } => Command::ImportArchive {
+            path: _user_path(path)?,
+            passphrase: _required(passphrase, MSG_NO_ARCHIVE_PASSPHRASE)?,
+            target: target.clone(),
+        },
         DialogKind::Passphrase {
             command,
             passphrase,
             confirm,
         } => {
-            let passphrase = _new_password(passphrase, confirm)?;
+            let passphrase = if matches!(**command, Command::RestoreBackup { .. }) {
+                _required(passphrase, MSG_NO_BACKUP_PASSPHRASE)?
+            } else {
+                _new_password(passphrase, confirm)?
+            };
             with_backup_passphrase((**command).clone(), passphrase)
         }
     };
     Ok(cmd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::backups::RestorePassphrase;
+    use kring_core::model::{CollectionId, CollectionInfo};
+    use std::path::{Path, PathBuf};
+
+    /// Fills a zeroizing buffer with text.
+    fn buf(text: &str) -> Zeroizing<String> {
+        Zeroizing::new(text.to_string())
+    }
+
+    /// Builds a collection.
+    fn col(label: &str) -> CollectionInfo {
+        CollectionInfo {
+            id: CollectionId("/c/w".into()),
+            label: label.into(),
+            locked: false,
+            item_count: 0,
+            aliases: vec![],
+            is_login: false,
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    /// Typed paths are cleaned, `~` expands to home, relative paths are refused.
+    #[test]
+    fn typed_paths() {
+        let home = Some(Path::new("/home/me"));
+        assert_eq!(
+            typed_path(" '/tmp/a.age' ", home),
+            Ok(PathBuf::from("/tmp/a.age"))
+        );
+        assert_eq!(
+            typed_path("~/x.age", home),
+            Ok(PathBuf::from("/home/me/x.age"))
+        );
+        assert_eq!(typed_path("~", home), Ok(PathBuf::from("/home/me")));
+        assert_eq!(typed_path("  ", home), Err(MSG_NO_PATH.to_string()));
+        assert_eq!(
+            typed_path("x.age", home),
+            Err(MSG_RELATIVE_PATH.to_string())
+        );
+        assert_eq!(typed_path("~/x", None), Err(MSG_RELATIVE_PATH.to_string()));
+        assert_eq!(
+            typed_path("~bob/x", home),
+            Err(MSG_RELATIVE_PATH.to_string())
+        );
+    }
+
+    /// Export suggests a sanitized path and needs a confirmed passphrase.
+    #[test]
+    fn export_validates() {
+        let mut kind = DialogKind::export_collection(&col("My keys"), Path::new("/h"), "20261115");
+        let DialogKind::ExportCollection { path, .. } = &kind else {
+            panic!("expected ExportCollection");
+        };
+        assert_eq!(path, "/h/kring-My_keys-20261115.kring.age");
+        assert!(command_for(&kind).is_err(), "empty passphrase rejected");
+        if let DialogKind::ExportCollection {
+            passphrase,
+            confirm,
+            path,
+            ..
+        } = &mut kind
+        {
+            *passphrase = buf("pp");
+            *confirm = buf("pq");
+            *path = "\"/tmp/out.kring.age\"".into();
+        }
+        assert!(command_for(&kind).is_err(), "mismatch rejected");
+        if let DialogKind::ExportCollection { confirm, .. } = &mut kind {
+            *confirm = buf("pp");
+        }
+        match command_for(&kind).unwrap() {
+            Command::ExportCollection {
+                collection,
+                path,
+                passphrase,
+            } => {
+                assert_eq!(collection.0, "/c/w");
+                assert_eq!(path, PathBuf::from("/tmp/out.kring.age"));
+                assert_eq!(passphrase.as_text(), Some("pp"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Archive import needs a path and a passphrase and targets the collection.
+    #[test]
+    fn import_archive_validates() {
+        let mut kind = DialogKind::import_archive(&col("Work"));
+        assert_eq!(command_for(&kind).unwrap_err(), MSG_NO_PATH);
+        if let DialogKind::ImportArchive { path, .. } = &mut kind {
+            *path = "/tmp/in.kring.age".into();
+        }
+        assert_eq!(command_for(&kind).unwrap_err(), MSG_NO_ARCHIVE_PASSPHRASE);
+        if let DialogKind::ImportArchive { passphrase, .. } = &mut kind {
+            *passphrase = buf("pp");
+        }
+        match command_for(&kind).unwrap() {
+            Command::ImportArchive {
+                path,
+                passphrase,
+                target,
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/in.kring.age"));
+                assert_eq!(passphrase.as_text(), Some("pp"));
+                assert_eq!(target.0, "/c/w");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Builds a restore dialog in `mode`.
+    fn restore(mode: RestorePassphrase) -> DialogKind {
+        DialogKind::restore_backup(
+            "/b/1".into(),
+            vec!["/x/a.keyring".into()],
+            vec!["/k/a.keyring".into()],
+            mode,
+        )
+    }
+
+    /// Restore sends no passphrase, the backup one, or a confirmed new one.
+    #[test]
+    fn restore_passphrase_modes() {
+        match command_for(&restore(RestorePassphrase::NotNeeded)).unwrap() {
+            Command::RestoreBackup {
+                dir,
+                files,
+                passphrase,
+            } => {
+                assert_eq!(dir, PathBuf::from("/b/1"));
+                assert_eq!(files, [PathBuf::from("/x/a.keyring")]);
+                assert!(passphrase.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let mut existing = restore(RestorePassphrase::Existing);
+        assert!(command_for(&existing).is_err(), "empty passphrase rejected");
+        if let DialogKind::RestoreBackup { passphrase, .. } = &mut existing {
+            *passphrase = buf("pp");
+        }
+        assert!(matches!(
+            command_for(&existing).unwrap(),
+            Command::RestoreBackup { passphrase: Some(p), .. } if p.as_text() == Some("pp")
+        ));
+        let mut new = restore(RestorePassphrase::New);
+        if let DialogKind::RestoreBackup { passphrase, .. } = &mut new {
+            *passphrase = buf("pp");
+        }
+        assert!(
+            command_for(&new).is_err(),
+            "unconfirmed new passphrase rejected"
+        );
+        if let DialogKind::RestoreBackup { confirm, .. } = &mut new {
+            *confirm = buf("pp");
+        }
+        assert!(command_for(&new).is_ok());
+    }
+
+    /// The fallback passphrase dialog resends a restore with one field only.
+    #[test]
+    fn passphrase_dialog_resends_restore() {
+        let original = Command::RestoreBackup {
+            dir: "/b/1".into(),
+            files: vec!["/x/a.keyring".into()],
+            passphrase: None,
+        };
+        let mut kind = DialogKind::passphrase(original);
+        assert!(command_for(&kind).is_err(), "empty passphrase rejected");
+        if let DialogKind::Passphrase { passphrase, .. } = &mut kind {
+            *passphrase = buf("pp");
+        }
+        assert!(matches!(
+            command_for(&kind).unwrap(),
+            Command::RestoreBackup { passphrase: Some(p), .. } if p.as_text() == Some("pp")
+        ));
+    }
 }

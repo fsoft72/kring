@@ -54,6 +54,10 @@ pub enum Ico {
     Sliders,
     /// Rescan or reload.
     Refresh,
+    /// Backups area: archive box.
+    Archive,
+    /// Export: arrow leaving an open box.
+    Export,
 }
 
 /// Maps 16-unit grid coordinates to screen positions inside an icon box.
@@ -203,6 +207,34 @@ fn _simple(p: &Painter, g: &Grid, st: Stroke, ico: Ico) {
             ];
             _poly(p, outline, st);
             _poly(p, vec![g.pt(5.5, 8.0), g.pt(7.3, 9.8), g.pt(10.8, 6.2)], st);
+        }
+        Ico::Archive => {
+            _square(p, g, (1.5, 2.5), (14.5, 5.5), st);
+            _poly(
+                p,
+                vec![
+                    g.pt(2.5, 5.5),
+                    g.pt(2.5, 13.5),
+                    g.pt(13.5, 13.5),
+                    g.pt(13.5, 5.5),
+                ],
+                st,
+            );
+            line(g.pt(6.0, 8.5), g.pt(10.0, 8.5));
+        }
+        Ico::Export => {
+            _poly(
+                p,
+                vec![
+                    g.pt(2.5, 8.5),
+                    g.pt(2.5, 13.5),
+                    g.pt(13.5, 13.5),
+                    g.pt(13.5, 8.5),
+                ],
+                st,
+            );
+            line(g.pt(8.0, 10.5), g.pt(8.0, 2.0));
+            _poly(p, vec![g.pt(5.0, 5.0), g.pt(8.0, 2.0), g.pt(11.0, 5.0)], st);
         }
         Ico::Sliders => {
             for (y, k) in [(4.0, 10.0), (8.0, 5.0), (12.0, 11.0)] {

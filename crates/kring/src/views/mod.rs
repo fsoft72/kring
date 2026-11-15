@@ -1,6 +1,7 @@
 //! Views of the main window and the actions they request.
 
 pub mod attr_diff;
+pub mod backups;
 pub mod banners;
 pub mod collection;
 pub mod dialog_body;
@@ -60,20 +61,37 @@ pub enum Area {
     Secrets,
     /// Keyring files on disk, read offline.
     Files,
+    /// Backups of the keyring files and their restore.
+    Backups,
 }
 
-/// Switches from area `from` to `to`; returns the command to send on entry.
+/// Commands that load the data of the Backups area: the backups, and the
+/// keyring files to tell which restore destinations are plaintext.
+pub fn backups_commands() -> Vec<Command> {
+    vec![Command::ListBackups, Command::ScanFiles]
+}
+
+/// Switches from area `from` to `to`; returns the commands to send on entry.
 ///
 /// Leaving the Offline files area closes the selected file, dropping its
-/// secrets; entering it rescans the keyrings directory.
-pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Option<Command> {
+/// secrets; leaving the Backups area forgets the last restore. Any switch
+/// drops the report of the last import. Entering Files rescans the keyrings
+/// directory; entering Backups lists the backups too.
+pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     if from == to {
-        return None;
+        return Vec::new();
     }
-    if from == Area::Files {
-        state.close_file();
+    match from {
+        Area::Files => state.close_file(),
+        Area::Backups => state.last_restore = None,
+        Area::Secrets => {}
     }
-    (to == Area::Files).then_some(Command::ScanFiles)
+    state.last_import = None;
+    match to {
+        Area::Files => vec![Command::ScanFiles],
+        Area::Backups => backups_commands(),
+        Area::Secrets => Vec::new(),
+    }
 }
 
 /// Why groups of actions are disabled; `None` means allowed.
@@ -158,12 +176,33 @@ mod tests {
     fn switch_area_closes_file_and_rescans() {
         let mut s = AppState::default();
         s.select_file("a".into());
-        assert!(switch_area(&mut s, Area::Files, Area::Files).is_none());
+        assert!(switch_area(&mut s, Area::Files, Area::Files).is_empty());
         assert_eq!(s.selected_file.as_deref(), Some("a"));
-        assert!(switch_area(&mut s, Area::Files, Area::Secrets).is_none());
+        assert!(switch_area(&mut s, Area::Files, Area::Secrets).is_empty());
         assert!(s.selected_file.is_none());
-        let cmd = switch_area(&mut s, Area::Secrets, Area::Files);
-        assert!(matches!(cmd, Some(Command::ScanFiles)));
+        let cmds = switch_area(&mut s, Area::Secrets, Area::Files);
+        assert!(matches!(&cmds[..], [Command::ScanFiles]));
+    }
+
+    /// Entering Backups lists backups and files; leaving forgets the restore
+    /// and the import report.
+    #[test]
+    fn switch_area_backups() {
+        use kring_core::backup::RestoreReport;
+        use kring_core::transfer::import::ImportReport;
+        let mut s = AppState::default();
+        let cmds = switch_area(&mut s, Area::Secrets, Area::Backups);
+        assert!(matches!(
+            &cmds[..],
+            [Command::ListBackups, Command::ScanFiles]
+        ));
+        s.last_restore = Some(RestoreReport {
+            restored: vec![],
+            pre_restore_backup: None,
+        });
+        s.last_import = Some(ImportReport::default());
+        assert!(switch_area(&mut s, Area::Backups, Area::Secrets).is_empty());
+        assert!(s.last_restore.is_none() && s.last_import.is_none());
     }
 
     /// No provider blocks everything.

@@ -24,16 +24,17 @@ pub enum FileAction {
     Import { target: CollectionId },
 }
 
-/// Returns the toast text of a finished import, e.g. `Imported 2 items - 1 duplicate - 0 conflicts`.
+/// Returns the toast text of a finished import, e.g.
+/// `Imported 2 items, skipped 1 duplicate, 0 conflicts`.
 pub fn import_summary(report: &ImportReport) -> String {
     let mut text = format!(
-        "Imported {} - {} - {}",
+        "Imported {}, skipped {}, {}",
         _count(report.created, "item"),
         _count(report.duplicates, "duplicate"),
         _count(report.conflicts.len(), "conflict"),
     );
     if !report.failed.is_empty() {
-        text.push_str(&format!(" - {} failed", report.failed.len()));
+        text.push_str(&format!(", {} failed", report.failed.len()));
     }
     text
 }
@@ -64,6 +65,8 @@ pub struct AppState {
     pub selected_file: Option<String>,
     /// Items read offline from the selected file; holds secrets, cleared on file change.
     pub file_items: Vec<OfflineItem>,
+    /// True once the items of the selected file arrived (even zero items).
+    pub file_opened: bool,
     /// Parse warnings of the selected file.
     pub file_warnings: Vec<ParseWarning>,
     /// Binary keyring file waiting for its password.
@@ -76,6 +79,8 @@ pub struct AppState {
     pub last_import: Option<ImportReport>,
     /// Outcome of the last restore.
     pub last_restore: Option<RestoreReport>,
+    /// Set when a backup was created or restored since the last listing.
+    backups_stale: bool,
 }
 
 /// Sort key: login first, then default alias, then label (case-insensitive).
@@ -116,6 +121,7 @@ impl AppState {
             }
             Event::BackupCreated(info) => {
                 self.status = format!("Backup created: {}", info.dir.display());
+                self.backups_stale = true;
             }
             Event::PassphraseNeeded(cmd) => self.pending_passphrase = Some(*cmd),
             Event::Files(v) => self._set_files(v),
@@ -129,6 +135,7 @@ impl AppState {
                 }
                 self.file_items = items;
                 self.file_warnings = warnings;
+                self.file_opened = true;
             }
             Event::PasswordNeeded(name) => {
                 if self.selected_file.as_ref() == Some(&name) {
@@ -139,8 +146,14 @@ impl AppState {
                 self.status = import_summary(&report);
                 self.last_import = Some(report);
             }
-            Event::Backups(v) => self.backups = v,
-            Event::RestoreDone(report) => self.last_restore = Some(report),
+            Event::Backups(v) => {
+                self.backups = v;
+                self.backups_stale = false;
+            }
+            Event::RestoreDone(report) => {
+                self.last_restore = Some(report);
+                self.backups_stale = true;
+            }
             Event::Done(msg) => self.status = msg,
             Event::Error(msg) => {
                 // The failed command may be the pending file command: never resend it.
@@ -192,6 +205,7 @@ impl AppState {
         self.selected_file = None;
         self.file_items.clear();
         self.file_warnings.clear();
+        self.file_opened = false;
         self.pending_file_password = None;
         self.pending_file_action = None;
         self.last_import = None;
@@ -232,9 +246,16 @@ impl AppState {
         Some((name, action))
     }
 
-    /// Selects a collection and clears everything below it.
+    /// Returns true (once) when the backup list must be reloaded.
+    pub fn take_backups_stale(&mut self) -> bool {
+        std::mem::take(&mut self.backups_stale)
+    }
+
+    /// Selects a collection and clears everything below it, including the
+    /// report of an earlier import.
     pub fn select_collection(&mut self, id: CollectionId) {
         self.selected = Some(id);
+        self.last_import = None;
         self.items.clear();
         self.selected_item = None;
         self.revealed = None;
@@ -550,7 +571,7 @@ mod tests {
         };
         assert_eq!(
             import_summary(&report),
-            "Imported 2 items - 1 duplicate - 1 conflict"
+            "Imported 2 items, skipped 1 duplicate, 1 conflict"
         );
         let failed = ImportReport {
             created: 1,
@@ -559,12 +580,62 @@ mod tests {
         };
         assert_eq!(
             import_summary(&failed),
-            "Imported 1 item - 0 duplicates - 0 conflicts - 1 failed"
+            "Imported 1 item, skipped 0 duplicates, 0 conflicts, 1 failed"
         );
         let mut s = tracked("a", Command::ScanFiles);
         s.apply(Event::ImportDone(report));
-        assert_eq!(s.status, "Imported 2 items - 1 duplicate - 1 conflict");
+        assert_eq!(
+            s.status,
+            "Imported 2 items, skipped 1 duplicate, 1 conflict"
+        );
         s.close_file();
+        assert!(s.last_import.is_none());
+    }
+
+    /// A file counts as opened once its items arrived, even with no items.
+    #[test]
+    fn file_opened_tracks_selected_file() {
+        let mut s = AppState::default();
+        s.apply(Event::Files(vec![file("a"), file("b")]));
+        s.select_file("a".into());
+        assert!(!s.file_opened);
+        s.apply(Event::FileItems {
+            name: "b".into(),
+            items: vec![],
+            warnings: vec![],
+        });
+        assert!(!s.file_opened, "items of another file");
+        s.apply(Event::FileItems {
+            name: "a".into(),
+            items: vec![],
+            warnings: vec![],
+        });
+        assert!(s.file_opened);
+        s.select_file("b".into());
+        assert!(!s.file_opened);
+    }
+
+    /// Backups and restores mark the backup list stale, once.
+    #[test]
+    fn backups_stale_after_changes() {
+        let mut s = AppState::default();
+        assert!(!s.take_backups_stale());
+        s.apply(Event::RestoreDone(RestoreReport {
+            restored: vec![],
+            pre_restore_backup: None,
+        }));
+        assert!(s.take_backups_stale());
+        assert!(!s.take_backups_stale());
+        s.apply(Event::Backups(vec![]));
+        assert!(!s.take_backups_stale());
+    }
+
+    /// Selecting a collection drops the report of an earlier import.
+    #[test]
+    fn select_collection_clears_import_report() {
+        let mut s = AppState::default();
+        s.apply(Event::ImportDone(ImportReport::default()));
+        s.select_collection(CollectionId("/c/a".into()));
         assert!(s.last_import.is_none());
     }
 

@@ -1,5 +1,7 @@
 //! Modal dialogs: password prompts, forms and confirmations.
 
+use std::path::{Path, PathBuf};
+
 use eframe::egui;
 use kring_core::model::{Attributes, CollectionId, CollectionInfo, ItemId};
 use zeroize::Zeroizing;
@@ -8,6 +10,7 @@ use crate::app_state::FileAction;
 use crate::ui::password_field::{forget_fields, new_buffer};
 use crate::ui::theme;
 use crate::ui::widgets::{danger_button, primary_button, secondary_button};
+use crate::views::backups::RestorePassphrase;
 use crate::views::collection::display_name;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_submit::command_for;
@@ -111,6 +114,35 @@ pub enum DialogKind {
         passphrase: Zeroizing<String>,
         confirm: Zeroizing<String>,
     },
+    /// Confirm restoring files of a backup, listing what gets overwritten.
+    RestoreBackup {
+        dir: PathBuf,
+        /// Original paths of the files to restore.
+        files: Vec<PathBuf>,
+        /// Files that will be overwritten, for display.
+        destinations: Vec<String>,
+        /// Which passphrase the restore needs.
+        mode: RestorePassphrase,
+        passphrase: Zeroizing<String>,
+        confirm: Zeroizing<String>,
+    },
+    /// Export a collection to an age-encrypted archive.
+    ExportCollection {
+        collection: CollectionId,
+        label: String,
+        /// Typed archive path.
+        path: String,
+        passphrase: Zeroizing<String>,
+        confirm: Zeroizing<String>,
+    },
+    /// Import the items of an archive into a collection.
+    ImportArchive {
+        target: CollectionId,
+        label: String,
+        /// Typed archive path.
+        path: String,
+        passphrase: Zeroizing<String>,
+    },
     /// Choose a passphrase for a backup containing plaintext keyrings.
     Passphrase {
         command: Box<Command>,
@@ -204,6 +236,45 @@ impl DialogKind {
         }
     }
 
+    /// Restore confirmation of `files` (original paths) of backup `dir`.
+    pub fn restore_backup(
+        dir: PathBuf,
+        files: Vec<PathBuf>,
+        destinations: Vec<String>,
+        mode: RestorePassphrase,
+    ) -> Self {
+        Self::RestoreBackup {
+            dir,
+            files,
+            destinations,
+            mode,
+            passphrase: new_buffer(),
+            confirm: new_buffer(),
+        }
+    }
+
+    /// Export dialog of collection `c`, suggesting `<home>/kring-<name>-<date>.kring.age`.
+    pub fn export_collection(c: &CollectionInfo, home: &Path, date: &str) -> Self {
+        let label = display_name(c);
+        Self::ExportCollection {
+            collection: c.id.clone(),
+            path: default_export_path(home, &label, date),
+            label,
+            passphrase: new_buffer(),
+            confirm: new_buffer(),
+        }
+    }
+
+    /// Archive import dialog into collection `c`.
+    pub fn import_archive(c: &CollectionInfo) -> Self {
+        Self::ImportArchive {
+            target: c.id.clone(),
+            label: display_name(c),
+            path: String::new(),
+            passphrase: new_buffer(),
+        }
+    }
+
     /// Passphrase dialog that resends `command` with the chosen passphrase.
     pub fn passphrase(command: Command) -> Self {
         Self::Passphrase {
@@ -212,6 +283,24 @@ impl DialogKind {
             confirm: new_buffer(),
         }
     }
+}
+
+/// Returns the suggested archive path `<home>/kring-<name>-<date>.kring.age`;
+/// characters of `name` other than ASCII letters, digits, `-` and `_` become `_`.
+pub fn default_export_path(home: &Path, name: &str, date: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    home.join(format!("kring-{safe}-{date}.kring.age"))
+        .display()
+        .to_string()
 }
 
 /// What happened to a dialog this frame.

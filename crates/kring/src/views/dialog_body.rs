@@ -10,11 +10,15 @@ use crate::ui::password_field::{
 };
 use crate::ui::theme;
 use crate::ui::widgets::{field_label, input, semibold};
+use crate::views::backups::RestorePassphrase;
 use crate::views::dialogs::{DialogKind, ImportTarget};
 use crate::views::item_detail::attribute_rows;
+use crate::worker::Command;
 
 /// Width of dialog content.
 pub const FIELD_WIDTH: f32 = 380.0;
+/// Hint of the archive path fields.
+const MSG_PATH_HINT: &str = "Full path, e.g. ~/kring-export.kring.age";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -59,6 +63,17 @@ fn _muted(ui: &mut egui::Ui, text: &str) {
 fn _text_field(ui: &mut egui::Ui, label: &str, text: &mut String) {
     field_label(ui, label);
     ui.add(input(text).desired_width(f32::INFINITY));
+}
+
+/// Adds a field label above a single-line monospace path field.
+fn _path_field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) {
+    field_label(ui, label);
+    ui.add(
+        input(text)
+            .font(egui::TextStyle::Monospace)
+            .hint_text(RichText::new(hint).color(theme::MUTED.gamma_multiply(0.7)))
+            .desired_width(f32::INFINITY),
+    );
 }
 
 /// Adds a field label above a password field with an eye toggle.
@@ -235,12 +250,99 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _danger("Retire")
         }
-        DialogKind::Passphrase {
+        DialogKind::RestoreBackup {
+            destinations,
+            mode,
             passphrase,
             confirm,
             ..
         } => {
+            _title(ui, "Restore backup");
+            _text(ui, "These files will be overwritten:");
+            for dest in destinations.iter() {
+                ui.label(
+                    RichText::new(dest)
+                        .monospace()
+                        .size(12.5)
+                        .color(theme::TEXT),
+                );
+            }
+            _muted(
+                ui,
+                "The current versions are backed up first. Restart gnome-keyring afterwards.",
+            );
+            match mode {
+                RestorePassphrase::NotNeeded => {}
+                RestorePassphrase::Existing => {
+                    _password_field(ui, "Backup passphrase", FIELD_PASSWORD, passphrase);
+                    _muted(
+                        ui,
+                        "Encrypted copies need the passphrase they were backed up with. It \
+                         also encrypts the backup of plaintext files overwritten now.",
+                    );
+                }
+                RestorePassphrase::New => {
+                    ui.label(
+                        RichText::new(
+                            "A plaintext keyring is overwritten: its backup is encrypted, \
+                             choose a passphrase",
+                        )
+                        .color(theme::TERTIARY),
+                    );
+                    _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
+                    _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+                }
+            }
+            _danger("Restore")
+        }
+        DialogKind::ExportCollection {
+            label,
+            path,
+            passphrase,
+            confirm,
+            ..
+        } => {
+            _title(ui, &format!("Export \"{label}\""));
+            _text(
+                ui,
+                "Every item, with its secret, is written to an age-encrypted archive.",
+            );
+            _path_field(ui, "Archive file", path, MSG_PATH_HINT);
+            _password_field(ui, "Archive passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _muted(ui, "An existing file is never overwritten.");
+            _primary("Export")
+        }
+        DialogKind::ImportArchive {
+            label,
+            path,
+            passphrase,
+            ..
+        } => {
+            _title(ui, &format!("Import an archive into \"{label}\""));
+            _path_field(ui, "Archive file", path, MSG_PATH_HINT);
+            _password_field(ui, "Archive passphrase", FIELD_PASSWORD, passphrase);
+            _muted(
+                ui,
+                "Identical items are skipped. Items whose attributes exist with another \
+                 secret are listed as conflicts and never overwritten.",
+            );
+            _primary("Import")
+        }
+        DialogKind::Passphrase {
+            command,
+            passphrase,
+            confirm,
+        } => {
             _title(ui, "Backup passphrase");
+            if matches!(**command, Command::RestoreBackup { .. }) {
+                ui.label(
+                    RichText::new("The restore needs the passphrase of the backup")
+                        .color(theme::TERTIARY),
+                );
+                _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
+                return _primary("Continue");
+            }
             ui.label(
                 RichText::new("Backup contains plaintext keyrings, choose a passphrase")
                     .color(theme::TERTIARY),

@@ -13,6 +13,8 @@ const WINDOW_MIN_SIZE: [f32; 2] = [960.0, 600.0];
 
 /// Connects to the Secret Service, starts the worker and opens the window.
 fn main() -> eframe::Result<()> {
+    // Must run while the process has a single thread.
+    kring::local_time::init();
     let Connected {
         runtime: _bus_runtime,
         store,

@@ -9,8 +9,8 @@ use kring_core::model::{Attributes, CollectionInfo, ItemInfo};
 use crate::app_state::AppState;
 use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
-use crate::ui::widgets::{card_frame, muted, primary_button, search_box};
-use crate::views::collection::{attributes_summary, format_date, matches_filter};
+use crate::ui::widgets::{card_frame, muted, primary_button, search_box, secondary_button};
+use crate::views::collection::{MSG_UNLOCK_FIRST, attributes_summary, format_date, matches_filter};
 use crate::views::dialogs::DialogKind;
 use crate::views::item_detail::{self, AttrEditor};
 use crate::views::{Action, Gates};
@@ -23,18 +23,19 @@ pub const CARD_GAP: f32 = 8.0;
 const HEADER_GAP: f32 = 12.0;
 /// Side of the chevron and lock glyph boxes.
 const GLYPH_BOX: f32 = 20.0;
-/// Tooltip of "+ New item" while the collection is locked.
-const MSG_LOCKED: &str = "Unlock the keyring first";
 /// Width of the item search box.
 const SEARCH_WIDTH: f32 = 260.0;
 
-/// Renders "+ New item" and the item search box.
+/// Renders "+ New item", "Import archive" and the item search box.
 fn _toolbar(ui: &mut Ui, c: &CollectionInfo, filter: &mut String, gates: Gates) -> Option<Action> {
     let mut action = None;
     ui.horizontal(|ui| {
-        let locked = c.locked.then_some(MSG_LOCKED);
-        if primary_button(ui, "+  New item", gates.write.or(locked)) {
+        let blocked = gates.write.or(c.locked.then_some(MSG_UNLOCK_FIRST));
+        if primary_button(ui, "+  New item", blocked) {
             action = Some(Action::Open(DialogKind::new_item(c.id.clone())));
+        }
+        if secondary_button(ui, "Import archive", blocked) {
+            action = Some(Action::Open(DialogKind::import_archive(c)));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.set_max_width(SEARCH_WIDTH);

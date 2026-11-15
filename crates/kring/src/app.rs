@@ -1,5 +1,6 @@
 //! The main window: wires worker events, views, dialogs, toasts and the clipboard.
 
+use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,7 @@ use crate::copy_flow::SecretCopier;
 use crate::dev_preset::DevPreset;
 use crate::ui::theme;
 use crate::ui::toasts::{ToastKind, Toasts, kind_for_status, user_message};
+use crate::views::backups::{self, BackupView};
 use crate::views::dialogs::{Dialog, DialogKind, Outcome};
 use crate::views::file_items::FileView;
 use crate::views::item_detail::AttrEditor;
@@ -58,6 +60,10 @@ pub struct KringApp {
     files_filter: String,
     /// Card state of the selected keyring file (expanded card, shown secrets).
     file_view: FileView,
+    /// Selected backup and the files checked for a restore.
+    backup_view: BackupView,
+    /// Keyrings directory, where restores write (same as the worker's).
+    keyrings_dir: PathBuf,
     toasts: Toasts,
     /// Screenshot preset (debug builds, isolated session only).
     #[cfg(debug_assertions)]
@@ -80,6 +86,8 @@ impl KringApp {
             area: Area::default(),
             files_filter: String::new(),
             file_view: FileView::default(),
+            backup_view: BackupView::default(),
+            keyrings_dir: kring_core::paths::keyrings_dir(),
             toasts: Toasts::default(),
             #[cfg(debug_assertions)]
             dev: DevPreset::default(),
@@ -161,9 +169,9 @@ impl KringApp {
             }
             Action::Open(kind) => self.dialog = Some(Dialog::new(kind)),
             Action::SwitchArea(to) => {
-                let cmd = switch_area(&mut self.state, self.area, to);
+                let cmds = switch_area(&mut self.state, self.area, to);
                 self.area = to;
-                if let Some(cmd) = cmd {
+                for cmd in cmds {
                     self._send(cmd);
                 }
             }
@@ -182,6 +190,16 @@ impl KringApp {
                 };
                 self.copier.copy_value(&secret, &mut self.state);
             }
+        }
+    }
+
+    /// Reloads the backup list after a backup or restore while it is shown.
+    fn _reload_stale_backups(&mut self) {
+        if !self.state.take_backups_stale() || self.area != Area::Backups {
+            return;
+        }
+        for cmd in crate::views::backups_commands() {
+            self._send(cmd);
         }
     }
 
@@ -221,6 +239,10 @@ impl KringApp {
         let actions = match self.area {
             Area::Secrets => self.dev.take_actions(&self.state, &self.filter),
             Area::Files => self.dev.take_file_actions(&self.state),
+            Area::Backups => {
+                self.dev
+                    .take_backup_actions(&self.state, &mut self.backup_view, &self.keyrings_dir)
+            }
         };
         for action in actions {
             self._handle(action);
@@ -308,6 +330,7 @@ impl KringApp {
                         sidebar::show(ui, &self.state, &mut self.keyring_filter, gates)
                     }
                     Area::Files => files_list::show(ui, &self.state, &mut self.files_filter),
+                    Area::Backups => backups::list(ui, &self.state, &mut self.backup_view),
                 };
                 action = found.or(action.take());
             });
@@ -325,6 +348,9 @@ impl KringApp {
                         collection::show(ui, &self.state, &mut self.filter, &mut self.editor, gates)
                     }
                     Area::Files => file_detail::show(ui, &self.state, &mut self.file_view, gates),
+                    Area::Backups => {
+                        backups::detail(ui, &self.state, &mut self.backup_view, &self.keyrings_dir)
+                    }
                 };
                 action = found.or(action.take());
             });
@@ -338,6 +364,7 @@ impl eframe::App for KringApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self._drain_events();
+        self._reload_stale_backups();
         self.copier.finish(&mut self.state);
         self._hide_locked_secret();
         self._auto_select();

@@ -12,7 +12,9 @@
 # and, before the daemon starts, the synthetic fixtures of
 # crates/kring-core/tests/fixtures/keyrings are copied into the TEMP keyrings
 # dir (never from the real one), so the Offline files area has binary,
-# plaintext, unreadable (multi-line secret), empty and garbage files.
+# plaintext, unreadable (multi-line secret), empty and garbage files. The seed
+# also writes two backups of those temp fixtures into the temp backups dir
+# (passphrase `backup`) for the Backups area.
 # The temp dir is deleted on exit unless KRING_DEV_KEEP=1.
 set -u
 
@@ -81,6 +83,7 @@ fi
 mkdir -p "$TEMP_KEYRINGS"
 chmod 700 "$TEMP_KEYRINGS"
 for f in "$FIXTURES_DIR"/*.keyring; do
+  [ -e "$f" ] || continue
   install -m 600 "$f" "$TEMP_KEYRINGS/"
 done
 

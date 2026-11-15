@@ -6,11 +6,14 @@
 //! bus that is not the real user bus), so a leftover export in a normal
 //! session cannot reveal a secret from the real keyring.
 
+use std::path::Path;
+
 use kring_core::dev_guard::{IT_RUNTIME_VAR, violation_from};
 use kring_core::model::CollectionId;
 
 use crate::app_state::AppState;
-use crate::views::collection::display_name;
+use crate::views::backups::{BackupView, restore_dialog};
+use crate::views::collection::{display_name, export_dialog};
 use crate::views::dialogs::DialogKind;
 use crate::views::file_detail::retire_dialog;
 use crate::views::file_items::displayed_file_items;
@@ -24,15 +27,21 @@ const VAR_SELECT: &str = "KRING_DEV_SELECT";
 const VAR_EXPAND: &str = "KRING_DEV_EXPAND";
 /// Any non-empty value reveals the expanded item's secret.
 const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
-/// Dialog to open: `new-keyring` or `unlock`; in the files area `import`,
-/// `retire` or `open` (password of a binary file).
+/// Dialog to open: `new-keyring`, `unlock`, `export` or `import-archive`; in
+/// the files area `import`, `retire` or `open` (password of a binary file);
+/// in the backups area `restore` (confirmation) or `restore-now` (restores
+/// every file of the selected backup without a passphrase).
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
-/// Area to show first: `files` selects the Offline files area.
+/// Area to show first: `files` or `backups`.
 const VAR_AREA: &str = "KRING_DEV_AREA";
 /// Keyring file (name without `.keyring`) to select in the files area.
 const VAR_FILE: &str = "KRING_DEV_FILE";
+/// Index (newest first) of the backup to select in the backups area.
+const VAR_BACKUP: &str = "KRING_DEV_BACKUP";
 /// Value of [`VAR_AREA`] selecting the Offline files area.
 const AREA_FILES: &str = "files";
+/// Value of [`VAR_AREA`] selecting the Backups area.
+const AREA_BACKUPS: &str = "backups";
 
 /// Initial state requested for screenshots.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -50,6 +59,8 @@ pub struct DevPreset {
     pub area: Option<String>,
     /// Keyring file to select in the files area.
     pub file: Option<String>,
+    /// Backup (index, newest first) to select in the backups area.
+    pub backup: Option<usize>,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -71,6 +82,7 @@ pub fn preset_from(
         dialog: var(VAR_DIALOG),
         area: var(VAR_AREA),
         file: var(VAR_FILE),
+        backup: var(VAR_BACKUP).and_then(|v| v.parse().ok()),
     }
 }
 
@@ -102,7 +114,49 @@ impl DevPreset {
     /// Area to switch to at start; returned once.
     pub fn take_area(&mut self) -> Option<Area> {
         let area = self.area.take()?;
-        (area == AREA_FILES).then_some(Area::Files)
+        match area.as_str() {
+            AREA_FILES => Some(Area::Files),
+            AREA_BACKUPS => Some(Area::Backups),
+            _ => None,
+        }
+    }
+
+    /// Backups area actions due now: selects the preset backup in `view`
+    /// once listed, then opens or sends the restore; each fires once.
+    pub fn take_backup_actions(
+        &mut self,
+        state: &AppState,
+        view: &mut BackupView,
+        keyrings_dir: &Path,
+    ) -> Vec<Action> {
+        if let Some(index) = self.backup {
+            let Some(info) = state.backups.get(index) else {
+                return Vec::new();
+            };
+            view.select(Some(info.dir.clone()));
+            self.backup = None;
+        }
+        let Some(info) = view
+            .selected
+            .as_ref()
+            .and_then(|d| state.backups.iter().find(|b| &b.dir == d))
+        else {
+            return Vec::new();
+        };
+        let action = match self.dialog.as_deref() {
+            Some("restore") => {
+                let checked = view.checked(info);
+                Action::Open(restore_dialog(info, &checked, &state.files, keyrings_dir))
+            }
+            Some("restore-now") => Action::Send(Command::RestoreBackup {
+                dir: info.dir.clone(),
+                files: info.files.iter().map(|f| f.original.clone()).collect(),
+                passphrase: None,
+            }),
+            _ => return Vec::new(),
+        };
+        self.dialog = None;
+        vec![action]
     }
 
     /// Files area actions due now (select file, dialog); each fires once when its data exists.
@@ -167,9 +221,15 @@ impl DevPreset {
             }
         }
         let locked = state.collections.iter().find(|c| c.locked);
-        let kind = match (self.dialog.as_deref(), locked) {
-            (Some("new-keyring"), _) => Some(DialogKind::create_collection()),
-            (Some("unlock"), Some(c)) => Some(DialogKind::unlock(c.id.clone(), display_name(c))),
+        let selected = state
+            .selected
+            .as_ref()
+            .and_then(|id| state.collections.iter().find(|c| &c.id == id));
+        let kind = match (self.dialog.as_deref(), locked, selected) {
+            (Some("new-keyring"), _, _) => Some(DialogKind::create_collection()),
+            (Some("unlock"), Some(c), _) => Some(DialogKind::unlock(c.id.clone(), display_name(c))),
+            (Some("export"), _, Some(c)) => Some(export_dialog(c)),
+            (Some("import-archive"), _, Some(c)) => Some(DialogKind::import_archive(c)),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -202,6 +262,7 @@ mod tests {
             VAR_DIALOG => Some("unlock".into()),
             VAR_AREA => Some("files".into()),
             VAR_FILE => Some("textual_two_items".into()),
+            VAR_BACKUP => Some("1".into()),
             _ => None,
         }
     }
@@ -219,6 +280,7 @@ mod tests {
                 dialog: Some("unlock".into()),
                 area: Some("files".into()),
                 file: Some("textual_two_items".into()),
+                backup: Some(1),
             }
         );
     }
@@ -304,6 +366,46 @@ mod tests {
         assert_eq!(p.take_file_card(&s), Some((1, true)));
         assert!(p.take_file_card(&s).is_none());
         assert_eq!(DevPreset::default().take_area(), None);
+    }
+
+    /// The backups area is entered; the backup is selected once listed, then
+    /// the restore confirmation opens with every file.
+    #[test]
+    fn backups_area_preset() {
+        use kring_core::backup::{BackupFile, BackupInfo};
+        let mut p = DevPreset {
+            area: Some("backups".into()),
+            backup: Some(1),
+            dialog: Some("restore".into()),
+            ..DevPreset::default()
+        };
+        assert_eq!(p.take_area(), Some(Area::Backups));
+        let mut view = BackupView::default();
+        let mut s = AppState::default();
+        let k = Path::new("/k");
+        assert!(p.take_backup_actions(&s, &mut view, k).is_empty());
+        let info = |dir: &str| BackupInfo {
+            dir: dir.into(),
+            reason: "delete-item".into(),
+            created: String::new(),
+            files: vec![BackupFile {
+                original: "/x/a.keyring".into(),
+                stored: "/s/a.keyring".into(),
+                sha256: String::new(),
+                encrypted: false,
+            }],
+            seq: 0,
+            prune_warning: None,
+        };
+        s.apply(Event::Backups(vec![info("/b/2"), info("/b/1")]));
+        let actions = p.take_backup_actions(&s, &mut view, k);
+        assert_eq!(view.selected.as_deref(), Some(Path::new("/b/1")));
+        assert!(matches!(
+            &actions[..],
+            [Action::Open(DialogKind::RestoreBackup { destinations, .. })]
+                if destinations == &["/k/a.keyring"]
+        ));
+        assert!(p.take_backup_actions(&s, &mut view, k).is_empty());
     }
 
     /// The expand index follows the displayed (label-sorted) order, once.

@@ -14,17 +14,15 @@ const BRAND_SIZE: f32 = 36.0;
 const BRAND_RADIUS: u8 = 8;
 /// Opacity of the glyphs of areas not implemented yet.
 const SOON_ALPHA: f32 = 0.4;
-/// Areas that are implemented, with their glyph and tooltip.
-const AREAS: [(Area, Ico, &str); 2] = [
-    (Area::Secrets, Ico::Key, "Secrets"),
-    (Area::Files, Ico::Folder, "Offline files"),
-];
-/// Areas that are not implemented yet, with their glyph.
-const FUTURE_AREAS: [(Ico, &str); 4] = [
-    (Ico::Wallet, "KWallet"),
-    (Ico::Terminal, "SSH keys"),
-    (Ico::Shield, "GPG keys"),
-    (Ico::Sliders, "Tools"),
+/// Rail tiles in order: the area (`None` when not implemented yet), glyph
+/// and tooltip.
+const TILES: [(Option<Area>, Ico, &str); 6] = [
+    (Some(Area::Secrets), Ico::Key, "Secrets"),
+    (Some(Area::Files), Ico::Folder, "Offline files"),
+    (None, Ico::Wallet, "KWallet"),
+    (None, Ico::Terminal, "SSH keys"),
+    (None, Ico::Shield, "GPG keys"),
+    (Some(Area::Backups), Ico::Archive, "Backups"),
 ];
 
 /// State of the background worker shown by the rail dot.
@@ -134,13 +132,14 @@ pub fn show(ui: &mut Ui, activity: WorkerActivity, current: Area) -> Option<Area
     ui.vertical_centered(|ui| {
         _brand(ui);
         ui.add_space(14.0);
-        for (area, ico, tip) in AREAS {
+        for (area, ico, tip) in TILES {
+            let Some(area) = area else {
+                _tile(ui, ico, &format!("{tip} - coming soon"), false, false);
+                continue;
+            };
             if _tile(ui, ico, tip, area == current, true) {
                 clicked = Some(area);
             }
-        }
-        for (ico, area) in FUTURE_AREAS {
-            _tile(ui, ico, &format!("{area} - coming soon"), false, false);
         }
     });
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
@@ -152,6 +151,16 @@ pub fn show(ui: &mut Ui, activity: WorkerActivity, current: Area) -> Option<Area
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every area has exactly one enabled tile; Backups replaced Tools.
+    #[test]
+    fn tiles_cover_areas() {
+        for area in [Area::Secrets, Area::Files, Area::Backups] {
+            assert_eq!(TILES.iter().filter(|t| t.0 == Some(area)).count(), 1);
+        }
+        assert!(TILES.iter().all(|t| t.2 != "Tools"));
+        assert_eq!(TILES[5], (Some(Area::Backups), Ico::Archive, "Backups"));
+    }
 
     /// Stopped wins over busy, which wins over idle.
     #[test]
