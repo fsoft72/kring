@@ -7,12 +7,11 @@
 //! detection, so it cannot shadow a real item); anything else is created with
 //! `replace = false`. Attribute equality ignores `xdg:content-type`.
 
-use oo7::CONTENT_TYPE_ATTRIBUTE;
-
 use crate::error::{KringError, Result};
 use crate::keyring_file::textual::OfflineItem;
 use crate::model::{Attributes, CollectionId, ItemInfo, NewItem, SecretValue};
 use crate::store::SecretStore;
+use crate::transfer::plan::{Action, Existing, Incoming, TransferSource, identity, plan_transfer};
 
 /// What the import does with one incoming item.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,13 +52,6 @@ pub struct ImportReport {
     pub no_secret: usize,
 }
 
-/// Returns the attributes used for equality, without `xdg:content-type`.
-fn comparable(attrs: &Attributes) -> Attributes {
-    let mut out = attrs.clone();
-    out.remove(CONTENT_TYPE_ATTRIBUTE);
-    out
-}
-
 /// Decides what to do with each incoming item, in order (pure).
 ///
 /// Earlier incoming items that will be created count as existing for later
@@ -69,39 +61,43 @@ pub fn plan_import(
     incoming: &[OfflineItem],
     existing: &[(ItemInfo, SecretValue)],
 ) -> Vec<ImportPlanEntry> {
-    let mut known: Vec<(Attributes, &[u8])> = existing
+    let incoming_items: Vec<Incoming> = incoming
         .iter()
-        .map(|(info, secret)| (comparable(&info.attributes), secret.as_bytes()))
-        .collect();
-    let mut plan = Vec::with_capacity(incoming.len());
-    for item in incoming {
-        if item.secret_missing {
-            plan.push(ImportPlanEntry {
-                label: item.label.clone(),
-                attributes: item.attributes.clone(),
-                decision: ImportDecision::SkipNoSecret,
-            });
-            continue;
-        }
-        let attrs = comparable(&item.attributes);
-        let mut same_attrs = known.iter().filter(|(a, _)| *a == attrs).peekable();
-        let decision = if same_attrs.peek().is_none() {
-            ImportDecision::Create
-        } else if same_attrs.any(|(_, s)| *s == item.secret.as_bytes()) {
-            ImportDecision::SkipDuplicate
-        } else {
-            ImportDecision::SkipConflict
-        };
-        if decision == ImportDecision::Create {
-            known.push((attrs, item.secret.as_bytes()));
-        }
-        plan.push(ImportPlanEntry {
+        .enumerate()
+        .map(|(index, item)| Incoming {
+            source: TransferSource::Offline(index),
             label: item.label.clone(),
             attributes: item.attributes.clone(),
-            decision,
-        });
-    }
-    plan
+            secret: item.secret.clone(),
+            secret_missing: item.secret_missing,
+            modified: item.modified,
+        })
+        .collect();
+    let existing_items: Vec<Existing> = existing
+        .iter()
+        .map(|(info, secret)| Existing {
+            id: info.id.clone(),
+            label: info.label.clone(),
+            attributes: info.attributes.clone(),
+            secret: secret.clone(),
+            modified: info.modified,
+        })
+        .collect();
+    let plan = plan_transfer(&incoming_items, &existing_items);
+    incoming
+        .iter()
+        .zip(&plan.actions)
+        .map(|(item, action)| ImportPlanEntry {
+            label: item.label.clone(),
+            attributes: item.attributes.clone(),
+            decision: match action {
+                Action::Create => ImportDecision::Create,
+                Action::Duplicate { .. } | Action::SkipSameBatch => ImportDecision::SkipDuplicate,
+                Action::Conflict(_) | Action::ConflictSameBatch => ImportDecision::SkipConflict,
+                Action::NoSecret => ImportDecision::SkipNoSecret,
+            },
+        })
+        .collect()
 }
 
 /// Imports `incoming` into `target`, following the policy in the module docs.
@@ -125,11 +121,11 @@ pub async fn import_items<S: SecretStore + ?Sized>(
     let incoming_attrs: Vec<Attributes> = incoming
         .iter()
         .filter(|i| !i.secret_missing)
-        .map(|i| comparable(&i.attributes))
+        .map(|i| identity(&i.attributes))
         .collect();
     let mut existing = Vec::new();
     for info in store.list_items(target).await? {
-        if !incoming_attrs.contains(&comparable(&info.attributes)) {
+        if !incoming_attrs.contains(&identity(&info.attributes)) {
             continue;
         }
         let secret = store.read_secret(&info.id).await?;
@@ -164,6 +160,7 @@ mod tests {
     use super::*;
     use crate::fake_store::FakeStore;
     use crate::model::{ItemId, ItemUpdate};
+    use oo7::CONTENT_TYPE_ATTRIBUTE;
 
     /// Builds attributes from pairs.
     fn attrs(pairs: &[(&str, &str)]) -> Attributes {
@@ -241,7 +238,7 @@ mod tests {
     #[test]
     fn comparable_drops_content_type() {
         let a = attrs(&[("a", "1"), (CONTENT_TYPE_ATTRIBUTE, "text/plain")]);
-        assert_eq!(comparable(&a), attrs(&[("a", "1")]));
+        assert_eq!(identity(&a), attrs(&[("a", "1")]));
         let ex = [existing(
             &[("a", "1"), (CONTENT_TYPE_ATTRIBUTE, "text/plain")],
             "s",
