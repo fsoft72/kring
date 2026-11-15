@@ -16,10 +16,12 @@ use crate::app_state::AppState;
 use crate::views::backups::{BackupView, path_exists, restore_dialog};
 use crate::views::collection::{display_name, export_dialog, shown_name};
 use crate::views::consolidate::{default_target, needs_passphrases};
+use crate::views::dialog_ssh::SshDialog;
 use crate::views::dialogs::DialogKind;
 use crate::views::file_detail::{delete_dialog, retire_dialog};
 use crate::views::file_items::displayed_file_items;
 use crate::views::item_list::displayed_items;
+use crate::views::ssh_detail::selected_key;
 use crate::views::transfer::default_choices;
 use crate::views::wallet_detail::import_dialog;
 use crate::views::wallet_items::wallet_groups;
@@ -49,7 +51,7 @@ const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
 /// passphrase dialog of the apply) or `consolidate-now` (then applies with
 /// the preselected choices and [`DEV_PASSPHRASE`] for every passphrase).
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
-/// Area to show first: `files`, `kwallet`, `backups` or `consolidate`.
+/// Area to show first: `files`, `kwallet`, `ssh`, `backups` or `consolidate`.
 const VAR_AREA: &str = "KRING_DEV_AREA";
 /// Wallet (name without `.kwl`) to select in the KWallet area. Its dialogs
 /// ([`VAR_DIALOG`]): `wallet-password` (the password dialog), `wallet-open`
@@ -59,6 +61,17 @@ const VAR_AREA: &str = "KRING_DEV_AREA";
 const VAR_WALLET: &str = "KRING_DEV_WALLET";
 /// Value of [`VAR_AREA`] selecting the KWallet area.
 const AREA_KWALLET: &str = "kwallet";
+/// Value of [`VAR_AREA`] selecting the SSH keys area.
+const AREA_SSH: &str = "ssh";
+/// SSH key (file name) to select in the SSH keys area. Its dialogs
+/// ([`VAR_DIALOG`]): `ssh-new`, `ssh-import`, `ssh-agent-add`,
+/// `ssh-export`, `ssh-change`, `ssh-delete` (open the dialog),
+/// `ssh-agent-add-now` (adds the key, an encrypted one with
+/// [`DEV_SSH_KEY_PASSPHRASE`]) or `ssh-delete-now` (deletes it, backing up
+/// an unencrypted key with [`DEV_PASSPHRASE`], showing the progress modal).
+const VAR_SSH_KEY: &str = "KRING_DEV_SSH_KEY";
+/// Passphrase of the encrypted fixture key seeded by `scripts/dev-session.sh`.
+const DEV_SSH_KEY_PASSPHRASE: &str = "fixture-pw";
 /// Password of the fixture wallet seeded by `scripts/dev-session.sh`.
 const DEV_WALLET_PASSWORD: &str = "fixture-pw";
 /// Keyring file (name without `.keyring`) to select in the files area.
@@ -117,6 +130,8 @@ pub struct DevPreset {
     pub wallet: Option<String>,
     /// The open request of the preset wallet was sent.
     pub wallet_open_sent: bool,
+    /// SSH key to select in the SSH keys area.
+    pub ssh_key: Option<String>,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -144,6 +159,7 @@ pub fn preset_from(
         remember: var(VAR_REMEMBER).is_some(),
         wallet: var(VAR_WALLET),
         wallet_open_sent: false,
+        ssh_key: var(VAR_SSH_KEY),
     }
 }
 
@@ -183,6 +199,7 @@ impl DevPreset {
         match area.as_str() {
             AREA_FILES => Some(Area::Files),
             AREA_KWALLET => Some(Area::KWallet),
+            AREA_SSH => Some(Area::Ssh),
             AREA_BACKUPS => Some(Area::Backups),
             AREA_CONSOLIDATE => Some(Area::Consolidate),
             _ => None,
@@ -335,6 +352,58 @@ impl DevPreset {
             _ => None,
         };
         action.into_iter().collect()
+    }
+
+    /// SSH keys area actions due now: selects the preset key once scanned,
+    /// then opens its dialog or sends its command; each fires once.
+    pub fn take_ssh_actions(&mut self, state: &AppState) -> Vec<Action> {
+        if let Some(name) = self.ssh_key.as_deref() {
+            if !state.ssh_keys.iter().any(|k| k.name == name) {
+                return Vec::new();
+            }
+            let name = self.ssh_key.take().unwrap_or_default();
+            return vec![Action::SelectSshKey(name)];
+        }
+        let wanted = self.dialog.as_deref().filter(|d| d.starts_with("ssh-"));
+        // Wait for the scan: the new key dialog avoids existing names.
+        let Some(dialog) = wanted.filter(|_| !state.ssh_keys.is_empty()) else {
+            return Vec::new();
+        };
+        let dialog = dialog.to_string();
+        let open = |d: SshDialog| vec![Action::Open(DialogKind::Ssh(d))];
+        match dialog.as_str() {
+            "ssh-new" => {
+                self.dialog = None;
+                return open(SshDialog::generate(&state.ssh_keys));
+            }
+            "ssh-import" => {
+                self.dialog = None;
+                return open(SshDialog::import());
+            }
+            _ => {}
+        }
+        let Some(info) = selected_key(state) else {
+            return Vec::new();
+        };
+        self.dialog = None;
+        let encrypted = info.encrypted == Some(true);
+        match dialog.as_str() {
+            "ssh-agent-add" => open(SshDialog::agent_add(info)),
+            "ssh-export" => open(SshDialog::export(info)),
+            "ssh-change" => open(SshDialog::change_passphrase(info)),
+            "ssh-delete" => open(SshDialog::delete(info, state.ssh_key_in_agent(info))),
+            "ssh-agent-add-now" => vec![Action::Send(Command::AgentAdd {
+                name: info.name.clone(),
+                passphrase: encrypted.then(|| SecretValue::from_text(DEV_SSH_KEY_PASSPHRASE)),
+                lifetime_secs: None,
+            })],
+            "ssh-delete-now" => vec![Action::Send(Command::DeleteSshKey {
+                name: info.name.clone(),
+                backup_passphrase: (info.encrypted == Some(false))
+                    .then(|| SecretValue::from_text(DEV_PASSPHRASE)),
+            })],
+            _ => Vec::new(),
+        }
     }
 
     /// KWallet area card to expand, as `(index into wallet_items, reveal)`
@@ -575,6 +644,7 @@ mod tests {
             VAR_BACKUP => Some("1".into()),
             VAR_REMEMBER => Some("1".into()),
             VAR_WALLET => Some("fixture".into()),
+            VAR_SSH_KEY => Some("id_ed25519".into()),
             _ => None,
         }
     }
@@ -598,6 +668,7 @@ mod tests {
                 remember: true,
                 wallet: Some("fixture".into()),
                 wallet_open_sent: false,
+                ssh_key: Some("id_ed25519".into()),
             }
         );
     }
@@ -1117,5 +1188,48 @@ mod tests {
             [Action::Open(DialogKind::ImportWallet { .. })]
         ));
         assert!(p.take_wallet_actions(&s, gates).is_empty());
+    }
+
+    /// The SSH preset selects the key once scanned, then sends the add with
+    /// the fixture passphrase of an encrypted key; dialogs open once.
+    #[test]
+    fn ssh_area_preset() {
+        use crate::views::dialog_ssh::tests::key;
+        let mut p = DevPreset {
+            area: Some(AREA_SSH.into()),
+            ssh_key: Some("id_ed25519_enc".into()),
+            dialog: Some("ssh-agent-add-now".into()),
+            ..DevPreset::default()
+        };
+        assert_eq!(p.take_area(), Some(Area::Ssh));
+        let mut s = AppState::default();
+        assert!(p.take_ssh_actions(&s).is_empty(), "not scanned yet");
+        s.apply(Event::SshKeys(vec![key("id_ed25519_enc", Some(true))]));
+        let actions = p.take_ssh_actions(&s);
+        assert!(matches!(&actions[..], [Action::SelectSshKey(n)] if n == "id_ed25519_enc"));
+        s.select_ssh_key("id_ed25519_enc".into());
+        let actions = p.take_ssh_actions(&s);
+        let [Action::Send(Command::AgentAdd { passphrase, .. })] = &actions[..] else {
+            panic!("expected the agent add");
+        };
+        assert_eq!(
+            passphrase.as_ref().and_then(|p| p.as_text()),
+            Some(DEV_SSH_KEY_PASSPHRASE)
+        );
+        assert!(p.take_ssh_actions(&s).is_empty(), "sent once");
+        let mut p = DevPreset {
+            dialog: Some("ssh-new".into()),
+            ..DevPreset::default()
+        };
+        assert!(
+            p.take_ssh_actions(&AppState::default()).is_empty(),
+            "waits for the scan"
+        );
+        let actions = p.take_ssh_actions(&s);
+        assert!(matches!(
+            &actions[..],
+            [Action::Open(DialogKind::Ssh(SshDialog::Generate { .. }))]
+        ));
+        assert!(p.take_ssh_actions(&s).is_empty());
     }
 }

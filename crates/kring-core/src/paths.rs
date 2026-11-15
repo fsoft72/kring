@@ -46,13 +46,15 @@ pub fn backups_dir() -> PathBuf {
     data_home().join("kring").join("backups")
 }
 
-/// Resolves the SSH key directory `$HOME/.ssh` from an explicit HOME (pure, testable).
-pub fn ssh_dir_from(home: Option<&str>) -> PathBuf {
-    PathBuf::from(home.filter(|v| !v.is_empty()).unwrap_or("/")).join(".ssh")
+/// Resolves the SSH key directory `$HOME/.ssh` from an explicit HOME (pure,
+/// testable); `None` when HOME is unset or empty (no directory to scan).
+pub fn ssh_dir_from(home: Option<&str>) -> Option<PathBuf> {
+    let home = home.filter(|v| !v.is_empty())?;
+    Some(PathBuf::from(home).join(".ssh"))
 }
 
-/// Returns the user's SSH key directory, `$HOME/.ssh`.
-pub fn ssh_dir() -> PathBuf {
+/// Returns the user's SSH key directory, `$HOME/.ssh`; `None` without HOME.
+pub fn ssh_dir() -> Option<PathBuf> {
     ssh_dir_from(std::env::var("HOME").ok().as_deref())
 }
 
@@ -94,12 +96,15 @@ mod tests {
         );
     }
 
-    /// The SSH directory is `$HOME/.ssh`; an unset or empty HOME falls back to `/`.
+    /// The SSH directory is `$HOME/.ssh`; an unset or empty HOME gives none.
     #[test]
     fn ssh_dir_in_home() {
-        assert_eq!(ssh_dir_from(Some("/home/u")), PathBuf::from("/home/u/.ssh"));
-        assert_eq!(ssh_dir_from(Some("")), PathBuf::from("/.ssh"));
-        assert_eq!(ssh_dir_from(None), PathBuf::from("/.ssh"));
+        assert_eq!(
+            ssh_dir_from(Some("/home/u")),
+            Some(PathBuf::from("/home/u/.ssh"))
+        );
+        assert_eq!(ssh_dir_from(Some("")), None, "empty HOME: no SSH dir");
+        assert_eq!(ssh_dir_from(None), None, "unset HOME: no SSH dir");
     }
 
     /// The agent socket is taken from a non-empty `SSH_AUTH_SOCK` value only.

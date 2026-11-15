@@ -20,6 +20,7 @@ use crate::views::dialog_remember::{
     asks_passphrase, cleared, fill_passphrases, passphrase_of, remember_row, remembered_row,
     reopens_when_wrong, uses_remembered,
 };
+use crate::views::dialog_ssh::SshDialog;
 use crate::views::dialog_submit::command_for;
 use crate::views::file_detail::default_import_target;
 use crate::views::transfer::transfer_targets;
@@ -252,6 +253,8 @@ pub enum DialogKind {
         new_password: Zeroizing<String>,
         confirm: Zeroizing<String>,
     },
+    /// A dialog of the SSH keys area.
+    Ssh(SshDialog),
     /// Choose a passphrase for a backup containing plaintext keyrings.
     Passphrase {
         command: Box<Command>,
@@ -578,6 +581,16 @@ impl Dialog {
     pub fn retry(kind: DialogKind) -> Self {
         Self {
             error: Some(MSG_WRONG_TRY_AGAIN.to_string()),
+            retry: true,
+            ..Self::new(kind)
+        }
+    }
+
+    /// Reopens an SSH dialog whose key turned out to need a passphrase: it
+    /// now asks for it, under the error "Key passphrase required".
+    pub fn key_passphrase_required(kind: DialogKind) -> Self {
+        Self {
+            error: Some(kring_core::ssh::MSG_KEY_PASSPHRASE_REQUIRED.to_string()),
             retry: true,
             ..Self::new(kind)
         }

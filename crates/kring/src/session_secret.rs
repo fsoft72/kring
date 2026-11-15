@@ -14,6 +14,7 @@
 
 use kring_core::model::{CollectionId, SecretValue};
 
+use crate::views::dialog_remember::needing_key_passphrase;
 use crate::views::dialog_submit::with_backup_passphrase;
 use crate::views::dialogs::DialogKind;
 use crate::worker::{Command, Event};
@@ -37,15 +38,18 @@ const WRONG_PASSPHRASE: &str = "Wrong passphrase";
 
 /// Returns true when a worker error says the passphrase or password was
 /// wrong: backups and archives, KWallet wallets
-/// ([`kring_core::kwallet_file::MSG_WRONG_PASSWORD`]) and binary keyring
-/// files ([`kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX`]).
+/// ([`kring_core::kwallet_file::MSG_WRONG_PASSWORD`]), binary keyring
+/// files ([`kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX`])
+/// and SSH keys ([`kring_core::ssh::MSG_WRONG_KEY_PASSPHRASE`]).
 pub fn is_wrong_passphrase(msg: &str) -> bool {
     use kring_core::keyring_file::binary::MSG_WRONG_PASSWORD_PREFIX;
     use kring_core::kwallet_file::MSG_WRONG_PASSWORD;
+    use kring_core::ssh::MSG_WRONG_KEY_PASSPHRASE;
     [
         WRONG_PASSPHRASE,
         MSG_WRONG_PASSWORD,
         MSG_WRONG_PASSWORD_PREFIX,
+        MSG_WRONG_KEY_PASSPHRASE,
     ]
     .iter()
     .any(|part| msg.contains(part))
@@ -84,6 +88,8 @@ struct Window {
     error: bool,
     /// An error said the passphrase is wrong.
     wrong: bool,
+    /// An error said the SSH key needs a passphrase that was not sent.
+    key_required: bool,
     /// A passphrase was asked for again.
     asked: bool,
 }
@@ -112,6 +118,9 @@ pub enum FollowUp {
         /// Display name.
         label: String,
     },
+    /// Reopen this SSH dialog asking the key passphrase (the key turned out
+    /// to be encrypted).
+    KeyPassphrase(Box<DialogKind>),
     /// Say that the remembered passphrase was used (successful unlock).
     UsedRemembered,
 }
@@ -299,6 +308,7 @@ impl SessionSecret {
             Event::Error(msg) => {
                 window.error = true;
                 window.wrong |= is_wrong_passphrase(msg);
+                window.key_required |= msg == kring_core::ssh::MSG_KEY_PASSPHRASE_REQUIRED;
             }
             Event::PassphraseNeeded(_) | Event::ApplyPassphrasesNeeded { .. } => {
                 window.asked = true;
@@ -321,6 +331,9 @@ impl SessionSecret {
                 Some(FollowUp::Dialog(Box::new(DialogKind::passphrase(echo))))
             }
             AutoKind::Dialog(kind) if w.wrong && !w.done => Some(FollowUp::Dialog(kind)),
+            AutoKind::Dialog(kind) if w.key_required && !w.done => Some(FollowUp::KeyPassphrase(
+                Box::new(needing_key_passphrase(*kind)),
+            )),
             kind @ (AutoKind::Resend { .. } | AutoKind::Apply(_)) if w.asked => {
                 // Asked again: kept so the repeated request opens its dialog.
                 self.auto = Some(AutoUse {
@@ -633,5 +646,52 @@ mod tests {
         assert!(!s.is_remembered());
         assert!(s.value().is_none());
         assert!(s.resend(&delete_echo(), 1).is_none());
+    }
+
+    /// A wrong SSH key passphrase counts as a wrong passphrase (shared
+    /// constant) and reopens its dialog; a missing one reopens it asking
+    /// the key passphrase.
+    #[test]
+    fn ssh_key_passphrase_follow_ups() {
+        use crate::views::dialog_ssh::SshDialog;
+        use crate::views::dialog_ssh::tests::key;
+        use kring_core::ssh::{MSG_KEY_PASSPHRASE_REQUIRED, MSG_WRONG_KEY_PASSPHRASE};
+        assert!(is_wrong_passphrase(MSG_WRONG_KEY_PASSPHRASE));
+        assert!(!is_wrong_passphrase(MSG_KEY_PASSPHRASE_REQUIRED));
+        let mut s = SessionSecret::default();
+        let encrypted = DialogKind::Ssh(SshDialog::agent_add(&key("k", Some(true))));
+        s.used_in_dialog(encrypted, 1);
+        let wrong = [
+            Event::Error(MSG_WRONG_KEY_PASSPHRASE.into()),
+            Event::CommandFinished(1),
+        ];
+        assert!(matches!(
+            feed(&mut s, 1, &wrong),
+            Some(FollowUp::Dialog(k)) if matches!(*k, DialogKind::Ssh(SshDialog::AgentAdd { .. }))
+        ));
+        let plain = DialogKind::Ssh(SshDialog::agent_add(&key("p", Some(false))));
+        s.used_in_dialog(plain, 2);
+        let required = [
+            Event::Error(MSG_KEY_PASSPHRASE_REQUIRED.into()),
+            Event::CommandFinished(2),
+        ];
+        let Some(FollowUp::KeyPassphrase(kind)) = feed(&mut s, 2, &required) else {
+            panic!("expected the key passphrase dialog");
+        };
+        assert!(matches!(
+            *kind,
+            DialogKind::Ssh(SshDialog::AgentAdd {
+                encrypted: true,
+                ..
+            })
+        ));
+        // A typed candidate is not remembered after a wrong key passphrase.
+        s.remember_if_correct(SecretValue::from_text("typed"), 3);
+        let wrong = [
+            Event::Error(MSG_WRONG_KEY_PASSPHRASE.into()),
+            Event::CommandFinished(3),
+        ];
+        feed(&mut s, 3, &wrong);
+        assert!(!s.is_remembered());
     }
 }

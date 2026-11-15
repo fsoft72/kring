@@ -8,6 +8,7 @@ pub mod conflict_row;
 pub mod consolidate;
 pub mod dialog_body;
 pub mod dialog_remember;
+pub mod dialog_ssh;
 pub mod dialog_submit;
 pub mod dialogs;
 pub mod file_detail;
@@ -18,6 +19,8 @@ pub mod item_list;
 pub mod progress;
 pub mod rail;
 pub mod sidebar;
+pub mod ssh_detail;
+pub mod ssh_list;
 pub mod transfer;
 pub mod wallet_detail;
 pub mod wallet_items;
@@ -84,6 +87,10 @@ pub enum Action {
     DismissConsolidation,
     /// Ask to forget the passphrase remembered for the session.
     AskForgetPassphrase,
+    /// Select an SSH key and read its public key.
+    SelectSshKey(String),
+    /// Show an informational toast (e.g. after copying a public key).
+    Info(String),
 }
 
 /// Area of the window selected in the nav rail.
@@ -96,6 +103,8 @@ pub enum Area {
     Files,
     /// KWallet wallets on disk, read offline and migrated.
     KWallet,
+    /// SSH keys of `~/.ssh` and the identities of the ssh-agent.
+    Ssh,
     /// Backups of the keyring files and their restore.
     Backups,
     /// Consolidation of the orphan keyrings into one.
@@ -116,7 +125,8 @@ pub fn backups_commands() -> Vec<Command> {
 /// restore; leaving the Consolidate area drops the secrets revealed in its
 /// preview. Any switch drops the report of the last import. Entering Files
 /// or Consolidate rescans the keyrings directory (orphan files); entering
-/// Backups lists the backups too; entering KWallet scans the wallets.
+/// Backups lists the backups too; entering KWallet scans the wallets;
+/// entering SSH keys scans the keys and lists the agent.
 pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
     if from == to {
         return Vec::new();
@@ -126,12 +136,13 @@ pub fn switch_area(state: &mut AppState, from: Area, to: Area) -> Vec<Command> {
         Area::KWallet => state.close_wallet(),
         Area::Backups => state.last_restore = None,
         Area::Consolidate => state.set_consolidation_shown(false),
-        Area::Secrets => {}
+        Area::Secrets | Area::Ssh => {}
     }
     state.last_import = None;
     match to {
         Area::Files => vec![Command::ScanFiles],
         Area::KWallet => vec![Command::ScanWallets],
+        Area::Ssh => vec![Command::ScanSshKeys, Command::AgentList],
         Area::Backups => backups_commands(),
         Area::Consolidate => {
             state.set_consolidation_shown(true);
@@ -331,6 +342,19 @@ mod tests {
         let cmds = switch_area(&mut s, Area::Secrets, Area::Consolidate);
         assert!(matches!(&cmds[..], [Command::ScanFiles]));
         assert!(switch_area(&mut s, Area::Consolidate, Area::Backups).len() == 2);
+    }
+
+    /// Entering the SSH keys area scans the keys and lists the agent.
+    #[test]
+    fn switch_area_ssh() {
+        let mut s = AppState::default();
+        let cmds = switch_area(&mut s, Area::Secrets, Area::Ssh);
+        assert!(matches!(
+            &cmds[..],
+            [Command::ScanSshKeys, Command::AgentList]
+        ));
+        assert!(switch_area(&mut s, Area::Ssh, Area::Ssh).is_empty());
+        assert!(switch_area(&mut s, Area::Ssh, Area::Secrets).is_empty());
     }
 
     /// No provider blocks everything.

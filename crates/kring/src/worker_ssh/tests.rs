@@ -15,7 +15,7 @@ use kring_core::ssh::{
     MSG_KEY_PASSPHRASE_REQUIRED, MSG_WRONG_KEY_PASSPHRASE, NewKey, SshAlgorithm, SshKeyInfo,
 };
 
-use super::{AgentStatus, MSG_NO_AGENT};
+use super::{AgentStatus, MSG_NO_AGENT, MSG_NO_SSH_DIR, MSG_RESCAN_FAILED, finish};
 use crate::worker::{Command, Event, WorkerConfig, WorkerHandle, passphrase_echo, spawn};
 use crate::worker_transfer::invalidates_plan;
 
@@ -139,23 +139,36 @@ impl Env {
 /// Starts a worker without a Secret Service over a temp SSH directory
 /// seeded with the fixtures, using `agent` as its agent socket.
 fn env_with(agent: Option<PathBuf>) -> Env {
+    env_over(true, agent)
+}
+
+/// Builds the worker configuration over temp dir `dir`, with `ssh_dir`.
+fn config_in(dir: &Path, ssh_dir: Option<PathBuf>, agent: Option<PathBuf>) -> WorkerConfig {
+    WorkerConfig {
+        backups: BackupManager {
+            root: dir.join("backups"),
+            keep: BACKUP_KEEP,
+        },
+        keyrings_dir: dir.join("keyrings"),
+        pam_dir: dir.join("pam"),
+        kwallet_dir: dir.join("kwalletd"),
+        ssh_dir,
+        ssh_agent_sock: agent,
+    }
+}
+
+/// Starts a worker without a Secret Service; with `has_ssh_dir` its SSH
+/// directory is a temp copy of the fixtures, otherwise it has none (HOME
+/// unset).
+fn env_over(has_ssh_dir: bool, agent: Option<PathBuf>) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let ssh = dir.path().join("ssh");
     std::fs::create_dir(&ssh).unwrap();
     for name in FIXTURE_FILES {
         std::fs::copy(Path::new(FIXTURES).join(name), ssh.join(name)).unwrap();
     }
-    let config = WorkerConfig {
-        backups: BackupManager {
-            root: dir.path().join("backups"),
-            keep: BACKUP_KEEP,
-        },
-        keyrings_dir: dir.path().join("keyrings"),
-        pam_dir: dir.path().join("pam"),
-        kwallet_dir: dir.path().join("kwalletd"),
-        ssh_dir: ssh.clone(),
-        ssh_agent_sock: agent,
-    };
+    let ssh_dir = has_ssh_dir.then(|| ssh.clone());
+    let config = config_in(dir.path(), ssh_dir, agent);
     let handle = spawn::<FakeStore>(None, None, config, || {});
     // Startup: ProviderUnavailable and Pam.
     for _ in 0..2 {
@@ -667,4 +680,52 @@ fn plan_invalidation() {
     for cmd in drop {
         assert!(invalidates_plan(&cmd), "{cmd:?}");
     }
+}
+
+/// Without an SSH directory (HOME unset) a scan lists nothing without an
+/// error, and key commands fail with the explicit message.
+#[test]
+fn no_ssh_dir_lists_nothing() {
+    let mut env = env_over(false, None);
+    let events = env.run(Command::ScanSshKeys);
+    assert!(keys_of(&events).is_empty());
+    assert!(errors(&events).is_empty(), "{events:?}");
+    let events = env.run(Command::ReadSshPublicKey {
+        name: "id_ed25519".into(),
+    });
+    assert_eq!(errors(&events), [MSG_NO_SSH_DIR]);
+    let events = env.run(Command::DeleteSshKey {
+        name: "id_ed25519".into(),
+        backup_passphrase: Some(secret(BACKUP_PW)),
+    });
+    assert_eq!(errors(&events), [MSG_NO_SSH_DIR]);
+    assert!(env.key_path("id_ed25519").exists(), "nothing deleted");
+}
+
+/// A finished change reports `Done` even when the rescan after it fails;
+/// the scan error comes separately.
+#[test]
+fn finish_reports_done_when_rescan_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let ssh = dir.path().join("ssh");
+    std::fs::create_dir(&ssh).unwrap();
+    // Listable only with read permission: the rescan's read_dir fails.
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::read_dir(&ssh).is_ok() {
+        eprintln!("SKIPPED: running with permissions that bypass the mode");
+        return;
+    }
+    let config = config_in(dir.path(), Some(ssh.clone()), None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = crate::worker::Emitter::for_test(tx, || {});
+    finish(&out, &config, None, "Key 'k' created".into());
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let events: Vec<Event> = rx.try_iter().collect();
+    assert!(
+        matches!(events.last(), Some(Event::Done(m)) if m == "Key 'k' created"),
+        "{events:?}"
+    );
+    let errs = errors(&events);
+    assert_eq!(errs.len(), 1, "{events:?}");
+    assert!(errs[0].starts_with(MSG_RESCAN_FAILED), "{errs:?}");
 }

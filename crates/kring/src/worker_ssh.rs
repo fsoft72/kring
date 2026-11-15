@@ -29,6 +29,10 @@ use crate::worker::{Command, Emitter, Event, WorkerConfig, passphrase_echo};
 
 /// Reason shown when no agent socket is configured.
 pub(crate) const MSG_NO_AGENT: &str = "No ssh-agent: SSH_AUTH_SOCK is not set";
+/// Error of a key command without an SSH directory (HOME unset).
+pub const MSG_NO_SSH_DIR: &str = "No SSH key directory: HOME is not set";
+/// Prefix of the error of a failed rescan after a successful change.
+pub(crate) const MSG_RESCAN_FAILED: &str = "Cannot rescan the SSH keys";
 
 /// What the ssh-agent holds, or why it cannot be asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +99,14 @@ fn invalid(message: impl Into<String>) -> KringError {
     KringError::InvalidInput(message.into())
 }
 
+/// Returns the SSH directory, or [`MSG_NO_SSH_DIR`] when there is none.
+fn ssh_dir(config: &WorkerConfig) -> Result<&Path> {
+    config
+        .ssh_dir
+        .as_deref()
+        .ok_or_else(|| invalid(MSG_NO_SSH_DIR))
+}
+
 /// Resolves key `name` in a fresh scan of the SSH directory.
 ///
 /// Names with a `/`, empty names, `.` and `..` are refused before the scan;
@@ -103,45 +115,57 @@ fn resolve_key(config: &WorkerConfig, name: &str) -> Result<SshKeyInfo> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return Err(invalid("Invalid SSH key name"));
     }
-    scan_keys(&config.ssh_dir)?
+    scan_keys(ssh_dir(config)?)?
         .into_iter()
         .find(|k| k.name == name)
         .ok_or_else(|| invalid(format!("No SSH key named '{name}'")))
 }
 
-/// Scans the SSH directory and emits [`Event::SshKeys`].
+/// Scans the SSH directory and emits [`Event::SshKeys`]; without a
+/// directory (HOME unset) the list is empty (the UI says why).
 fn emit_keys<N: Fn()>(out: &Emitter<N>, config: &WorkerConfig) -> Result<()> {
-    out.emit(Event::SshKeys(scan_keys(&config.ssh_dir)?));
+    let keys = match &config.ssh_dir {
+        Some(dir) => scan_keys(dir)?,
+        None => Vec::new(),
+    };
+    out.emit(Event::SshKeys(keys));
     Ok(())
 }
 
-/// Reports a finished change: the backup, a rescan of the keys, then `Done`.
-fn finish<N: Fn()>(
+/// Reports a finished change: the backup, a rescan of the keys, then
+/// `Done`. The change happened even when the rescan fails: its error is
+/// reported on its own and `Done` still follows.
+pub(crate) fn finish<N: Fn()>(
     out: &Emitter<N>,
     config: &WorkerConfig,
     backup: Option<BackupInfo>,
     done: String,
-) -> Result<()> {
+) {
     if let Some(info) = backup {
         out.emit(Event::BackupCreated(info));
     }
-    emit_keys(out, config)?;
+    if let Err(e) = emit_keys(out, config) {
+        out.error(format!("{MSG_RESCAN_FAILED}: {}", message(&e)));
+    }
     out.emit(Event::Done(done));
-    Ok(())
 }
 
 /// Executes a key command.
 fn run_key<N: Fn()>(out: &Emitter<N>, config: &WorkerConfig, cmd: &Command) -> Result<()> {
-    let dir = &config.ssh_dir;
+    if matches!(cmd, Command::ScanSshKeys) {
+        return emit_keys(out, config);
+    }
+    let dir = ssh_dir(config)?;
     match cmd {
-        Command::ScanSshKeys => emit_keys(out, config),
         Command::GenerateSshKey(key) => {
             let info = generate_key(dir, key)?;
-            finish(out, config, None, format!("Key '{}' created", info.name))
+            finish(out, config, None, format!("Key '{}' created", info.name));
+            Ok(())
         }
         Command::ImportSshKey { source, name } => {
             let info = import_key(dir, source, name.as_deref())?;
-            finish(out, config, None, format!("Key '{}' imported", info.name))
+            finish(out, config, None, format!("Key '{}' imported", info.name));
+            Ok(())
         }
         Command::ReadSshPublicKey { name } => {
             let info = resolve_key(config, name)?;
@@ -185,7 +209,8 @@ fn run_key<N: Fn()>(out: &Emitter<N>, config: &WorkerConfig, cmd: &Command) -> R
                 None => "Passphrase removed",
             };
             let done = format!("{what}, backup in {}", backup.dir.display());
-            finish(out, config, Some(backup), done)
+            finish(out, config, Some(backup), done);
+            Ok(())
         }
         Command::DeleteSshKey {
             name,
@@ -194,7 +219,8 @@ fn run_key<N: Fn()>(out: &Emitter<N>, config: &WorkerConfig, cmd: &Command) -> R
             let info = resolve_key(config, name)?;
             let backup = delete_key(&config.backups, dir, &info, backup_passphrase.as_ref())?;
             let done = format!("Key '{name}' deleted, backup in {}", backup.dir.display());
-            finish(out, config, Some(backup), done)
+            finish(out, config, Some(backup), done);
+            Ok(())
         }
         _ => Err(invalid("Command sent to the SSH key path")),
     }

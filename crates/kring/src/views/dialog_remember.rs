@@ -33,6 +33,7 @@ pub fn asks_passphrase(kind: &DialogKind) -> bool {
         DialogKind::DeleteFile { spec, backup, .. } => *backup && spec.needs_passphrase,
         DialogKind::RestoreBackup { mode, .. } => *mode != RestorePassphrase::NotNeeded,
         DialogKind::ImportWallet { target, .. } => *target == Some(WalletTarget::Create),
+        DialogKind::Ssh(dialog) => dialog.asks_passphrase(),
         _ => false,
     }
 }
@@ -47,19 +48,35 @@ pub fn uses_remembered(kind: &DialogKind) -> bool {
 
 /// Returns true for the password dialogs that reopen (fields empty, "Wrong
 /// passphrase, try again") after a wrong password, even when typed: the
-/// binary keyring file and KWallet wallet passwords.
+/// binary keyring file and KWallet wallet passwords, and the SSH dialogs
+/// sending a key passphrase (they also reopen when the key turned out to
+/// need one, see [`needing_key_passphrase`]).
 pub fn reopens_when_wrong(kind: &DialogKind) -> bool {
-    matches!(
-        kind,
-        DialogKind::FilePassword { .. } | DialogKind::WalletPassword { .. }
-    )
+    match kind {
+        DialogKind::FilePassword { .. } | DialogKind::WalletPassword { .. } => true,
+        DialogKind::Ssh(dialog) => dialog.reopens_when_wrong(),
+        _ => false,
+    }
 }
 
-/// Returns a copy of `kind` with every passphrase field emptied.
+/// Returns a copy of `kind` with every passphrase field emptied (for the
+/// SSH dialogs the new key passphrases too).
 pub fn cleared(kind: &DialogKind) -> DialogKind {
     let mut kind = kind.clone();
     fill_passphrases(&mut kind, &SecretValue::from_text(""));
+    if let DialogKind::Ssh(dialog) = &mut kind {
+        dialog.clear_secrets();
+    }
     kind
+}
+
+/// Returns `kind` asking the key passphrase: an SSH dialog sent without
+/// one for a key the worker found encrypted. Other dialogs are unchanged.
+pub fn needing_key_passphrase(kind: DialogKind) -> DialogKind {
+    match kind {
+        DialogKind::Ssh(dialog) => DialogKind::Ssh(dialog.needing_key_passphrase()),
+        other => other,
+    }
 }
 
 /// Replaces `buffer` with `text`.
@@ -134,6 +151,7 @@ pub fn fill_passphrases(kind: &mut DialogKind, secret: &SecretValue) {
                 _set(buffer, text);
             }
         }
+        DialogKind::Ssh(dialog) => dialog.fill(text),
         _ => {}
     }
 }
@@ -182,6 +200,17 @@ pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
         } => backup_passphrase
             .as_ref()
             .or(orphan_files_passphrase.as_ref()),
+        Command::AgentAdd { passphrase, .. } | Command::ExportSshPrivate { passphrase, .. } => {
+            passphrase.as_ref()
+        }
+        Command::ChangeSshPassphrase {
+            old,
+            backup_passphrase,
+            ..
+        } => old.as_ref().or(backup_passphrase.as_ref()),
+        Command::DeleteSshKey {
+            backup_passphrase, ..
+        } => backup_passphrase.as_ref(),
         _ => None,
     }
 }
@@ -375,5 +404,49 @@ mod tests {
         };
         assert!(passphrase_of(&none).is_none());
         assert!(passphrase_of(&Command::Refresh).is_none());
+    }
+
+    /// The SSH key passphrase dialogs take the remembered passphrase and
+    /// reopen when wrong; the backup passphrase of an unencrypted key is
+    /// remembered too; a new key passphrase never is.
+    #[test]
+    fn ssh_dialogs_remember() {
+        use crate::views::dialog_ssh::SshDialog;
+        use crate::views::dialog_ssh::tests::key;
+        let encrypted = key("k", Some(true));
+        let plain = key("p", Some(false));
+        let kinds = [
+            (SshDialog::agent_add(&encrypted), true),
+            (SshDialog::change_passphrase(&encrypted), true),
+            (SshDialog::change_passphrase(&plain), true),
+            (SshDialog::delete(&plain, false), false),
+        ];
+        for (dialog, reopens) in kinds {
+            let mut kind = DialogKind::Ssh(dialog);
+            assert!(uses_remembered(&kind));
+            assert_eq!(reopens_when_wrong(&kind), reopens);
+            fill_passphrases(&mut kind, &SecretValue::from_text(PASS));
+            if let DialogKind::Ssh(SshDialog::ChangePassphrase { new, confirm, .. }) = &mut kind {
+                _set(new, "new-key-pass");
+                _set(confirm, "new-key-pass");
+            }
+            let cmd = command_for(&kind).unwrap();
+            assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+            assert!(command_for(&cleared(&kind)).is_err(), "fields emptied");
+        }
+        let mut export = SshDialog::export(&encrypted);
+        if let SshDialog::Export { reencrypt, .. } = &mut export {
+            *reencrypt = true;
+        }
+        let kind = DialogKind::Ssh(export);
+        assert!(uses_remembered(&kind) && reopens_when_wrong(&kind));
+        let generate = DialogKind::Ssh(SshDialog::generate(&[]));
+        assert!(!asks_passphrase(&generate) && !reopens_when_wrong(&generate));
+        let agent = Command::AgentAdd {
+            name: "k".into(),
+            passphrase: Some(SecretValue::from_text(PASS)),
+            lifetime_secs: None,
+        };
+        assert_eq!(passphrase_of(&agent).unwrap().as_text(), Some(PASS));
     }
 }

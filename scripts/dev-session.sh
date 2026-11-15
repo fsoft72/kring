@@ -29,6 +29,12 @@
 # (`fixture.kwl`, `.salt`, `_attributes.json`, password `fixture-pw`) is
 # copied as wallets `kdewallet` and `fixture` into the TEMP
 # `$XDG_DATA_HOME/kwalletd` for the KWallet area (never from or to the real one).
+# The SSH key fixtures of crates/kring-core/tests/fixtures/ssh (keys and the
+# authorized_keys / known_hosts / config decoys; passphrase of id_ed25519_enc:
+# `fixture-pw`) are copied into the TEMP `$HOME/.ssh` for the SSH keys area, and
+# a private ssh-agent listening under the temp dir (killed on exit) is given to
+# the app as SSH_AUTH_SOCK, holding id_ecdsa. The real ~/.ssh and the user's
+# agent are never used.
 # The temp dir is deleted on exit unless KRING_DEV_KEEP=1.
 set -u
 
@@ -41,6 +47,9 @@ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 REAL_KEYRINGS="${XDG_DATA_HOME:-$HOME/.local/share}/keyrings"
 REAL_KWALLET="${XDG_DATA_HOME:-$HOME/.local/share}/kwalletd"
+REAL_SSH="$HOME/.ssh"
+REAL_AGENT_SOCK="${SSH_AUTH_SOCK:-}"
+AGENT_PID=""
 REAL_XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 if [ -f "$REAL_XAUTHORITY" ]; then
   export XAUTHORITY="$REAL_XAUTHORITY"
@@ -50,23 +59,28 @@ if [ -n "${WAYLAND_DISPLAY:-}" ] && [ "${WAYLAND_DISPLAY#/}" = "$WAYLAND_DISPLAY
   export WAYLAND_DISPLAY="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$WAYLAND_DISPLAY"
 fi
 
-# Prints the modification times of the real keyrings and KWallet dirs (or `missing`).
+# Prints the modification times of the real keyrings, KWallet and SSH dirs (or `missing`).
 _real_mtime() {
-  echo "$(stat -c %Y "$REAL_KEYRINGS" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_KWALLET" 2>/dev/null || echo missing)"
+  echo "$(stat -c %Y "$REAL_KEYRINGS" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_KWALLET" 2>/dev/null || echo missing)/$(stat -c %Y "$REAL_SSH" 2>/dev/null || echo missing)"
 }
 MTIME_BEFORE="$(_real_mtime)"
 
-# Removes the temp dir (unless kept) and reports whether the real keyrings changed.
+# Stops the private agent, removes the temp dir (unless kept) and reports
+# whether the real keyrings, kwalletd or ~/.ssh changed.
 _cleanup() {
+  if [ -n "$AGENT_PID" ]; then
+    kill "$AGENT_PID" 2>/dev/null
+    wait "$AGENT_PID" 2>/dev/null
+  fi
   if [ "${KRING_DEV_KEEP:-0}" = "1" ]; then
     echo "dev-session: kept $TMP_ROOT" >&2
   else
     rm -rf "$TMP_ROOT"
   fi
   MTIME_AFTER="$(_real_mtime)"
-  echo "dev-session: real keyrings/kwalletd mtimes before=$MTIME_BEFORE after=$MTIME_AFTER" >&2
+  echo "dev-session: real keyrings/kwalletd/ssh mtimes before=$MTIME_BEFORE after=$MTIME_AFTER" >&2
   if [ "$MTIME_BEFORE" != "$MTIME_AFTER" ]; then
-    echo "dev-session: WARNING the real keyrings or kwalletd directory changed" >&2
+    echo "dev-session: WARNING the real keyrings, kwalletd or ~/.ssh directory changed" >&2
   fi
 }
 trap _cleanup EXIT
@@ -123,6 +137,58 @@ for wallet in kdewallet fixture; do
   install -m 600 "$KWALLET_FIXTURES/fixture_attributes.json" "$TEMP_KWALLET/${wallet}_attributes.json"
 done
 
+# Seed the temp ~/.ssh with the SSH key fixtures (repo files only).
+SSH_FIXTURES="$REPO_ROOT/crates/kring-core/tests/fixtures/ssh"
+TEMP_SSH="$HOME/.ssh"
+case "$TEMP_SSH" in
+  "$TMP_ROOT"/*) ;;
+  *) echo "dev-session: refusing to seed outside $TMP_ROOT" >&2; exit 1 ;;
+esac
+if [ "$TEMP_SSH" = "$REAL_SSH" ]; then
+  echo "dev-session: refusing to seed the real ~/.ssh" >&2
+  exit 1
+fi
+mkdir -p "$TEMP_SSH"
+chmod 700 "$TEMP_SSH"
+for f in id_ed25519 id_ed25519_enc id_rsa id_ecdsa id_legacy; do
+  install -m 600 "$SSH_FIXTURES/$f" "$TEMP_SSH/$f"
+  install -m 644 "$SSH_FIXTURES/$f.pub" "$TEMP_SSH/$f.pub"
+done
+install -m 644 "$SSH_FIXTURES/orphan.pub" "$TEMP_SSH/orphan.pub"
+for f in authorized_keys known_hosts config; do
+  install -m 600 "$SSH_FIXTURES/$f" "$TEMP_SSH/$f"
+done
+
+# Start a private ssh-agent under the temp dir (never the user's agent).
+AGENT_SOCK="$TMP_ROOT/agent.sock"
+case "$AGENT_SOCK" in
+  "$TMP_ROOT"/*) ;;
+  *) echo "dev-session: refusing an agent socket outside $TMP_ROOT" >&2; exit 1 ;;
+esac
+if [ -n "$REAL_AGENT_SOCK" ] && [ "$AGENT_SOCK" = "$REAL_AGENT_SOCK" ]; then
+  echo "dev-session: refusing to use the real ssh-agent socket" >&2
+  exit 1
+fi
+KRING_DEV_AGENT_SOCK=""
+if command -v ssh-agent >/dev/null 2>&1; then
+  ssh-agent -D -a "$AGENT_SOCK" >/dev/null 2>&1 &
+  AGENT_PID=$!
+  for _ in $(seq 1 50); do
+    [ -S "$AGENT_SOCK" ] && break
+    sleep 0.1
+  done
+  if [ -S "$AGENT_SOCK" ]; then
+    KRING_DEV_AGENT_SOCK="$AGENT_SOCK"
+    SSH_AUTH_SOCK="$AGENT_SOCK" ssh-add -q "$TEMP_SSH/id_ecdsa" </dev/null >/dev/null 2>&1 ||
+      echo "dev-session: could not preload id_ecdsa into the private agent" >&2
+  else
+    echo "dev-session: private ssh-agent did not start, the agent is unavailable" >&2
+  fi
+else
+  echo "dev-session: ssh-agent not installed, the agent is unavailable" >&2
+fi
+export KRING_DEV_AGENT_SOCK
+
 cd "$REPO_ROOT" || exit 1
 dbus-run-session -- bash -c '
   unset GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
@@ -160,6 +226,11 @@ dbus-run-session -- bash -c '
   fi
 
   cargo run -q -p kring-core --example seed_dev || exit 1
-  cargo run -p kring
+  # The app talks only to the private agent (empty: no agent).
+  if [ -n "$KRING_DEV_AGENT_SOCK" ]; then
+    SSH_AUTH_SOCK="$KRING_DEV_AGENT_SOCK" cargo run -p kring
+  else
+    cargo run -p kring
+  fi
 '
 exit $?

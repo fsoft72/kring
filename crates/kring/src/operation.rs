@@ -302,6 +302,16 @@ pub fn describe(cmd: &Command, state: &AppState, id: u64) -> Option<Operation> {
                 id,
             )
         }
+        Command::DeleteSshKey { name, .. } => {
+            Operation::start(format!("Deleting SSH key \"{name}\"..."), true, id)
+        }
+        Command::ChangeSshPassphrase { name, new, .. } => {
+            let verb = match new {
+                Some(_) => "Changing",
+                None => "Removing",
+            };
+            Operation::start(format!("{verb} the passphrase of \"{name}\"..."), true, id)
+        }
         _ => return None,
     };
     Some(op)
@@ -667,5 +677,35 @@ mod tests {
             text_in(&state, apply),
             Some((2, "Applying the transfer to \"Work\"...".into()))
         );
+    }
+
+    /// Deleting an SSH key and changing its passphrase show the progress
+    /// modal with a backup step; agent and export commands do not.
+    #[test]
+    fn ssh_operations() {
+        let state = AppState::default();
+        let delete = Command::DeleteSshKey {
+            name: "id_rsa".into(),
+            backup_passphrase: None,
+        };
+        let op = describe(&delete, &state, 3).expect("delete is destructive");
+        assert_eq!(op.steps().len(), 2, "backup and action");
+        assert_eq!(op.steps()[1].text, "Deleting SSH key \"id_rsa\"...");
+        let change = |new: bool| Command::ChangeSshPassphrase {
+            name: "k".into(),
+            old: None,
+            new: new.then(|| kring_core::model::SecretValue::from_text("n")),
+            allow_unencrypted: !new,
+            backup_passphrase: None,
+        };
+        let op = describe(&change(true), &state, 4).expect("change is destructive");
+        assert_eq!(op.steps()[1].text, "Changing the passphrase of \"k\"...");
+        let op = describe(&change(false), &state, 5).expect("removal is destructive");
+        assert_eq!(op.steps()[1].text, "Removing the passphrase of \"k\"...");
+        let agent = Command::AgentRemove {
+            fingerprint: "SHA256:x".into(),
+        };
+        assert!(describe(&agent, &state, 6).is_none());
+        assert!(describe(&Command::AgentRemoveAll, &state, 7).is_none());
     }
 }

@@ -109,6 +109,25 @@ fn _item_label(label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validates a new passphrase and its confirmation (non-empty, equal).
+pub fn new_passphrase(
+    new: &Zeroizing<String>,
+    confirm: &Zeroizing<String>,
+) -> Result<SecretValue, String> {
+    _new_password(new, confirm)
+}
+
+/// Returns the typed passphrase as a secret, or `message` when it is empty.
+pub fn required_secret(buffer: &Zeroizing<String>, message: &str) -> Result<SecretValue, String> {
+    _required(buffer, message)
+}
+
+/// Resolves a typed path against the `HOME` of the process (`~` expanded,
+/// must be absolute).
+pub fn user_path(text: &str) -> Result<PathBuf, String> {
+    _user_path(text)
+}
+
 /// Returns `cmd` with its backup passphrase set (only delete commands carry one).
 pub fn with_backup_passphrase(cmd: Command, passphrase: SecretValue) -> Command {
     match cmd {
@@ -129,6 +148,10 @@ pub fn with_backup_passphrase(cmd: Command, passphrase: SecretValue) -> Command 
             dir,
             files,
             passphrase: Some(passphrase),
+        },
+        Command::DeleteSshKey { name, .. } => Command::DeleteSshKey {
+            name,
+            backup_passphrase: Some(passphrase),
         },
         other => other,
     }
@@ -456,6 +479,7 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
                 orphan_files_passphrase,
             }
         }
+        DialogKind::Ssh(dialog) => dialog.command_for()?,
         DialogKind::Passphrase {
             command,
             passphrase,

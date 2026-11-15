@@ -26,8 +26,8 @@ use crate::views::rail::WorkerActivity;
 use crate::views::transfer::{self, TransferView};
 use crate::views::wallet_items::WalletView;
 use crate::views::{
-    Action, Area, Gates, banners, collection, file_detail, files_list, rail, sidebar, switch_area,
-    wallet_detail, wallets_list,
+    Action, Area, Gates, banners, collection, file_detail, files_list, rail, sidebar, ssh_detail,
+    ssh_list, switch_area, wallet_detail, wallets_list,
 };
 use crate::worker::{Command, Event, WorkerHandle};
 
@@ -74,6 +74,10 @@ pub struct KringApp {
     wallets_filter: String,
     /// Card state of the open wallet (folders, expanded card, shown secrets).
     wallet_view: WalletView,
+    /// SSH key search text.
+    ssh_filter: String,
+    /// SSH key folder scanned by the worker (`None` when HOME is unset).
+    ssh_dir: Option<PathBuf>,
     /// Selected backup and the files checked for a restore.
     backup_view: BackupView,
     /// Choices and shown offline secrets of the transfer preview.
@@ -111,6 +115,8 @@ impl KringApp {
             file_view: FileView::default(),
             wallets_filter: String::new(),
             wallet_view: WalletView::default(),
+            ssh_filter: String::new(),
+            ssh_dir: kring_core::paths::ssh_dir(),
             backup_view: BackupView::default(),
             transfer_view: TransferView::default(),
             consolidate_view: ConsolidateView::default(),
@@ -162,11 +168,13 @@ impl KringApp {
     }
 
     /// Acts on the judgement of an automatic use of the remembered
-    /// passphrase: reopens the dialog it answered (wrong passphrase), opens
-    /// the password dialog of a failed unlock, or announces a used one.
+    /// passphrase: reopens the dialog it answered (wrong passphrase, or an
+    /// SSH key that needs one), opens the password dialog of a failed
+    /// unlock, or announces a used one.
     fn _follow_up(&mut self, follow: FollowUp) {
         let dialog = match follow {
             FollowUp::Dialog(kind) => Dialog::retry(*kind),
+            FollowUp::KeyPassphrase(kind) => Dialog::key_passphrase_required(*kind),
             FollowUp::Unlock { collection, label } => {
                 Dialog::new(DialogKind::unlock(collection, label))
             }
@@ -332,6 +340,15 @@ impl KringApp {
                 self.state.last_consolidation = None;
                 self.consolidate_view.forget_passphrases();
             }
+            Action::SelectSshKey(name) => {
+                let info = self.state.ssh_keys.iter().find(|k| k.name == name);
+                let cmd = info.and_then(ssh_detail::select_command);
+                self.state.select_ssh_key(name);
+                if let Some(cmd) = cmd {
+                    self._send(cmd);
+                }
+            }
+            Action::Info(text) => self.toasts.push(ToastKind::Info, text, Instant::now()),
         }
     }
 
@@ -393,6 +410,7 @@ impl KringApp {
                     .take_backup_actions(&self.state, &mut self.backup_view, &self.keyrings_dir)
             }
             Area::Consolidate => self.dev.take_consolidate_actions(&self.state),
+            Area::Ssh => self.dev.take_ssh_actions(&self.state),
         };
         let reveal = self.dev.take_transfer_reveal(&self.state);
         for action in actions.into_iter().chain(reveal) {
@@ -666,6 +684,12 @@ impl KringApp {
                     }
                     Area::Files => files_list::show(ui, &self.state, &mut self.files_filter),
                     Area::KWallet => wallets_list::show(ui, &self.state, &mut self.wallets_filter),
+                    Area::Ssh => ssh_list::show(
+                        ui,
+                        &self.state,
+                        &mut self.ssh_filter,
+                        self.ssh_dir.as_deref(),
+                    ),
                     Area::Backups => backups::list(ui, &self.state, &mut self.backup_view),
                     Area::Consolidate => consolidate::list(ui, &self.state, &self.consolidate_view),
                 };
@@ -688,6 +712,7 @@ impl KringApp {
                     Area::KWallet => {
                         wallet_detail::show(ui, &self.state, &mut self.wallet_view, gates)
                     }
+                    Area::Ssh => ssh_detail::show(ui, &self.state, gates, self.ssh_dir.as_deref()),
                     Area::Backups => {
                         backups::detail(ui, &self.state, &mut self.backup_view, &self.keyrings_dir)
                     }

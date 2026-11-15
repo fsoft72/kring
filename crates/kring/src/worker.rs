@@ -29,7 +29,7 @@ use kring_core::{KringError, MasterPasswordStore, SecretStore};
 
 use crate::worker_offline;
 use crate::worker_ssh;
-pub use crate::worker_ssh::AgentStatus;
+pub use crate::worker_ssh::{AgentStatus, MSG_NO_SSH_DIR};
 use crate::worker_transfer::{self, PlanState};
 pub use crate::worker_transfer::{ConflictView, ConsolidationSummary, StepSummary};
 use crate::worker_wallet;
@@ -361,8 +361,8 @@ pub struct WorkerConfig {
     pub pam_dir: PathBuf,
     /// Directory holding the KWallet wallets (`$XDG_DATA_HOME/kwalletd`).
     pub kwallet_dir: PathBuf,
-    /// Directory holding the SSH keys (`$HOME/.ssh`).
-    pub ssh_dir: PathBuf,
+    /// Directory holding the SSH keys (`$HOME/.ssh`), `None` when HOME is unset.
+    pub ssh_dir: Option<PathBuf>,
     /// Socket of the ssh-agent (`SSH_AUTH_SOCK` at startup), `None` when unset.
     pub ssh_agent_sock: Option<PathBuf>,
 }
@@ -1013,10 +1013,6 @@ where
     out.emit(Event::Done(done));
     Ok(())
 }
-
-/// SSH directory of worker tests that never use SSH commands (does not exist).
-#[cfg(test)]
-pub(crate) const NO_SSH_DIR: &str = "/nonexistent/kring-test-ssh";
 
 /// Receives the next event of `handle` other than [`Event::CommandFinished`]
 /// (tests asserting the event sequence of a command), failing after `timeout`.

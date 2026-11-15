@@ -136,6 +136,11 @@ const STALE_PLAN_PREFIX: &str = "Plan is out of date";
 const MAX_REVEAL_REQUESTS: usize = 32;
 /// Notice shown when a backup was written but old backups could not be pruned.
 const MSG_PRUNE_FAILED: &str = "Backup created but old backups could not be pruned";
+/// Error of a backup passphrase request for an SSH passphrase change: the
+/// key is unencrypted although the dialog did not ask for a backup
+/// passphrase (the request clears the key passphrases, so no resend).
+pub const MSG_SSH_KEY_CHANGED: &str =
+    "The key changed since the dialog opened, nothing was changed: try again";
 
 /// Formats `n noun`, adding `s` unless `n` is 1 (e.g. `2 items`).
 pub fn count_noun(n: usize, noun: &str) -> String {
@@ -332,7 +337,12 @@ impl AppState {
                     self.notices.push(format!("{MSG_PRUNE_FAILED}: {w}"));
                 }
             }
-            Event::PassphraseNeeded(cmd) => self.pending_passphrase = Some(*cmd),
+            Event::PassphraseNeeded(cmd) => {
+                if matches!(*cmd, Command::ChangeSshPassphrase { .. }) {
+                    return self.errors.push(MSG_SSH_KEY_CHANGED.to_string());
+                }
+                self.pending_passphrase = Some(*cmd);
+            }
             Event::Files(v) => self._set_files(v),
             Event::FileItems {
                 name,
@@ -2260,5 +2270,33 @@ mod tests {
         assert_eq!(s.agent_unavailable.as_deref(), Some("gone"));
         assert!(!s.ssh_key_in_agent(&ssh_key("a", "SHA256:a")));
         assert!(s.errors.is_empty(), "never an error toast");
+    }
+
+    /// A backup passphrase request for an SSH command whose key
+    /// passphrases were cleared cannot be answered by a resend: it becomes
+    /// an error; a delete request still opens the passphrase dialog.
+    #[test]
+    fn ssh_passphrase_requests() {
+        let mut s = AppState::default();
+        s.apply(Event::PassphraseNeeded(Box::new(
+            Command::ChangeSshPassphrase {
+                name: "k".into(),
+                old: None,
+                new: None,
+                allow_unencrypted: false,
+                backup_passphrase: None,
+            },
+        )));
+        assert!(s.pending_passphrase.is_none());
+        assert_eq!(s.errors, [MSG_SSH_KEY_CHANGED]);
+        let delete = Command::DeleteSshKey {
+            name: "k".into(),
+            backup_passphrase: None,
+        };
+        s.apply(Event::PassphraseNeeded(Box::new(delete)));
+        assert!(matches!(
+            s.pending_passphrase,
+            Some(Command::DeleteSshKey { .. })
+        ));
     }
 }

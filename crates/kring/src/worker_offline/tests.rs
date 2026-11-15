@@ -151,7 +151,7 @@ fn dirs(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, WorkerConfig) {
         keyrings_dir: keyrings.clone(),
         pam_dir: pam,
         kwallet_dir: keyrings.join("kwalletd-unused"),
-        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_dir: None,
         ssh_agent_sock: None,
     };
     (dir, keyrings, config)

@@ -55,7 +55,7 @@ fn fixture_with(provider: Option<ProviderInfo>, label: &str, keep: usize) -> Fix
         keyrings_dir: keyrings.clone(),
         pam_dir: pam,
         kwallet_dir: keyrings.join("kwalletd-unused"),
-        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_dir: None,
         ssh_agent_sock: None,
     };
     let handle = spawn(Some(Arc::new(store)), provider, config, || {});
@@ -148,7 +148,7 @@ fn no_provider_emits_unavailable() {
         keyrings_dir: dir.path().join("k"),
         pam_dir: dir.path().join("p"),
         kwallet_dir: dir.path().join("w"),
-        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_dir: None,
         ssh_agent_sock: None,
     };
     let h = spawn::<FakeStore>(None, None, config, || {});
@@ -356,7 +356,7 @@ fn panic_worker(dir: &tempfile::TempDir, on_collections: bool) -> (WorkerHandle,
         keyrings_dir: dir.path().join("k"),
         pam_dir: dir.path().join("p"),
         kwallet_dir: dir.path().join("w"),
-        ssh_dir: std::path::PathBuf::from(crate::worker::NO_SSH_DIR),
+        ssh_dir: None,
         ssh_agent_sock: None,
     };
     let inner = FakeStore::new();
