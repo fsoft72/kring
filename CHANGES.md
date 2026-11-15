@@ -120,3 +120,4 @@
   wallet as `kdewallet` and `fixture` into the temp `$XDG_DATA_HOME/kwalletd`; dev presets
   `KRING_DEV_AREA=kwallet`, `KRING_DEV_WALLET`, `KRING_DEV_DIALOG=wallet-password|wallet-open|wallet-import|wallet-import-now`
   (fixture password, debug builds inside the isolated session only).
+- Plan 4 Task 6: README "KWallet migration" section (what is migrated, how app and native attributes are restored incl. `server`/`user`/`type` for KWallet-API apps via the kwalletd6 shim, the keyring named like the wallet, disabling KWallet's Secret Service integration afterwards) and safety note.

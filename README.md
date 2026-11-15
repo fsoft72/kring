@@ -8,6 +8,7 @@ libraries.
 
 - **Secret Service management**: list, create, rename, unlock and delete keyrings; change the master password; browse, search, create, edit and delete items; copy secrets with a 30 s clipboard auto-clear.
 - **Offline files**: browse the `*.keyring` files in `~/.local/share/keyrings` without the daemon. Binary (encrypted) files open with their password; plaintext files are read directly, including ones the daemon rejects because of multi-line `secret=` values (recovered by a tolerant parser). Items can be imported into an unlocked keyring (duplicates skipped, conflicts listed, nothing overwritten). "Delete file" removes any file the daemon has not loaded (binary, plaintext or unrecognized): "Back up the file before deleting" is checked by default (a plaintext file's backup is encrypted with a passphrase you choose); unchecked, the deletion is permanent and the button is enabled only after typing the exact file name. A file loaded by gnome-keyring (the note shows its keyring id and label, e.g. `Default_10 (label "Default")`) is deleted as a keyring through gnome-keyring, with the usual backup of all keyring files (encrypted when any of them is plaintext); the backup can be skipped only when that keyring is unlocked and holds no items (a locked keyring never counts as empty). This needs a provider that allows writes, and works on locked keyrings too (no prompt).
+- **KWallet migration**: read KDE wallets (`~/.local/share/kwalletd/*.kwl`) without KWallet running, browse their folders and entries, and import them into a gnome-keyring keyring so apps keep finding their secrets (see below).
 - **Same-named keyrings**: when two or more keyrings share a label (gnome-keyring names many orphans "Default"), every list, header and keyring picker shows `<label> · <keyring id>` for each of them.
 - **Backups and restore**: every destructive action first writes a backup; the Backups area lists them and restores selected files.
 - **Copy, move and consolidate**: move items between keyrings with a conflict preview, or merge all orphan keyrings into `login` in one step (see below).
@@ -33,10 +34,62 @@ Preview and apply read every item and secret over D-Bus, so with many keyrings a
 2. **Consolidate** into `login`, with "retire empty plaintext orphan files" enabled.
 3. Restart the daemon so it drops its in-memory copy of the removed keyrings: `systemctl --user restart gnome-keyring-daemon`.
 
+## KWallet migration
+
+The KWallet area lists the wallets in `$XDG_DATA_HOME/kwalletd` (default
+`~/.local/share/kwalletd`, usually just `kdewallet`). kring reads the wallet
+files itself: KWallet does not need to run, and the files are never changed.
+Supported format: Blowfish CBC wallets with a PBKDF2-SHA512 key (what current
+KWallet writes); older Blowfish ECB / SHA-1 and GPG wallets are listed as
+unsupported.
+
+**Open** asks for the wallet password and shows the entries grouped by folder,
+read only, each with its type (PASSWORD, MAP, STREAM), the attributes it will
+get, and Show / Copy for its secret. The password stays in memory only while the
+wallet is open (switching wallet or leaving the area drops it with the entries).
+
+**What is migrated**: every password, map and stream entry of every folder.
+Passwords become text secrets, maps a JSON object (`application/json`, keys
+sorted) and streams raw bytes (`application/octet-stream`).
+
+**How attributes are restored**:
+
+- Entries an app stored through KWallet's Secret Service layer ("app entry"
+  chip) get back their original label, attributes and dates from
+  `<wallet>_attributes.json`, so those apps find them in gnome-keyring exactly as
+  before.
+- Native KWallet entries (written through the KWallet API) are labelled
+  `<folder>/<key>` and get `server=<folder>`, `user=<key>`,
+  `type=plaintext|map|binary` (what the `kwalletd6` compatibility shim searches
+  when a KWallet-API app asks for an entry), plus `kwallet-folder`,
+  `kwallet-key`, `kwallet-type` and `xdg:schema=org.kde.KWallet.Entry`.
+
+**Import into...** uses the same preview as Copy: identical items are skipped,
+so importing twice changes nothing, and conflicts (same attributes, another
+secret) are shown for review before anything is written.
+
+**Which keyring**: the `kwalletd6` shim looks for a keyring labelled like the
+wallet, so for `kdewallet` import into a keyring named `kdewallet`. If one
+exists it is preselected; otherwise the dialog offers "Create keyring
+'kdewallet'" (with its password, which can be remembered for the session), then
+choose Import into... again to fill it. Importing into `login` keeps every secret,
+but apps using the KWallet API will not find them there.
+
+**After migrating, disable KWallet's Secret Service integration**, otherwise
+KWallet (`ksecretd`, `org.kde.secretservicecompat`) may claim
+`org.freedesktop.secrets` again and apps would keep using the wallet: in System
+Settings > KDE Wallet uncheck "Use KWallet for the Secret Service interface"
+(or set `apiEnabled=false` in the `[org.freedesktop.secrets]` group of
+`~/.config/kwalletrc`), then log out and back in. kring shows a reminder in the KWallet
+area while a KWallet daemon is on the bus, and again after each import. Keep the wallet files until
+you have checked that your apps work; kring never deletes them.
+
 ## Run
 
 Isolated, seeded session for trying things out (private D-Bus session, throwaway
-gnome-keyring, temp `HOME`; your real keyrings are never touched):
+gnome-keyring, temp `HOME`; your real keyrings and wallets are never touched; the
+KWallet area shows two copies of the test wallet, `kdewallet` and `fixture`,
+password `fixture-pw`):
 
 ```sh
 scripts/dev-session.sh
@@ -63,4 +116,5 @@ cargo run -p kring-core --example scan_report -- ~/.local/share/keyrings
 - Textual `.keyring` files are **plaintext on disk**: anyone who can read the file can read the secrets. "Retire file" deletes one only after an encrypted backup is verified, and never for a file the daemon has loaded. "Delete file" removes a file the daemon has not loaded only after the backup manifest lists it with the expected checksum (when the backup is chosen); a loaded one goes through the daemon's own delete, after a backup unless the keyring is unlocked and empty.
 - Restoring overwrites files in the keyrings directory (after backing up the current ones). The daemon keeps its own in-memory copy, so restart it afterwards: `systemctl --user restart gnome-keyring-daemon`. kring shows this command and does not run it.
 - Secrets are never logged and are zeroized in memory when dropped.
+- KWallet wallets are only read: kring never writes, deletes or locks the files in `~/.local/share/kwalletd`, and never talks to KWallet. Symlinked wallet, salt or attributes files are refused.
 - **Remembered passphrase warning**: "Remember for this session" keeps the passphrase in memory only (never on disk, in logs or in debug output) until kring closes or you forget it from the rail. While it is remembered, anyone using your session can unlock keyrings and decrypt or write backups with it without typing it. Use it only on a machine you control, and forget it when you are done.
