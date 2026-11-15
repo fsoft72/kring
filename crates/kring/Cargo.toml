@@ -12,3 +12,4 @@ arboard = "3.7"
 [dev-dependencies]
 kring-core = { path = "../kring-core", features = ["fake"] }
 tempfile = "3"
+async-trait = "0.1"

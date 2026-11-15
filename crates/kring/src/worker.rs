@@ -26,40 +26,50 @@ const MSG_NO_PROVIDER: &str = "No Secret Service provider running";
 /// A request from the UI to the worker.
 #[derive(Clone, Debug)]
 pub enum Command {
+    /// Re-list all collections.
     Refresh,
+    /// List the items of a collection.
     LoadItems(CollectionId),
+    /// Read the secret of an item.
     RevealSecret(ItemId),
+    /// Create an item in a collection.
     CreateItem {
         collection: CollectionId,
         item: NewItem,
     },
-    UpdateItem {
-        item: ItemId,
-        update: ItemUpdate,
-    },
+    /// Apply a partial update to an item.
+    UpdateItem { item: ItemId, update: ItemUpdate },
+    /// Delete an item after backing up the keyrings.
     DeleteItem {
         item: ItemId,
         backup_passphrase: Option<SecretValue>,
     },
+    /// Make a collection the default one.
     SetDefault(CollectionId),
+    /// Lock a collection.
     Lock(CollectionId),
+    /// Unlock a collection with its password.
     Unlock {
         collection: CollectionId,
         password: SecretValue,
     },
+    /// Create a collection protected by a password.
     CreateCollection {
         label: String,
         password: SecretValue,
     },
+    /// Change the label of a collection.
     RenameCollection {
         collection: CollectionId,
         label: String,
     },
+    /// Change the password of a collection.
     ChangePassword {
         collection: CollectionId,
         old: SecretValue,
         new: SecretValue,
     },
+    /// Delete a collection after backing up the keyrings.
     DeleteCollection {
         collection: CollectionId,
         backup_passphrase: Option<SecretValue>,
@@ -69,16 +79,25 @@ pub enum Command {
 /// A notification from the worker to the UI.
 #[derive(Clone, Debug)]
 pub enum Event {
+    /// The detected provider.
     Provider(ProviderInfo),
+    /// No Secret Service provider is running.
     ProviderUnavailable,
+    /// PAM auto-unlock status.
     Pam(PamStatus),
+    /// Current list of collections.
     Collections(Vec<CollectionInfo>),
+    /// Items of a collection.
     Items(CollectionId, Vec<ItemInfo>),
+    /// A revealed secret.
     Secret(ItemId, SecretValue),
+    /// A backup was written.
     BackupCreated(BackupInfo),
     /// A backup needs a passphrase; carries the command to resend with it.
     PassphraseNeeded(Box<Command>),
+    /// An operation finished with a message.
     Done(String),
+    /// An operation failed with a message.
     Error(String),
 }
 
@@ -158,19 +177,30 @@ where
         };
         runtime.block_on(startup(&out, store.as_deref(), provider.as_ref(), &config));
         while let Ok(cmd) = cmd_rx.recv() {
-            runtime.block_on(handle(
-                &out,
-                store.as_deref(),
-                provider.as_ref(),
-                &config,
-                cmd,
-            ));
+            let run = handle(&out, store.as_deref(), provider.as_ref(), &config, cmd);
+            // A panic in the store must not kill the worker silently.
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(run)));
+            if let Err(payload) = result {
+                out.error(format!("Worker crashed: {}", panic_message(&*payload)));
+            }
         }
     });
     WorkerHandle {
         tx: cmd_tx,
         rx: ev_rx,
     }
+}
+
+/// Extracts a printable message from a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(m) = payload.downcast_ref::<&str>() {
+        return (*m).to_string();
+    }
+    if let Some(m) = payload.downcast_ref::<String>() {
+        return m.clone();
+    }
+    "unknown".to_string()
 }
 
 /// Emits the initial provider, PAM and collection events.
@@ -207,7 +237,7 @@ async fn load_items<S: SecretStore, N: Fn()>(out: &Emitter<N>, store: &S, id: &C
 }
 
 /// Returns the parent object path of an item (its collection).
-fn _collection_of(item: &ItemId) -> CollectionId {
+fn collection_of(item: &ItemId) -> CollectionId {
     let parent = item.0.rsplit_once('/').map_or("", |(parent, _)| parent);
     CollectionId(parent.to_string())
 }
@@ -335,7 +365,7 @@ where
         }
         Command::UpdateItem { item, update } => {
             store.update_item(item, update.clone()).await?;
-            affected = Some(_collection_of(item));
+            affected = Some(collection_of(item));
         }
         Command::DeleteItem {
             item,
@@ -345,7 +375,7 @@ where
                 return Ok(());
             }
             store.delete_item(item).await?;
-            affected = Some(_collection_of(item));
+            affected = Some(collection_of(item));
         }
         Command::SetDefault(id) => store.set_alias("default", id).await?,
         Command::Lock(id) => {
@@ -625,5 +655,200 @@ mod tests {
             Event::Items(_, items) => assert_eq!(items.len(), 1),
             other => panic!("expected Items, got {other:?}"),
         }
+    }
+
+    /// Store wrapper whose first `list_items` call panics.
+    struct PanicStore {
+        inner: FakeStore,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretStore for PanicStore {
+        async fn list_collections(&self) -> kring_core::Result<Vec<CollectionInfo>> {
+            self.inner.list_collections().await
+        }
+        async fn list_items(&self, c: &CollectionId) -> kring_core::Result<Vec<ItemInfo>> {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("boom");
+            }
+            self.inner.list_items(c).await
+        }
+        async fn read_secret(&self, i: &ItemId) -> kring_core::Result<SecretValue> {
+            self.inner.read_secret(i).await
+        }
+        async fn create_item(&self, c: &CollectionId, i: NewItem) -> kring_core::Result<ItemId> {
+            self.inner.create_item(c, i).await
+        }
+        async fn update_item(&self, i: &ItemId, u: ItemUpdate) -> kring_core::Result<()> {
+            self.inner.update_item(i, u).await
+        }
+        async fn delete_item(&self, i: &ItemId) -> kring_core::Result<()> {
+            self.inner.delete_item(i).await
+        }
+        async fn read_alias(&self, a: &str) -> kring_core::Result<Option<CollectionId>> {
+            self.inner.read_alias(a).await
+        }
+        async fn set_alias(&self, a: &str, c: &CollectionId) -> kring_core::Result<()> {
+            self.inner.set_alias(a, c).await
+        }
+        async fn lock(&self, c: &CollectionId) -> kring_core::Result<()> {
+            self.inner.lock(c).await
+        }
+        async fn rename_collection(&self, c: &CollectionId, l: &str) -> kring_core::Result<()> {
+            self.inner.rename_collection(c, l).await
+        }
+        async fn delete_collection(&self, c: &CollectionId) -> kring_core::Result<()> {
+            self.inner.delete_collection(c).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MasterPasswordStore for PanicStore {
+        async fn create_with_password(
+            &self,
+            l: &str,
+            p: &SecretValue,
+        ) -> kring_core::Result<CollectionId> {
+            self.inner.create_with_password(l, p).await
+        }
+        async fn unlock_with_password(
+            &self,
+            c: &CollectionId,
+            p: &SecretValue,
+        ) -> kring_core::Result<()> {
+            self.inner.unlock_with_password(c, p).await
+        }
+        async fn change_password(
+            &self,
+            c: &CollectionId,
+            o: &SecretValue,
+            n: &SecretValue,
+        ) -> kring_core::Result<()> {
+            self.inner.change_password(c, o, n).await
+        }
+    }
+
+    /// A panic in the store is reported and the worker keeps serving commands.
+    #[test]
+    fn store_panic_reports_error_and_worker_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkerConfig {
+            backups: BackupManager {
+                root: dir.path().join("b"),
+                keep: BACKUP_KEEP,
+            },
+            keyrings_dir: dir.path().join("k"),
+            pam_dir: dir.path().join("p"),
+        };
+        let inner = FakeStore::new();
+        let id = inner.add_collection("Main", "pw", false);
+        let store = PanicStore {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(true),
+        };
+        let p = provider(ProviderKind::GnomeKeyring, true);
+        let h = spawn(Some(Arc::new(store)), Some(p), config, || {});
+        let next = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..3 {
+            next();
+        }
+        h.tx.send(Command::LoadItems(id)).unwrap();
+        match next() {
+            Event::Error(m) => assert_eq!(m, "Worker crashed: boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        h.tx.send(Command::Refresh).unwrap();
+        assert!(matches!(next(), Event::Collections(_)));
+    }
+
+    /// An unusable backups root aborts the delete and keeps the item.
+    #[test]
+    fn backup_failure_aborts_delete() {
+        let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        write_binary_keyring(&f.keyrings);
+        std::fs::write(&f.backups, "not a directory").unwrap();
+        f.skip_startup();
+        let item = f.create_item();
+        f.send(Command::DeleteItem {
+            item,
+            backup_passphrase: None,
+        });
+        assert!(matches!(f.next(), Event::Error(_)));
+        f.send(Command::LoadItems(f.collection.clone()));
+        match f.next() {
+            Event::Items(_, items) => assert_eq!(items.len(), 1),
+            other => panic!("expected Items, got {other:?}"),
+        }
+    }
+
+    /// Deleting a collection backs up first, then removes it.
+    #[test]
+    fn delete_collection_creates_backup_first() {
+        let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        write_binary_keyring(&f.keyrings);
+        f.skip_startup();
+        f.send(Command::DeleteCollection {
+            collection: f.collection.clone(),
+            backup_passphrase: None,
+        });
+        assert!(matches!(f.next(), Event::BackupCreated(_)));
+        match f.next() {
+            Event::Collections(list) => assert!(list.is_empty()),
+            other => panic!("expected Collections, got {other:?}"),
+        }
+    }
+
+    /// Resending the delete with a passphrase succeeds after PassphraseNeeded.
+    #[test]
+    fn delete_with_passphrase_retry_succeeds() {
+        let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        std::fs::write(
+            f.keyrings.join("old.keyring"),
+            "[keyring]\ndisplay-name=x\n",
+        )
+        .unwrap();
+        f.skip_startup();
+        let item = f.create_item();
+        f.send(Command::DeleteItem {
+            item: item.clone(),
+            backup_passphrase: None,
+        });
+        assert!(matches!(f.next(), Event::PassphraseNeeded(_)));
+        f.send(Command::DeleteItem {
+            item,
+            backup_passphrase: Some(SecretValue::from_text("pass")),
+        });
+        assert!(matches!(f.next(), Event::BackupCreated(_)));
+        assert!(matches!(f.next(), Event::Collections(_)));
+        match f.next() {
+            Event::Items(_, items) => assert!(items.is_empty()),
+            other => panic!("expected Items, got {other:?}"),
+        }
+    }
+
+    /// With no keyring files there is nothing to back up and the delete proceeds.
+    #[test]
+    fn empty_backup_set_skips_backup_and_deletes() {
+        let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        f.skip_startup();
+        let item = f.create_item();
+        f.send(Command::DeleteItem {
+            item,
+            backup_passphrase: None,
+        });
+        assert!(matches!(f.next(), Event::Collections(_)));
+        assert!(matches!(f.next(), Event::Items(_, _)));
+        assert!(!f.backups.exists());
+    }
+
+    /// The collection is the parent object path of the item.
+    #[test]
+    fn collection_of_returns_parent_path() {
+        let item = ItemId("/org/freedesktop/secrets/collection/login/12".into());
+        assert_eq!(
+            collection_of(&item).0,
+            "/org/freedesktop/secrets/collection/login"
+        );
     }
 }
