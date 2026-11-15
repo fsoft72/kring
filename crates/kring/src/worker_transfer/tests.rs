@@ -96,6 +96,7 @@ fn env(kind: ProviderKind) -> Env {
         kwallet_dir: keyrings.join("kwalletd-unused"),
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     let store = Arc::new(FakeStore::new());
     let main = store.add_collection("Main", "pw", false);
@@ -291,6 +292,9 @@ fn may_carry_secret(event: &Event) -> bool {
         | Event::SshKeys(_)
         | Event::AgentIdentities(_)
         | Event::SshPublicKey { .. }
+        | Event::GpgKeys(_)
+        | Event::GpgUnavailable(_)
+        | Event::GpgPublicKey { .. }
         | Event::Notice(_)
         | Event::TransferPreview { .. }
         | Event::TransferDone(_)

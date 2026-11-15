@@ -233,6 +233,8 @@ pub(crate) fn invalidates_plan(cmd: &Command) -> bool {
             | Command::ReadSshPublicKey { .. }
             | Command::AgentList
             | Command::ExportSshPrivate { .. }
+            | Command::ScanGpgKeys
+            | Command::ExportGpgPublic { .. }
     )
 }
 

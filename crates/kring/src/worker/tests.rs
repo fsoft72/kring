@@ -57,6 +57,7 @@ fn fixture_with(provider: Option<ProviderInfo>, label: &str, keep: usize) -> Fix
         kwallet_dir: keyrings.join("kwalletd-unused"),
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     let handle = spawn(Some(Arc::new(store)), provider, config, || {});
     Fixture {
@@ -150,6 +151,7 @@ fn no_provider_emits_unavailable() {
         kwallet_dir: dir.path().join("w"),
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     let h = spawn::<FakeStore>(None, None, config, || {});
     let next = || next_event(&h, Duration::from_secs(5));
@@ -358,6 +360,7 @@ fn panic_worker(dir: &tempfile::TempDir, on_collections: bool) -> (WorkerHandle,
         kwallet_dir: dir.path().join("w"),
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     let inner = FakeStore::new();
     let id = inner.add_collection("Main", "pw", false);

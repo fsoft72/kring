@@ -154,6 +154,7 @@ fn config_in(dir: &Path, ssh_dir: Option<PathBuf>, agent: Option<PathBuf>) -> Wo
         kwallet_dir: dir.join("kwalletd"),
         ssh_dir,
         ssh_agent_sock: agent,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     }
 }
 

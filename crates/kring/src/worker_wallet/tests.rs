@@ -100,6 +100,7 @@ fn env_with(competitors: &[&str]) -> Env {
         kwallet_dir: kwallet.clone(),
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     let store = Arc::new(FakeStore::new());
     let main = store.add_collection("Main", "pw", false);
@@ -506,6 +507,7 @@ fn create_wallet_collection_gated() {
         kwallet_dir: kwallet,
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     let mut info = provider(&[]).unwrap();
     info.has_master_password_iface = false;
@@ -638,6 +640,7 @@ fn created_keyring_done_despite_rescan_error() {
         kwallet_dir: not_a_dir,
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     let store = FakeStore::new();
     store.add_collection(FIXTURE, "pw", false);

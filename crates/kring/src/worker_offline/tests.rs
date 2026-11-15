@@ -153,6 +153,7 @@ fn dirs(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, WorkerConfig) {
         kwallet_dir: keyrings.join("kwalletd-unused"),
         ssh_dir: None,
         ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
     };
     (dir, keyrings, config)
 }

@@ -10,6 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use kring_core::backup::{
     BACKUP_KEEP, BackupInfo, BackupManager, RestoreReport, keyring_backup_set,
 };
+use kring_core::gpg::{GpgAlgo, GpgKey};
 use kring_core::keyring_file::textual::{OfflineItem, ParseWarning};
 use kring_core::keyring_file::{KeyringFileInfo, RetireBatchReport};
 use kring_core::model::{
@@ -27,6 +28,7 @@ use kring_core::transfer::import::ImportReport;
 use kring_core::transfer::plan::{Choice, TransferCounts};
 use kring_core::{KringError, MasterPasswordStore, SecretStore};
 
+use crate::worker_gpg;
 use crate::worker_offline;
 use crate::worker_ssh;
 pub use crate::worker_ssh::{AgentStatus, MSG_NO_SSH_DIR};
@@ -253,6 +255,44 @@ pub enum Command {
     AgentRemove { fingerprint: String },
     /// Remove every agent identity.
     AgentRemoveAll,
+    /// List the keys of the GnuPG home; answers with [`Event::GpgKeys`]
+    /// (or [`Event::GpgUnavailable`]).
+    ScanGpgKeys,
+    /// Generate a key for `uid` (`expire` in gpg syntax, `None` never;
+    /// `passphrase` `None` leaves it unprotected).
+    CreateGpgKey {
+        uid: String,
+        algo: GpgAlgo,
+        expire: Option<String>,
+        passphrase: Option<SecretValue>,
+    },
+    /// Import the OpenPGP keys (armored or binary) of the file `path`.
+    ImportGpgKeys { path: PathBuf },
+    /// Read the armored public key `fpr` (full primary fingerprint); answers
+    /// with [`Event::GpgPublicKey`].
+    ExportGpgPublic { fpr: String },
+    /// Write the armored secret key `fpr` to the new file `dest`, unlocked
+    /// with its `passphrase`.
+    ExportGpgSecret {
+        fpr: String,
+        dest: PathBuf,
+        passphrase: Option<SecretValue>,
+    },
+    /// Change the passphrase of key `fpr` from `old` to `new` after a backup
+    /// age-encrypted with `backup_passphrase` (required).
+    ChangeGpgPassphrase {
+        fpr: String,
+        old: Option<SecretValue>,
+        new: Option<SecretValue>,
+        backup_passphrase: Option<SecretValue>,
+    },
+    /// Delete key `fpr` (secret and public) after a backup; a secret key needs
+    /// `key_passphrase` for its export and `backup_passphrase` for the age copy.
+    DeleteGpgKey {
+        fpr: String,
+        key_passphrase: Option<SecretValue>,
+        backup_passphrase: Option<SecretValue>,
+    },
 }
 
 /// A notification from the worker to the UI.
@@ -336,6 +376,12 @@ pub enum Event {
     AgentIdentities(AgentStatus),
     /// Public key `text` (one OpenSSH line) of key `name`; not a secret.
     SshPublicKey { name: String, text: String },
+    /// Keys of the GnuPG home (last scan).
+    GpgKeys(Vec<GpgKey>),
+    /// gpg cannot be used (not installed, or the agent refuses loopback), with why.
+    GpgUnavailable(String),
+    /// Armored public key `text` of key `fpr`; not a secret.
+    GpgPublicKey { fpr: String, text: String },
     /// An informational notice shown as a toast (not an error).
     Notice(String),
     /// An operation finished with a message.
@@ -365,6 +411,8 @@ pub struct WorkerConfig {
     pub ssh_dir: Option<PathBuf>,
     /// Socket of the ssh-agent (`SSH_AUTH_SOCK` at startup), `None` when unset.
     pub ssh_agent_sock: Option<PathBuf>,
+    /// GnuPG home directory; `None` uses gpg's default (`GNUPGHOME` or `~/.gnupg`).
+    pub gnupg_home: Option<PathBuf>,
 }
 
 impl WorkerConfig {
@@ -381,9 +429,15 @@ impl WorkerConfig {
             kwallet_dir: paths::kwallet_dir(),
             ssh_dir: paths::ssh_dir(),
             ssh_agent_sock: paths::agent_sock(),
+            gnupg_home: None,
         }
     }
 }
+
+/// GnuPG home of tests that never run gpg: a path that cannot exist, so a
+/// stray gpg command fails instead of touching the user's `~/.gnupg`.
+#[cfg(test)]
+pub(crate) const NO_GNUPG_HOME: &str = "/nonexistent/kring-test-gnupg";
 
 /// UI-side endpoints of the worker.
 pub struct WorkerHandle {
@@ -419,9 +473,9 @@ impl<N: Fn()> Emitter<N> {
     }
 }
 
-/// Builds the [`Event::PassphraseNeeded`] echo of a Plan 1/2 or SSH command
-/// with every passphrase field cleared (backup and key passphrases), so no
-/// secret travels back in the event.
+/// Builds the [`Event::PassphraseNeeded`] echo of a Plan 1/2, SSH or GPG
+/// command with every passphrase field cleared (backup and key passphrases),
+/// so no secret travels back in the event.
 ///
 /// Apply commands must never be echoed (they use
 /// [`Event::ApplyPassphrasesNeeded`]); a debug build asserts this.
@@ -485,6 +539,30 @@ pub(crate) fn passphrase_echo(cmd: &Command) -> Event {
             name,
             passphrase: None,
             lifetime_secs,
+        },
+        Command::CreateGpgKey {
+            uid, algo, expire, ..
+        } => Command::CreateGpgKey {
+            uid,
+            algo,
+            expire,
+            passphrase: None,
+        },
+        Command::ExportGpgSecret { fpr, dest, .. } => Command::ExportGpgSecret {
+            fpr,
+            dest,
+            passphrase: None,
+        },
+        Command::ChangeGpgPassphrase { fpr, .. } => Command::ChangeGpgPassphrase {
+            fpr,
+            old: None,
+            new: None,
+            backup_passphrase: None,
+        },
+        Command::DeleteGpgKey { fpr, .. } => Command::DeleteGpgKey {
+            fpr,
+            key_passphrase: None,
+            backup_passphrase: None,
         },
         other => other,
     };
@@ -805,7 +883,8 @@ pub(crate) fn gate<N: Fn()>(
 /// that may change keyring data drops the pending plan first. Offline
 /// commands (files, backups, archives) are routed to [`worker_offline`],
 /// KWallet commands to [`worker_wallet`], SSH key and agent commands to
-/// [`worker_ssh`] (they need no Secret Service).
+/// [`worker_ssh`] and GPG key commands to [`worker_gpg`] (they need no
+/// Secret Service).
 async fn handle<S, N>(
     out: &Emitter<N>,
     store: Option<&S>,
@@ -831,6 +910,9 @@ async fn handle<S, N>(
     }
     if worker_ssh::is_ssh(&cmd) {
         return worker_ssh::handle(out, config, &cmd);
+    }
+    if worker_gpg::is_gpg(&cmd) {
+        return worker_gpg::handle(out, config, &cmd);
     }
     let Some(store) = store else {
         return out.error(MSG_NO_PROVIDER);
@@ -1000,7 +1082,14 @@ where
         | Command::AgentList
         | Command::AgentAdd { .. }
         | Command::AgentRemove { .. }
-        | Command::AgentRemoveAll => {
+        | Command::AgentRemoveAll
+        | Command::ScanGpgKeys
+        | Command::CreateGpgKey { .. }
+        | Command::ImportGpgKeys { .. }
+        | Command::ExportGpgPublic { .. }
+        | Command::ExportGpgSecret { .. }
+        | Command::ChangeGpgPassphrase { .. }
+        | Command::DeleteGpgKey { .. } => {
             return Err(KringError::InvalidInput(
                 "Offline or transfer command sent to the store path".into(),
             ));

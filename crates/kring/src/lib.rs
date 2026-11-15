@@ -14,6 +14,7 @@ pub mod startup;
 pub mod ui;
 pub mod views;
 pub mod worker;
+mod worker_gpg;
 mod worker_offline;
 mod worker_ssh;
 mod worker_transfer;

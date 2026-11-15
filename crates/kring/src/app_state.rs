@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use kring_core::backup::{BackupInfo, RestoreReport};
+use kring_core::gpg::GpgKey;
 use kring_core::keyring_file::textual::{OfflineItem, ParseWarning};
 use kring_core::keyring_file::{KeyringFileInfo, RetireBatchReport};
 use kring_core::model::{CollectionId, CollectionInfo, ItemId, ItemInfo, SecretValue};
@@ -205,6 +206,13 @@ pub struct AppState {
     pub agent_identities: Vec<AgentIdentity>,
     /// Why the ssh-agent cannot be reached, `None` once it answered.
     pub agent_unavailable: Option<String>,
+    /// Keys of the GnuPG home (last scan; empty while gpg is unavailable).
+    pub gpg_keys: Vec<GpgKey>,
+    /// Why gpg cannot be used, `None` once a scan succeeded.
+    pub gpg_unavailable: Option<String>,
+    /// Armored public key `(fingerprint, text)` last read (not a secret);
+    /// dropped when its key is no longer listed.
+    pub gpg_public_key: Option<(String, String)>,
     /// Backups, newest first.
     pub backups: Vec<BackupInfo>,
     /// Outcome of the last import.
@@ -382,6 +390,17 @@ impl AppState {
                     self.ssh_public_key = Some((name, text));
                 }
             }
+            Event::GpgKeys(keys) => self._set_gpg_keys(keys),
+            Event::GpgUnavailable(reason) => {
+                self.gpg_keys.clear();
+                self.gpg_public_key = None;
+                self.gpg_unavailable = Some(reason);
+            }
+            Event::GpgPublicKey { fpr, text } => {
+                if self.gpg_keys.iter().any(|k| k.fingerprint == fpr) {
+                    self.gpg_public_key = Some((fpr, text));
+                }
+            }
             Event::Notice(text) => self.notices.push(text),
             Event::PasswordNeeded(name) => {
                 if self.selected_file.as_ref() == Some(&name) {
@@ -556,6 +575,20 @@ impl AppState {
             .map(|k| k.fingerprint.clone());
         if old_fingerprint != new_fingerprint {
             self.ssh_public_key = None;
+        }
+    }
+
+    /// Replaces the GPG key list (gpg answered, so it is available) and drops
+    /// the public key text of a key that is no longer listed.
+    fn _set_gpg_keys(&mut self, keys: Vec<GpgKey>) {
+        self.gpg_keys = keys;
+        self.gpg_unavailable = None;
+        let listed = self
+            .gpg_public_key
+            .as_ref()
+            .is_some_and(|(fpr, _)| self.gpg_keys.iter().any(|k| &k.fingerprint == fpr));
+        if !listed {
+            self.gpg_public_key = None;
         }
     }
 
@@ -2269,6 +2302,44 @@ mod tests {
         assert!(s.ssh_public_key.is_none(), "dropped on selection change");
         s.apply(Event::SshKeys(vec![ssh_key("a", "SHA256:a")]));
         assert!(s.selected_ssh_key.is_none());
+    }
+
+    /// GPG keys and unavailability replace each other; a public key text is
+    /// kept only while its key is listed.
+    #[test]
+    fn gpg_keys_and_unavailability() {
+        let listing = include_bytes!("../../kring-core/tests/fixtures/gpg/list-keys.txt");
+        let keys = kring_core::gpg::parse_listing(listing);
+        let fpr = keys[0].fingerprint.clone();
+        let mut s = AppState::default();
+        s.apply(Event::GpgPublicKey {
+            fpr: fpr.clone(),
+            text: "armored".into(),
+        });
+        assert!(s.gpg_public_key.is_none(), "unknown key dropped");
+        s.apply(Event::GpgUnavailable("no gpg".into()));
+        assert_eq!(s.gpg_unavailable.as_deref(), Some("no gpg"));
+        s.apply(Event::GpgKeys(keys.clone()));
+        assert!(s.gpg_unavailable.is_none());
+        assert_eq!(s.gpg_keys.len(), keys.len());
+        s.apply(Event::GpgPublicKey {
+            fpr: fpr.clone(),
+            text: "armored".into(),
+        });
+        assert_eq!(
+            s.gpg_public_key.as_ref().map(|(f, _)| f.as_str()),
+            Some(fpr.as_str())
+        );
+        s.apply(Event::GpgKeys(keys[1..].to_vec()));
+        assert!(s.gpg_public_key.is_none(), "dropped with its key");
+        s.apply(Event::GpgKeys(keys.clone()));
+        s.apply(Event::GpgPublicKey {
+            fpr,
+            text: "armored".into(),
+        });
+        s.apply(Event::GpgUnavailable("refused".into()));
+        assert!(s.gpg_keys.is_empty() && s.gpg_public_key.is_none());
+        assert!(s.errors.is_empty(), "never an error toast");
     }
 
     /// Agent identities and unavailability replace each other; a key is in
