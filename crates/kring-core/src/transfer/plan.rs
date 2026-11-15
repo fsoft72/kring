@@ -378,4 +378,25 @@ mod tests {
         );
         assert_eq!(plan.counts().conflict, 1);
     }
+
+    /// Several existing items sharing an identity: any same secret is a
+    /// duplicate, none is a conflict against the first.
+    #[test]
+    fn several_existing_with_same_identity() {
+        let existing = [
+            ex("/1", &[("a", "1")], "first", 5),
+            ex("/2", &[("a", "1")], "second", 6),
+        ];
+        let plan = plan_transfer(&[inc(0, &[("a", "1")], "second", 9)], &existing);
+        assert_eq!(
+            plan.actions,
+            [Action::Duplicate {
+                existing: ItemId("/2".into())
+            }]
+        );
+        let plan = plan_transfer(&[inc(0, &[("a", "1")], "third", 9)], &existing);
+        assert_eq!(plan.actions, [Action::Conflict(0)]);
+        assert_eq!(plan.conflicts[0].existing, ItemId("/1".into()));
+        assert_eq!(plan.conflicts[0].modified_existing, 5);
+    }
 }
