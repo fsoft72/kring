@@ -8,3 +8,4 @@ pub use create::{
     keyring_backup_set,
 };
 pub(crate) use create::{encrypt_age, io_err};
+pub use restore::{RESTART_HINT, RestoreReport, read_backup_file, restore};
