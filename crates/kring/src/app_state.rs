@@ -18,6 +18,7 @@ use kring_core::transfer::plan::TransferCounts;
 use crate::operation::{self, Operation};
 use crate::session_secret::SessionSecret;
 use crate::views::collection::{collection_key, display_names};
+use crate::views::locked_list::natural_cmp;
 use crate::worker::{
     AgentStatus, Command, ConflictView, ConsolidationSummary, Event, OfflineItemView, WalletInfo,
 };
@@ -587,7 +588,14 @@ impl AppState {
 
     /// Replaces and sorts collections, dropping a selection that no longer exists.
     fn _set_collections(&mut self, mut v: Vec<CollectionInfo>) {
-        v.sort_by_cached_key(_sort_key);
+        // Login, then default, then label; same labels (e.g. many "Default
+        // keyring" orphans) fall back to the natural order of their ids, so
+        // Default_keyring_3 comes before Default_keyring_10.
+        v.sort_by(|a, b| {
+            _sort_key(a)
+                .cmp(&_sort_key(b))
+                .then_with(|| natural_cmp(&collection_key(&a.id), &collection_key(&b.id)))
+        });
         self.collections = v;
         let exists = self
             .selected
@@ -2770,5 +2778,34 @@ mod tests {
         s.set_consolidation_shown(false);
         s.apply(Event::CommandFinished(6));
         assert!(s.take_repreview().is_none(), "area left");
+    }
+    /// Same-label keyrings are listed in the natural order of their ids.
+    #[test]
+    fn same_labels_sorted_naturally_by_id() {
+        let mut state = AppState::default();
+        let mk = |id: &str| CollectionInfo {
+            id: CollectionId(format!("/org/freedesktop/secrets/collection/{id}")),
+            label: "Default keyring".into(),
+            locked: true,
+            item_count: 0,
+            aliases: vec![],
+            is_login: false,
+            created: 0,
+            modified: 0,
+        };
+        state.apply(Event::Collections(vec![
+            mk("Default_5fkeyring_5f10"),
+            mk("Default_5fkeyring_5f3"),
+            mk("Default_5fkeyring"),
+        ]));
+        let keys: Vec<String> = state
+            .collections
+            .iter()
+            .map(|c| collection_key(&c.id))
+            .collect();
+        assert_eq!(
+            keys,
+            ["Default_keyring", "Default_keyring_3", "Default_keyring_10"]
+        );
     }
 }
