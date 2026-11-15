@@ -115,12 +115,14 @@ pub fn plan_consolidation(
     target: &CollectionId,
     current_default: Option<&CollectionId>,
 ) -> Result<ConsolidationPlan> {
-    let target_items = snapshots
+    let target_snapshot = snapshots
         .iter()
         .find(|s| &s.info.id == target)
-        .ok_or_else(|| KringError::InvalidInput(format!("target {} not found", target.0)))?
+        .ok_or_else(|| KringError::InvalidInput(format!("target {} not found", target.0)))?;
+    let target_items = target_snapshot
         .items
         .as_ref()
+        .filter(|_| !target_snapshot.info.locked)
         .ok_or_else(|| KringError::InvalidInput(format!("target {} is locked", target.0)))?;
     let mut plan = ConsolidationPlan {
         target: target.clone(),
@@ -365,6 +367,11 @@ mod tests {
         let err = plan_consolidation(&[snap("A", vec![])], &cid("login"), None).unwrap_err();
         assert!(matches!(err, KringError::InvalidInput(_)));
         let err = plan_consolidation(&[locked("login")], &cid("login"), None).unwrap_err();
+        assert!(matches!(err, KringError::InvalidInput(_)));
+        // Items present but the collection reports locked: same as for orphans.
+        let mut half = snap("login", vec![]);
+        half.info.locked = true;
+        let err = plan_consolidation(&[half], &cid("login"), None).unwrap_err();
         assert!(matches!(err, KringError::InvalidInput(_)));
     }
 

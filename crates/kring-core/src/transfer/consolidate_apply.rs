@@ -69,6 +69,18 @@ pub struct ConsolidationReport {
 /// A failed step: `(step description, error message)`.
 type StepError = (String, String);
 
+/// A user choice for one preview conflict.
+#[derive(Clone, Copy, Debug)]
+struct Pick {
+    /// Incoming index of the conflict in the preview.
+    incoming: usize,
+    /// What the user chose.
+    choice: Choice,
+    /// True when the preview showed the target side as older than the
+    /// incoming side (a KeepTarget then must not delete the source).
+    target_older: bool,
+}
+
 /// Collects outcomes and reports progress.
 struct Runner<'a> {
     /// Outcomes so far.
@@ -99,8 +111,9 @@ impl Runner<'_> {
 ///   before calling; this function takes no backup.
 ///
 /// Fails with `InvalidInput`, before any change, when the shape of `choices`
-/// does not match the plan, or when a move source or `delete_empty` entry is
-/// the target, the login, session or an alias path. Step failures do not
+/// does not match the plan, when a move source or `delete_empty` entry is
+/// the target, the login, session or an alias path, or when a move step has
+/// an offline (non-live) incoming item. Step failures do not
 /// return `Err`: they end the run with [`StepOutcome::Failed`] and
 /// `completed == false`. A move with any failed item counts as failed.
 /// `progress` is called with `(0, total)` first and after every step, where
@@ -112,7 +125,7 @@ pub async fn apply_consolidation<S: SecretStore + ?Sized>(
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<ConsolidationReport> {
     let picked = index_choices(plan, choices)?;
-    check_deletable(plan)?;
+    check_plan(plan)?;
     let total = plan.moves.len() * 2 + plan.delete_empty.len() + usize::from(plan.set_default);
     progress(0, total);
     let mut runner = Runner {
@@ -134,11 +147,9 @@ pub async fn apply_consolidation<S: SecretStore + ?Sized>(
     })
 }
 
-/// Pairs each preview conflict choice with its incoming index, per move step.
-fn index_choices(
-    plan: &ConsolidationPlan,
-    choices: &[Vec<Choice>],
-) -> Result<Vec<Vec<(usize, Choice)>>> {
+/// Pairs each preview conflict choice with its incoming index and the
+/// preview's view of which side was newer, per move step.
+fn index_choices(plan: &ConsolidationPlan, choices: &[Vec<Choice>]) -> Result<Vec<Vec<Pick>>> {
     if choices.len() != plan.moves.len() {
         return Err(KringError::InvalidInput(format!(
             "expected choices for {} move steps, got {}",
@@ -163,14 +174,27 @@ fn index_choices(
                 .conflicts
                 .iter()
                 .zip(picks)
-                .map(|(c, p)| (c.incoming, *p))
+                .map(|(c, p)| Pick {
+                    incoming: c.incoming,
+                    choice: *p,
+                    target_older: c.modified_existing < c.modified_incoming,
+                })
                 .collect())
         })
         .collect()
 }
 
-/// Refuses a plan that could delete the target or a protected collection.
-fn check_deletable(plan: &ConsolidationPlan) -> Result<()> {
+/// Refuses a plan that could delete the target or a protected collection,
+/// or that moves offline items (consolidation moves live items only).
+fn check_plan(plan: &ConsolidationPlan) -> Result<()> {
+    let offline = plan.moves.iter().find(|m| {
+        m.incoming
+            .iter()
+            .any(|i| !matches!(i.source, TransferSource::Live(_)))
+    });
+    if let Some(step) = offline {
+        return Err(offline_error(&step.label));
+    }
     let sources = plan.moves.iter().map(|m| &m.source);
     let empties = plan.delete_empty.iter().map(|(id, _)| id);
     for id in sources.chain(empties) {
@@ -184,11 +208,18 @@ fn check_deletable(plan: &ConsolidationPlan) -> Result<()> {
     Ok(())
 }
 
+/// Builds the error for an offline item found in a consolidation move step.
+fn offline_error(label: &str) -> KringError {
+    KringError::InvalidInput(format!(
+        "move step {label} has an offline item; consolidation moves live items only"
+    ))
+}
+
 /// Runs every step in order; the first failure ends the run.
 async fn run<S: SecretStore + ?Sized>(
     store: &S,
     plan: &ConsolidationPlan,
-    picked: &[Vec<(usize, Choice)>],
+    picked: &[Vec<Pick>],
     runner: &mut Runner<'_>,
 ) -> std::result::Result<(), StepError> {
     for (step, picks) in plan.moves.iter().zip(picked) {
@@ -197,7 +228,13 @@ async fn run<S: SecretStore + ?Sized>(
             .await
             .map_err(|e| (name.clone(), e.to_string()))?;
         if !report.failed.is_empty() {
-            return Err((name, failure_summary(&report)));
+            // Show what did move before the failure that ends the run.
+            let error = failure_summary(&report);
+            runner.outcomes.push(StepOutcome::Moved {
+                source: step.label.clone(),
+                report,
+            });
+            return Err((name, error));
         }
         runner.step(StepOutcome::Moved {
             source: step.label.clone(),
@@ -269,14 +306,18 @@ async fn delete_if_empty<S: SecretStore + ?Sized>(
 
 /// Re-plans one move step against the live source and target, then applies it.
 ///
-/// Items changed since the preview and items in a conflict the preview did
-/// not show are left out (their sources stay) and appended to
-/// [`TransferReport::source_kept`].
+/// Left out (their sources stay, labels appended to
+/// [`TransferReport::source_kept`]): items changed since the preview, items in
+/// a conflict the preview did not show, and items in a conflict resolved as
+/// KeepTarget where the preview showed the target as older. The last rule is
+/// judged on the preview, not the live target: an item created or updated by
+/// an earlier step is stamped with the current time and would always look
+/// newer.
 async fn move_step<S: SecretStore + ?Sized>(
     store: &S,
     target: &CollectionId,
     step: &MoveStep,
-    picks: &[(usize, Choice)],
+    picks: &[Pick],
 ) -> Result<TransferReport> {
     let (fresh, mut kept) = fresh_incoming(store, step).await?;
     let existing = live_existing(store, target, &fresh).await?;
@@ -284,8 +325,12 @@ async fn move_step<S: SecretStore + ?Sized>(
     let first = plan_transfer(&all, &existing);
     let mut reviewed: Vec<(usize, Incoming)> = Vec::new();
     for ((index, item), action) in fresh.into_iter().zip(&first.actions) {
-        let unseen = matches!(action, Action::Conflict(_)) && pick(picks, index).is_none();
-        if unseen {
+        let keep_source = match (action, pick(picks, index)) {
+            (Action::Conflict(_), None) => true,
+            (Action::Conflict(_), Some(p)) => p.choice == Choice::KeepTarget && p.target_older,
+            _ => false,
+        };
+        if keep_source {
             kept.push(item.label.clone());
             continue;
         }
@@ -299,9 +344,14 @@ async fn move_step<S: SecretStore + ?Sized>(
         .conflicts
         .iter()
         .map(|c| {
-            pick(picks, reviewed[c.incoming].0).ok_or_else(|| {
-                KringError::InvalidInput(format!("no choice for conflict on {}", c.label_incoming))
-            })
+            pick(picks, reviewed[c.incoming].0)
+                .map(|p| p.choice)
+                .ok_or_else(|| {
+                    KringError::InvalidInput(format!(
+                        "no choice for conflict on {}",
+                        c.label_incoming
+                    ))
+                })
         })
         .collect::<Result<Vec<Choice>>>()?;
     let mut report = apply_transfer(
@@ -318,8 +368,8 @@ async fn move_step<S: SecretStore + ?Sized>(
 }
 
 /// Returns the user choice for the preview conflict of incoming `index`.
-fn pick(picks: &[(usize, Choice)], index: usize) -> Option<Choice> {
-    picks.iter().find(|(i, _)| *i == index).map(|(_, c)| *c)
+fn pick(picks: &[Pick], index: usize) -> Option<Pick> {
+    picks.iter().find(|p| p.incoming == index).copied()
 }
 
 /// Re-reads the step's live sources: returns the unchanged items with their
@@ -334,8 +384,7 @@ async fn fresh_incoming<S: SecretStore + ?Sized>(
     let mut changed = Vec::new();
     for (index, item) in step.incoming.iter().enumerate() {
         let TransferSource::Live(id) = &item.source else {
-            fresh.push((index, item.clone()));
-            continue;
+            return Err(offline_error(&step.label));
         };
         let Some(info) = live.iter().find(|i| &i.id == id) else {
             continue;
@@ -384,7 +433,7 @@ mod tests {
     use crate::model::{
         CollectionInfo, ItemId, ItemInfo, ItemUpdate, LOGIN_COLLECTION_PATH, NewItem,
     };
-    use crate::transfer::consolidate::{CollectionSnapshot, plan_consolidation};
+    use crate::transfer::consolidate::{CollectionSnapshot, PLANNED_ID_PREFIX, plan_consolidation};
 
     /// Store wrapper whose `create_item` fails for one label.
     struct FailingStore(FakeStore, &'static str);
@@ -474,8 +523,24 @@ mod tests {
 
     /// Plans a consolidation of the whole store into `target`.
     async fn plan_for(store: &FakeStore, target: &CollectionId) -> ConsolidationPlan {
+        plan_with_modified(store, target, &[]).await
+    }
+
+    /// Plans like [`plan_for`], first overriding the snapshot `modified` of
+    /// the items with the given labels.
+    async fn plan_with_modified(
+        store: &FakeStore,
+        target: &CollectionId,
+        modified: &[(&str, u64)],
+    ) -> ConsolidationPlan {
         let default = store.read_alias("default").await.unwrap();
-        plan_consolidation(&snapshots(store).await, target, default.as_ref()).unwrap()
+        let mut snaps = snapshots(store).await;
+        for item in snaps.iter_mut().flat_map(|s| s.items.iter_mut().flatten()) {
+            if let Some((_, m)) = modified.iter().find(|(l, _)| *l == item.label) {
+                item.modified = *m;
+            }
+        }
+        plan_consolidation(&snaps, target, default.as_ref()).unwrap()
     }
 
     /// Default choices of a plan (the preselected side of each conflict).
@@ -566,19 +631,32 @@ mod tests {
         let b = store.0.add_collection("B", "p", false);
         let c = store.0.add_collection("C", "p", false);
         put(&store.0, &a, "bad", "x", "1").await;
+        put(&store.0, &a, "fine", "z", "3").await;
         put(&store.0, &b, "good", "y", "2").await;
         let plan = plan_for(&store.0, &login).await;
         let report = apply_consolidation(&store, &plan, &defaults(&plan), &mut |_, _| {})
             .await
             .unwrap();
         assert!(!report.completed);
-        assert_eq!(report.outcomes.len(), 1);
-        let StepOutcome::Failed { step, error } = &report.outcomes[0] else {
+        assert_eq!(report.outcomes.len(), 2);
+        // The partial move is shown before the failure.
+        let StepOutcome::Moved {
+            source,
+            report: moved,
+        } = &report.outcomes[0]
+        else {
+            panic!("expected the partial move: {:?}", report.outcomes);
+        };
+        assert_eq!(source, "A");
+        assert_eq!((moved.created, moved.source_deleted), (1, 1));
+        assert_eq!(moved.failed.len(), 1);
+        let StepOutcome::Failed { step, error } = &report.outcomes[1] else {
             panic!("expected a failure: {:?}", report.outcomes);
         };
         assert_eq!(step, "Move A");
         assert!(error.contains("bad"), "{error}");
         assert_eq!(labels(&store.0, &a).await, ["bad"]);
+        assert_eq!(labels(&store.0, &login).await, ["fine"]);
         assert_eq!(labels(&store.0, &b).await, ["good"]);
         assert!(exists(&store.0, &c).await);
         assert_eq!(store.0.read_alias("default").await.unwrap(), None);
@@ -731,6 +809,98 @@ mod tests {
             b"from-b"
         );
         assert!(!exists(&store, &a).await && !exists(&store, &b).await);
+    }
+
+    /// KeepTarget against an item an earlier step creates keeps the source
+    /// when the preview showed that item as older.
+    #[tokio::test]
+    async fn keep_target_older_placeholder_keeps_source() {
+        let store = FakeStore::new();
+        let login = add_login(&store);
+        let a = store.add_collection("A", "p", false);
+        let b = store.add_collection("B", "p", false);
+        put(&store, &a, "from-a", "c", "old").await;
+        put(&store, &b, "from-b", "c", "new").await;
+        let plan = plan_with_modified(&store, &login, &[("from-a", 1), ("from-b", 9)]).await;
+        let conflict = &plan.moves[1].plan.conflicts[0];
+        assert!(conflict.existing.0.starts_with(PLANNED_ID_PREFIX));
+        assert_eq!(conflict.default_choice, Choice::UseIncoming);
+        let report = apply_consolidation(
+            &store,
+            &plan,
+            &[vec![], vec![Choice::KeepTarget]],
+            &mut |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(report.completed, "{:?}", report.outcomes);
+        let StepOutcome::Moved { report: moved, .. } = &report.outcomes[1] else {
+            panic!("expected the second move: {:?}", report.outcomes);
+        };
+        assert_eq!(moved.source_kept, ["from-b"]);
+        assert_eq!(
+            report.outcomes[2..4],
+            [
+                StepOutcome::Deleted("A".into()),
+                StepOutcome::Kept {
+                    source: "B".into(),
+                    remaining: 1
+                }
+            ]
+        );
+        assert_eq!(labels(&store, &b).await, ["from-b"]);
+        assert_eq!(labels(&store, &login).await, ["from-a"]);
+    }
+
+    /// KeepTarget against a target item that an earlier UseIncoming updated
+    /// keeps the source when the preview showed the target as older.
+    #[tokio::test]
+    async fn keep_target_after_use_incoming_keeps_source() {
+        let store = FakeStore::new();
+        let login = add_login(&store);
+        let a = store.add_collection("A", "p", false);
+        let b = store.add_collection("B", "p", false);
+        let target_item = put(&store, &login, "t", "c", "target").await;
+        put(&store, &a, "from-a", "c", "middle").await;
+        put(&store, &b, "from-b", "c", "newest").await;
+        let plan =
+            plan_with_modified(&store, &login, &[("t", 1), ("from-a", 5), ("from-b", 9)]).await;
+        let report = apply_consolidation(
+            &store,
+            &plan,
+            &[vec![Choice::UseIncoming], vec![Choice::KeepTarget]],
+            &mut |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert!(report.completed, "{:?}", report.outcomes);
+        assert_eq!(
+            store.read_secret(&target_item).await.unwrap().as_bytes(),
+            b"middle"
+        );
+        assert!(!exists(&store, &a).await);
+        assert_eq!(labels(&store, &b).await, ["from-b"]);
+        assert!(report.outcomes.contains(&StepOutcome::Kept {
+            source: "B".into(),
+            remaining: 1
+        }));
+    }
+
+    /// A move step with an offline item is refused before any change.
+    #[tokio::test]
+    async fn offline_item_in_step_rejected() {
+        let store = FakeStore::new();
+        let login = add_login(&store);
+        let a = store.add_collection("A", "p", false);
+        put(&store, &a, "x", "x", "1").await;
+        let mut plan = plan_for(&store, &login).await;
+        plan.moves[0].incoming[0].source = TransferSource::Offline(0);
+        let err = apply_consolidation(&store, &plan, &defaults(&plan), &mut |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KringError::InvalidInput(_)));
+        assert_eq!(labels(&store, &a).await, ["x"]);
+        assert!(labels(&store, &login).await.is_empty());
     }
 
     /// Progress goes from `(0, total)` to `(total, total)` one step at a time.
