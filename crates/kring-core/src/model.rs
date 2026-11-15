@@ -144,6 +144,21 @@ pub fn decode_path_segment(segment: &str) -> std::result::Result<String, String>
     String::from_utf8(out).map_err(|_| bad())
 }
 
+/// Encodes a name as a gnome-keyring object path segment (inverse of [`decode_path_segment`]).
+///
+/// Every UTF-8 byte that is not `[A-Za-z0-9]` becomes `_` plus two lowercase hex digits.
+pub fn encode_path_segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("_{b:02x}"));
+        }
+    }
+    out
+}
+
 /// Returns true if `id` is the login collection.
 pub fn is_login_collection(id: &CollectionId) -> bool {
     id.0 == LOGIN_COLLECTION_PATH
@@ -186,6 +201,30 @@ mod tests {
         assert!(decode_path_segment("a_").is_err());
         assert!(decode_path_segment("_c3").is_err());
         assert_eq!(decode_path_segment("_2f"), Ok("/".to_string()));
+    }
+
+    /// Encoding matches gnome-keyring and round-trips through decoding.
+    #[test]
+    fn encode_decode_roundtrip() {
+        assert_eq!(encode_path_segment("Default_keyring"), "Default_5fkeyring");
+        assert_eq!(encode_path_segment("a b-c"), "a_20b_2dc");
+        assert_eq!(encode_path_segment("caf\u{e9}"), "caf_c3_a9");
+        for name in [
+            "",
+            "login",
+            "My Keys",
+            "a_b",
+            "a-b",
+            "_",
+            "caf\u{e9} \u{1f511}",
+            "x/y",
+            "_5f",
+        ] {
+            assert_eq!(
+                decode_path_segment(&encode_path_segment(name)),
+                Ok(name.to_string())
+            );
+        }
     }
 
     /// Non-UTF-8 bytes give no text; clones keep the bytes.
