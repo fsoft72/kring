@@ -12,7 +12,7 @@ use kring_core::dev_guard::{IT_RUNTIME_VAR, violation_from};
 use kring_core::model::CollectionId;
 
 use crate::app_state::AppState;
-use crate::views::backups::{BackupView, restore_dialog};
+use crate::views::backups::{BackupView, path_exists, restore_dialog};
 use crate::views::collection::{display_name, export_dialog};
 use crate::views::dialogs::DialogKind;
 use crate::views::file_detail::retire_dialog;
@@ -146,7 +146,13 @@ impl DevPreset {
         let action = match self.dialog.as_deref() {
             Some("restore") => {
                 let checked = view.checked(info);
-                Action::Open(restore_dialog(info, &checked, &state.files, keyrings_dir))
+                Action::Open(restore_dialog(
+                    info,
+                    &checked,
+                    &state.files,
+                    keyrings_dir,
+                    path_exists,
+                ))
             }
             Some("restore-now") => Action::Send(Command::RestoreBackup {
                 dir: info.dir.clone(),
@@ -403,7 +409,7 @@ mod tests {
         assert!(matches!(
             &actions[..],
             [Action::Open(DialogKind::RestoreBackup { destinations, .. })]
-                if destinations == &["/k/a.keyring"]
+                if destinations == &["/k/a.keyring (new)"]
         ));
         assert!(p.take_backup_actions(&s, &mut view, k).is_empty());
     }

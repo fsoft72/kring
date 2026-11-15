@@ -10,13 +10,16 @@ use crate::ui::password_field::{
 };
 use crate::ui::theme;
 use crate::ui::widgets::{field_label, input, semibold};
-use crate::views::backups::RestorePassphrase;
+use crate::views::dialogs::RestorePassphrase;
 use crate::views::dialogs::{DialogKind, ImportTarget};
 use crate::views::item_detail::attribute_rows;
 use crate::worker::Command;
 
 /// Width of dialog content.
 pub const FIELD_WIDTH: f32 = 380.0;
+/// Passphrase request of a restore overwriting a plaintext keyring.
+const MSG_RESTORE_PLAINTEXT: &str =
+    "A plaintext keyring will be overwritten: its backup is encrypted, choose a passphrase";
 /// Hint of the archive path fields.
 const MSG_PATH_HINT: &str = "Full path, e.g. ~/kring-export.kring.age";
 /// Size of dialog titles.
@@ -258,7 +261,10 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             ..
         } => {
             _title(ui, "Restore backup");
-            _text(ui, "These files will be overwritten:");
+            _text(
+                ui,
+                "These files will be overwritten (new ones are created):",
+            );
             for dest in destinations.iter() {
                 ui.label(
                     RichText::new(dest)
@@ -282,13 +288,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
                     );
                 }
                 RestorePassphrase::New => {
-                    ui.label(
-                        RichText::new(
-                            "A plaintext keyring is overwritten: its backup is encrypted, \
-                             choose a passphrase",
-                        )
-                        .color(theme::TERTIARY),
-                    );
+                    ui.label(RichText::new(MSG_RESTORE_PLAINTEXT).color(theme::TERTIARY));
                     _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
                     _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
                 }
@@ -335,18 +335,12 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             confirm,
         } => {
             _title(ui, "Backup passphrase");
-            if matches!(**command, Command::RestoreBackup { .. }) {
-                ui.label(
-                    RichText::new("The restore needs the passphrase of the backup")
-                        .color(theme::TERTIARY),
-                );
-                _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
-                return _primary("Continue");
-            }
-            ui.label(
-                RichText::new("Backup contains plaintext keyrings, choose a passphrase")
-                    .color(theme::TERTIARY),
-            );
+            let text = if matches!(**command, Command::RestoreBackup { .. }) {
+                MSG_RESTORE_PLAINTEXT
+            } else {
+                "Backup contains plaintext keyrings, choose a passphrase"
+            };
+            ui.label(RichText::new(text).color(theme::TERTIARY));
             _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
             _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _primary("Continue")

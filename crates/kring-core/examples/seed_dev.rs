@@ -5,11 +5,11 @@
 //! It also writes two sample backups of the (temp) keyring fixtures, only when
 //! the data home lies inside the session's temp root.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use kring_core::backup::{BACKUP_KEEP, BackupManager};
-use kring_core::dev_guard::{IT_RUNTIME_VAR, private_session_violation};
+use kring_core::dev_guard::{IT_RUNTIME_VAR, data_home_violation, private_session_violation};
 use kring_core::model::{Attributes, CollectionId, LOGIN_COLLECTION_PATH, NewItem, SecretValue};
 use kring_core::paths;
 use kring_core::secret_service::SecretServiceBackend;
@@ -90,27 +90,13 @@ async fn _seed() -> kring_core::Result<()> {
     Ok(())
 }
 
-/// Returns why the data home is not inside the temp root of the session
-/// (the parent of the private runtime dir), or `None` when it is.
-fn _data_home_violation(data_home: &Path) -> Option<String> {
-    let runtime = std::env::var(IT_RUNTIME_VAR).ok().map(PathBuf::from)?;
-    let root = runtime.parent()?;
-    if root.as_os_str().is_empty() || root == Path::new("/") || !data_home.starts_with(root) {
-        return Some(format!(
-            "data home {} is not inside {}",
-            data_home.display(),
-            root.display()
-        ));
-    }
-    None
-}
-
 /// Creates the sample backups: an older binary one (reason
 /// `delete-collection`) and a newer one with an encrypted plaintext keyring
 /// (reason `delete-item`, passphrase [`BACKUP_PASSPHRASE`]).
 fn _seed_backups() -> kring_core::Result<()> {
     let data_home = paths::data_home();
-    if let Some(reason) = _data_home_violation(&data_home) {
+    let runtime = std::env::var_os(IT_RUNTIME_VAR).map(PathBuf::from);
+    if let Some(reason) = data_home_violation(&data_home, runtime.as_deref()) {
         return Err(kring_core::KringError::InvalidInput(format!(
             "refusing to write backups: {reason}"
         )));

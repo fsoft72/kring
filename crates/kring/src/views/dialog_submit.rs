@@ -7,9 +7,8 @@ use kring_core::validate;
 use zeroize::Zeroizing;
 
 use crate::app_state::FileAction;
-use crate::ui::widgets::clean_path;
-use crate::views::backups::RestorePassphrase;
 use crate::views::dialogs::DialogKind;
+use crate::views::dialogs::RestorePassphrase;
 use crate::worker::Command;
 
 /// Error of an import without a target keyring.
@@ -27,6 +26,12 @@ pub const MSG_RELATIVE_PATH: &str = "Enter an absolute path (or one starting wit
 pub const MSG_NO_ARCHIVE_PASSPHRASE: &str = "Enter the passphrase of the archive";
 /// Error of an empty backup passphrase.
 const MSG_NO_BACKUP_PASSPHRASE: &str = "Enter the passphrase of the backup";
+
+/// Parses a path typed by the user: strips surrounding whitespace and quotes
+/// (ported from Paranoid's `clean_path`).
+pub fn clean_path(s: &str) -> PathBuf {
+    PathBuf::from(s.trim().trim_matches('"').trim_matches('\''))
+}
 
 /// Resolves a typed path: cleaned (quotes, spaces), `~` and `~/...` expanded
 /// with `home`; the result must be absolute.
@@ -287,11 +292,9 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             passphrase,
             confirm,
         } => {
-            let passphrase = if matches!(**command, Command::RestoreBackup { .. }) {
-                _required(passphrase, MSG_NO_BACKUP_PASSPHRASE)?
-            } else {
-                _new_password(passphrase, confirm)?
-            };
+            // A restore asks here only to encrypt the backup of a plaintext
+            // keyring it overwrites: a new passphrase, confirmed like the others.
+            let passphrase = _new_password(passphrase, confirm)?;
             with_backup_passphrase((**command).clone(), passphrase)
         }
     };
@@ -301,7 +304,7 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::backups::RestorePassphrase;
+    use crate::views::dialogs::RestorePassphrase;
     use kring_core::model::{CollectionId, CollectionInfo};
     use std::path::{Path, PathBuf};
 
@@ -322,6 +325,40 @@ mod tests {
             created: 0,
             modified: 0,
         }
+    }
+
+    /// A restore fallback with a mismatched confirmation is rejected.
+    #[test]
+    fn passphrase_dialog_restore_rejects_mismatch() {
+        let mut kind = restore_fallback();
+        if let DialogKind::Passphrase {
+            passphrase,
+            confirm,
+            ..
+        } = &mut kind
+        {
+            *passphrase = buf("pp");
+            *confirm = buf("pq");
+        }
+        assert!(command_for(&kind).is_err());
+        if let DialogKind::Passphrase { confirm, .. } = &mut kind {
+            confirm.clear();
+        }
+        assert!(command_for(&kind).is_err(), "missing confirmation rejected");
+    }
+
+    /// Whitespace and surrounding quotes are removed, inner text is kept.
+    #[test]
+    fn clean_path_strips_quotes_and_spaces() {
+        assert_eq!(
+            clean_path("  /tmp/a b.age \n"),
+            PathBuf::from("/tmp/a b.age")
+        );
+        assert_eq!(clean_path("\"/tmp/x.age\""), PathBuf::from("/tmp/x.age"));
+        assert_eq!(clean_path("'/tmp/x.age'"), PathBuf::from("/tmp/x.age"));
+        assert_eq!(clean_path(" \"'/tmp/q'\" "), PathBuf::from("/tmp/q"));
+        assert_eq!(clean_path("/tmp/it's.age"), PathBuf::from("/tmp/it's.age"));
+        assert_eq!(clean_path("   "), PathBuf::from(""));
     }
 
     /// Typed paths are cleaned, `~` expands to home, relative paths are refused.
@@ -461,18 +498,29 @@ mod tests {
         assert!(command_for(&new).is_ok());
     }
 
-    /// The fallback passphrase dialog resends a restore with one field only.
-    #[test]
-    fn passphrase_dialog_resends_restore() {
-        let original = Command::RestoreBackup {
+    /// Builds the fallback passphrase dialog of a restore.
+    fn restore_fallback() -> DialogKind {
+        DialogKind::passphrase(Command::RestoreBackup {
             dir: "/b/1".into(),
             files: vec!["/x/a.keyring".into()],
             passphrase: None,
-        };
-        let mut kind = DialogKind::passphrase(original);
+        })
+    }
+
+    /// The fallback passphrase dialog encrypts a new backup: it resends the
+    /// restore only with a confirmed passphrase.
+    #[test]
+    fn passphrase_dialog_resends_restore() {
+        let mut kind = restore_fallback();
         assert!(command_for(&kind).is_err(), "empty passphrase rejected");
-        if let DialogKind::Passphrase { passphrase, .. } = &mut kind {
+        if let DialogKind::Passphrase {
+            passphrase,
+            confirm,
+            ..
+        } = &mut kind
+        {
             *passphrase = buf("pp");
+            *confirm = buf("pp");
         }
         assert!(matches!(
             command_for(&kind).unwrap(),

@@ -38,6 +38,37 @@ pub fn violation_from(
     None
 }
 
+/// Returns why `data_home` is not strictly inside the session temp root (the
+/// parent of the private runtime dir `it_runtime`), or `None` when it is.
+///
+/// Fails closed: a missing, relative or rootless runtime dir, a root of `/`
+/// and any `..` component in either path are violations.
+pub fn data_home_violation(
+    data_home: &std::path::Path,
+    it_runtime: Option<&std::path::Path>,
+) -> Option<String> {
+    use std::path::Component;
+    let Some(runtime) = it_runtime.filter(|r| r.is_absolute()) else {
+        return Some(format!("{IT_RUNTIME_VAR} is unset or not absolute"));
+    };
+    let dotted = |p: &std::path::Path| p.components().any(|c| c == Component::ParentDir);
+    if dotted(runtime) || dotted(data_home) {
+        return Some("paths must not contain '..'".into());
+    }
+    let root = match runtime.parent() {
+        Some(root) if root.parent().is_some() => root,
+        _ => return Some(format!("{} has no temp root", runtime.display())),
+    };
+    if data_home == root || !data_home.starts_with(root) {
+        return Some(format!(
+            "data home {} is not inside {}",
+            data_home.display(),
+            root.display()
+        ));
+    }
+    None
+}
+
 /// Checks the current process environment; `Some(reason)` means "do not touch the bus".
 #[cfg(any(test, feature = "dev"))]
 pub fn private_session_violation() -> Option<String> {
@@ -76,6 +107,27 @@ mod tests {
         assert!(violation_from(Some(""), Some(""), Some(PRIVATE_BUS)).is_some());
         assert!(violation_from(Some(RUN), Some("/run/user/1000"), Some(PRIVATE_BUS)).is_some());
         assert!(violation_from(Some(RUN), None, Some(PRIVATE_BUS)).is_some());
+    }
+
+    /// The data home must sit strictly inside the parent of the runtime dir,
+    /// without `..`; a missing or rootless runtime dir fails closed.
+    #[test]
+    fn data_home_inside_temp_root() {
+        use std::path::Path;
+        let run = Some(Path::new(RUN));
+        let inside = Path::new("/tmp/kring-it.abc/data");
+        assert_eq!(data_home_violation(inside, run), None);
+        assert!(data_home_violation(inside, None).is_some());
+        assert!(data_home_violation(inside, Some(Path::new(""))).is_some());
+        assert!(data_home_violation(inside, Some(Path::new("/"))).is_some());
+        assert!(data_home_violation(inside, Some(Path::new("/run"))).is_some());
+        assert!(data_home_violation(inside, Some(Path::new("run"))).is_some());
+        let home = Path::new("/home/me/.local/share");
+        assert!(data_home_violation(home, run).is_some());
+        let escape = Path::new("/tmp/kring-it.abc/../../home/me/.local/share");
+        assert!(data_home_violation(escape, run).is_some());
+        let dotted_run = Some(Path::new("/tmp/kring-it.abc/x/../run"));
+        assert!(data_home_violation(inside, dotted_run).is_some());
     }
 
     /// A missing bus address or the real user bus is rejected.

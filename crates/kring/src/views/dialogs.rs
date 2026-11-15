@@ -10,7 +10,6 @@ use crate::app_state::FileAction;
 use crate::ui::password_field::{forget_fields, new_buffer};
 use crate::ui::theme;
 use crate::ui::widgets::{danger_button, primary_button, secondary_button};
-use crate::views::backups::RestorePassphrase;
 use crate::views::collection::display_name;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_submit::command_for;
@@ -25,6 +24,18 @@ const DIALOG_WIDTH: f32 = FIELD_WIDTH;
 const DIALOG_MARGIN: i8 = 24;
 /// Opacity of the backdrop behind a dialog.
 const BACKDROP_ALPHA: u8 = 150;
+
+/// Passphrase asked by the restore confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestorePassphrase {
+    /// Nothing encrypted is read or written.
+    NotNeeded,
+    /// An encrypted copy is restored: the passphrase of the backup.
+    Existing,
+    /// Only the pre-restore backup of a plaintext file is encrypted: a new
+    /// passphrase, typed twice.
+    New,
+}
 
 /// A keyring offered as import target.
 #[derive(Clone, Debug, PartialEq, Eq)]

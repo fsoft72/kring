@@ -50,8 +50,6 @@ pub enum Ico {
     Terminal,
     /// GPG keys area.
     Shield,
-    /// Tools area.
-    Sliders,
     /// Rescan or reload.
     Refresh,
     /// Backups area: archive box.
@@ -235,16 +233,6 @@ fn _simple(p: &Painter, g: &Grid, st: Stroke, ico: Ico) {
             );
             line(g.pt(8.0, 10.5), g.pt(8.0, 2.0));
             _poly(p, vec![g.pt(5.0, 5.0), g.pt(8.0, 2.0), g.pt(11.0, 5.0)], st);
-        }
-        Ico::Sliders => {
-            for (y, k) in [(4.0, 10.0), (8.0, 5.0), (12.0, 11.0)] {
-                line(g.pt(2.0, y), g.pt(14.0, y));
-                p.rect_filled(
-                    Rect::from_center_size(g.pt(k, y), egui::vec2(3.2 * g.unit, 3.2 * g.unit)),
-                    CornerRadius::same(1),
-                    st.color,
-                );
-            }
         }
         _ => {}
     }

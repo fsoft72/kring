@@ -20,7 +20,7 @@ use crate::ui::widgets::{
     semibold,
 };
 use crate::views::Action;
-use crate::views::dialogs::DialogKind;
+use crate::views::dialogs::{DialogKind, RestorePassphrase};
 use crate::views::files_list::format_size;
 use crate::views::sidebar::row_background;
 use crate::worker::Command;
@@ -31,6 +31,8 @@ const ROW_HEIGHT: f32 = 52.0;
 const ROW_PADDING: f32 = 12.0;
 /// Chip of age-encrypted backup files.
 const CHIP_ENCRYPTED: &str = "encrypted";
+/// Suffix of restore destinations that do not exist yet.
+const NEW_SUFFIX: &str = " (new)";
 /// Tooltip of `Restore selected` with nothing selected.
 const MSG_NOTHING_SELECTED: &str = "Select at least one file";
 /// Explanation under the backup header.
@@ -86,18 +88,6 @@ pub fn restore_destination(file: &BackupFile, keyrings_dir: &Path) -> PathBuf {
     keyrings_dir.join(file_name(file))
 }
 
-/// Passphrase asked by the restore confirmation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RestorePassphrase {
-    /// Nothing encrypted is read or written.
-    NotNeeded,
-    /// An encrypted copy is restored: the passphrase of the backup.
-    Existing,
-    /// Only the pre-restore backup of a plaintext file is encrypted: a new
-    /// passphrase, typed twice.
-    New,
-}
-
 /// Decides the passphrase of a restore of `selected`: encrypted copies need
 /// theirs; a plaintext destination (per the last file scan) needs a new one
 /// for its pre-restore backup.
@@ -119,16 +109,30 @@ pub fn restore_passphrase(
     RestorePassphrase::NotNeeded
 }
 
-/// Builds the restore confirmation of the `selected` files of `info`.
+/// Returns true when `path` exists on disk (symlinks are not followed).
+pub fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Builds the restore confirmation of the `selected` files of `info`;
+/// destinations for which `exists` is false are marked `(new)`.
 pub fn restore_dialog(
     info: &BackupInfo,
     selected: &[&BackupFile],
     files: &[KeyringFileInfo],
     keyrings_dir: &Path,
+    exists: impl Fn(&Path) -> bool,
 ) -> DialogKind {
     let destinations = selected
         .iter()
-        .map(|f| restore_destination(f, keyrings_dir).display().to_string())
+        .map(|f| {
+            let dest = restore_destination(f, keyrings_dir);
+            let shown = dest.display().to_string();
+            if exists(&dest) {
+                return shown;
+            }
+            format!("{shown}{NEW_SUFFIX}")
+        })
         .collect();
     DialogKind::restore_backup(
         info.dir.clone(),
@@ -373,7 +377,7 @@ pub fn detail(
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let blocked = checked.is_empty().then_some(MSG_NOTHING_SELECTED);
             if danger_button(ui, "Restore selected", blocked) {
-                let kind = restore_dialog(info, &checked, &state.files, keyrings_dir);
+                let kind = restore_dialog(info, &checked, &state.files, keyrings_dir, path_exists);
                 action = Some(Action::Open(kind));
             }
         });
@@ -548,7 +552,7 @@ mod tests {
         view.toggle(Path::new("/x/a.keyring"));
         let checked = view.checked(&info);
         assert_eq!(checked.len(), 1);
-        match restore_dialog(&info, &checked, &[], Path::new("/k")) {
+        match restore_dialog(&info, &checked, &[], Path::new("/k"), |_| true) {
             DialogKind::RestoreBackup {
                 dir,
                 files,
@@ -560,6 +564,27 @@ mod tests {
                 assert_eq!(files, [PathBuf::from("/x/p.keyring")]);
                 assert_eq!(destinations, ["/k/p.keyring"]);
                 assert_eq!(mode, RestorePassphrase::Existing);
+            }
+            _ => panic!("expected RestoreBackup"),
+        }
+    }
+
+    /// Destinations that do not exist yet are marked new.
+    #[test]
+    fn restore_dialog_marks_new_destinations() {
+        let s = Path::new("/s");
+        let info = backup(
+            "/b/1",
+            vec![
+                bfile("/x/a.keyring", s, false),
+                bfile("/x/b.keyring", s, false),
+            ],
+        );
+        let checked: Vec<&BackupFile> = info.files.iter().collect();
+        let exists = |p: &Path| p == Path::new("/k/a.keyring");
+        match restore_dialog(&info, &checked, &[], Path::new("/k"), exists) {
+            DialogKind::RestoreBackup { destinations, .. } => {
+                assert_eq!(destinations, ["/k/a.keyring", "/k/b.keyring (new)"]);
             }
             _ => panic!("expected RestoreBackup"),
         }
