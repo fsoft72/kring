@@ -9,12 +9,13 @@ libraries.
 - **Secret Service management**: list, create, rename, unlock and delete keyrings; change the master password; browse, search, create, edit and delete items; copy secrets with a 30 s clipboard auto-clear.
 - **Offline files**: browse the `*.keyring` files in `~/.local/share/keyrings` without the daemon. Binary (encrypted) files open with their password; plaintext files are read directly, including ones the daemon rejects because of multi-line `secret=` values (recovered by a tolerant parser). Items can be imported into an unlocked keyring (duplicates skipped, conflicts listed, nothing overwritten). "Delete file" removes any file the daemon has not loaded (binary, plaintext or unrecognized): "Back up the file before deleting" is checked by default (a plaintext file's backup is encrypted with a passphrase you choose); unchecked, the deletion is permanent and the button is enabled only after typing the exact file name. A file loaded by gnome-keyring (the note shows its keyring id and label, e.g. `Default_10 (label "Default")`) is deleted as a keyring through gnome-keyring, with the usual backup of all keyring files (encrypted when any of them is plaintext); the backup can be skipped only when that keyring is unlocked and holds no items (a locked keyring never counts as empty). This needs a provider that allows writes, and works on locked keyrings too (no prompt).
 - **KWallet migration**: read KDE wallets (`~/.local/share/kwalletd/*.kwl`) without KWallet running, browse their folders and entries, and import them into a gnome-keyring keyring so apps keep finding their secrets (see below).
+- **SSH keys**: list the keys in `~/.ssh`, see their fingerprint, type, comment and public key, generate, import, export, change the passphrase of and delete them (after a backup), and load them into the running ssh-agent or remove them from it (see below).
 - **Same-named keyrings**: when two or more keyrings share a label (gnome-keyring names many orphans "Default"), every list, header and keyring picker shows `<label> · <keyring id>` for each of them.
 - **Backups and restore**: every destructive action first writes a backup; the Backups area lists them and restores selected files.
 - **Copy, move and consolidate**: move items between keyrings with a conflict preview, or merge all orphan keyrings into `login` in one step (see below).
 - **Encrypted export**: export a keyring to an age passphrase-encrypted `.kring.age` file and import it back.
-- **Progress of destructive actions**: deleting an item, keyring or file, retiring a file, restoring a backup and applying a move (or a "use incoming" choice) open a "Working..." window listing the backup step and the operation, then the result (or the error). It closes only once the operation finished, and every other destructive action stays disabled meanwhile, so the same keyring cannot be deleted twice.
-- **Remember a passphrase for the session**: passphrase dialogs (unlock, backup, restore, retire, export/import archive, consolidation, the password of a binary keyring file or of a KWallet wallet, the new KWallet keyring) offer "Remember for this session". The remembered value then answers passphrase requests by itself (once per request; the dialog opens if it is wrong), is tried first when you click Unlock, fills the keyring file and wallet password dialogs, and fills new-backup passphrases without the confirmation field. A wrong keyring file or wallet password, typed or remembered, reopens its dialog with "Wrong passphrase, try again". A key tile in the rail shows that one is remembered; click it to forget it.
+- **Progress of destructive actions**: deleting an item, keyring, file or SSH key, changing an SSH key passphrase, retiring a file, restoring a backup and applying a move (or a "use incoming" choice) open a "Working..." window listing the backup step and the operation, then the result (or the error). It closes only once the operation finished, and every other destructive action stays disabled meanwhile, so the same keyring cannot be deleted twice.
+- **Remember a passphrase for the session**: passphrase dialogs (unlock, backup, restore, retire, export/import archive, consolidation, the password of a binary keyring file or of a KWallet wallet, the new KWallet keyring, an SSH key passphrase) offer "Remember for this session". The remembered value then answers passphrase requests by itself (once per request; the dialog opens if it is wrong), is tried first when you click Unlock, fills the keyring file and wallet password dialogs, and fills new-backup passphrases without the confirmation field. A wrong keyring file, wallet or SSH key password, typed or remembered, reopens its dialog with "Wrong passphrase, try again". A key tile in the rail shows that one is remembered; click it to forget it.
 
 ## Copy / Move and Consolidate
 
@@ -87,12 +88,63 @@ Settings > KDE Wallet uncheck "Use KWallet for the Secret Service interface"
 area while a KWallet daemon is on the bus, and again after each import. Keep the wallet files until
 you have checked that your apps work; kring never deletes them.
 
+## SSH keys
+
+The SSH keys area lists the keys in `~/.ssh` (`$HOME/.ssh`; without `HOME`
+nothing is scanned and the area says so). Only files that are SSH keys are
+listed or ever touched: a private key (OpenSSH, or legacy PEM / PKCS#8) paired
+with its `<name>.pub`, or a lone `.pub`. `authorized_keys`, `known_hosts`,
+`config` and similar files are never listed or modified, and symlinks are
+ignored.
+
+Each key shows its type (ED25519, RSA 3072, ECDSA P-256, ...), whether the
+private key is ENCRYPTED or UNENCRYPTED (a warning: anyone who can read the
+file can use it), PUBLIC ONLY when there is no private file, IN AGENT when the
+running ssh-agent holds it, and LEGACY for PEM keys. The detail shows the
+fingerprint (`SHA256:...`, as `ssh-keygen -l` prints it), the comment, the file
+paths and the public key in one line with a Copy button.
+
+- **+ New key**: Ed25519 (default), ECDSA P-256 / P-384 or RSA 3072 / 4096,
+  with a comment and a passphrase ("No passphrase" stores it unencrypted, with
+  a warning). The private key is written 0600 and the `.pub` 0644; an
+  existing file is never overwritten.
+- **Import**: copies an OpenSSH private key from any path into `~/.ssh` (its
+  `.pub` is derived when missing); nothing is overwritten.
+- **Add to agent / Remove from agent**: loads the key into the ssh-agent of
+  `SSH_AUTH_SOCK` (an encrypted key asks its passphrase), optionally for a
+  limited time (15 minutes to 8 hours). The agent section at the bottom of the
+  list shows the loaded identities, each with Remove, and "Remove all". These
+  change only the agent's memory, never a file. Without `SSH_AUTH_SOCK`, or
+  when the agent does not answer, the section says why.
+- **Export private key...**: writes a copy to a new file (0600, never over an
+  existing one), either as is (an encrypted key keeps its passphrase) or
+  encrypted with a new passphrase. kring never writes a decrypted copy of an
+  encrypted key.
+- **Change passphrase...**: checks the current passphrase, backs up the key
+  file, then replaces it atomically. Removing the passphrase needs the explicit
+  "Store this key without a passphrase" checkbox.
+- **Delete...**: moves the private and public files into a backup (reason
+  `delete-ssh-key`), verifies it, then removes them. A key loaded in the agent
+  stays loaded until removed there.
+
+Backups of SSH keys go to the same backups directory as the keyrings and are
+listed in the Backups area. An unencrypted private key is never stored in
+clear in a backup: deleting it, or changing its passphrase, asks for a backup
+passphrase in the same dialog and the copy is age-encrypted (a remembered
+passphrase fills it). Encrypted keys and public keys are copied as they are.
+
+Legacy PEM keys are read only: they can be listed, copied (public key) and
+deleted. Convert one with `ssh-keygen -p -f <file>` (it rewrites it in the
+OpenSSH format) to manage it in kring.
+
 ## Run
 
 Isolated, seeded session for trying things out (private D-Bus session, throwaway
 gnome-keyring, temp `HOME`; your real keyrings and wallets are never touched; the
 KWallet area shows two copies of the test wallet, `kdewallet` and `fixture`,
-password `fixture-pw`):
+password `fixture-pw`; the SSH keys area shows the test keys in a temp
+`~/.ssh`, passphrase of `id_ed25519_enc` `fixture-pw`, with a private
+ssh-agent holding `id_ecdsa`; your real `~/.ssh` and agent are never used):
 
 ```sh
 scripts/dev-session.sh
@@ -119,5 +171,6 @@ cargo run -p kring-core --example scan_report -- ~/.local/share/keyrings
 - Textual `.keyring` files are **plaintext on disk**: anyone who can read the file can read the secrets. "Retire file" deletes one only after an encrypted backup is verified, and never for a file the daemon has loaded. "Delete file" removes a file the daemon has not loaded only after the backup manifest lists it with the expected checksum (when the backup is chosen); a loaded one goes through the daemon's own delete, after a backup unless the keyring is unlocked and empty.
 - Restoring overwrites files in the keyrings directory (after backing up the current ones). The daemon keeps its own in-memory copy, so restart it afterwards: `systemctl --user restart gnome-keyring-daemon`. kring shows this command and does not run it.
 - Secrets are never logged and are zeroized in memory when dropped.
+- SSH keys: kring changes only key files it listed in `~/.ssh` (never `authorized_keys`, `known_hosts`, `config` or symlinks), writes through a temp file and a rename in the same directory, never overwrites a key except when changing its passphrase (after a backup), and never writes an unencrypted private key into a backup. Private keys and passphrases stay in zeroized memory and are never logged; the agent only receives a key you add.
 - KWallet wallets are only read: kring never writes, deletes or locks the files in `~/.local/share/kwalletd`, and never talks to KWallet. Symlinked wallet, salt or attributes files are refused.
 - **Remembered passphrase warning**: "Remember for this session" keeps the passphrase in memory only (never on disk, in logs or in debug output) until kring closes or you forget it from the rail. While it is remembered, anyone using your session can unlock keyrings and decrypt or write backups with it without typing it. Use it only on a machine you control, and forget it when you are done.
