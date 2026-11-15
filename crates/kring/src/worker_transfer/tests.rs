@@ -282,6 +282,7 @@ fn may_carry_secret(event: &Event) -> bool {
         | Event::Collections(_)
         | Event::Items(..)
         | Event::BackupCreated(_)
+        | Event::BackupSkipped { .. }
         | Event::ApplyPassphrasesNeeded { .. }
         | Event::UnlockManyDone { .. }
         | Event::Files(_)
@@ -608,7 +609,7 @@ fn stale_plan_after_plan_1_and_2_mutations() {
     let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
     e.send(Command::RetireFile {
         name: "loose".into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     });
     e.until(|ev| matches!(ev, Event::Files(_)));
     assert!(!e.keyring("loose").exists());
@@ -776,12 +777,9 @@ fn consolidation_preview_then_apply_with_progress() {
         Event::BackupCreated(info) => info.files,
         other => panic!("expected BackupCreated, got {other:?}"),
     };
-    for name in ["Main", "Other", "Empty"] {
-        assert!(
-            files.iter().any(|f| f.original == e.keyring(name)),
-            "{name}"
-        );
-    }
+    // Target and move sources only: the empty keyring holds no secrets.
+    let originals: Vec<_> = files.iter().map(|f| f.original.clone()).collect();
+    assert_eq!(originals, [e.keyring("Main"), e.keyring("Other")]);
     let events = e.until(|ev| matches!(ev, Event::ConsolidationDone(_, _)));
     let progress: Vec<(usize, usize)> = events
         .iter()
@@ -833,7 +831,6 @@ fn consolidation_backup_failure_changes_nothing() {
     e.add_item(&e.other, "b", &[("k", "2")], "y");
     let empty = e.store.add_collection("Empty", "pw", false);
     e.binary_keyring("Main");
-    e.binary_keyring("Other");
     let apply = |plan_id| Command::ApplyConsolidation {
         plan_id,
         choices: vec![vec![]],
@@ -843,9 +840,10 @@ fn consolidation_backup_failure_changes_nothing() {
     let (plan_id, _) = e.plan_consolidation(false);
     e.send(apply(plan_id));
     let m = e.expect_error();
-    assert!(m.starts_with("No keyring file found for 'Empty'"), "{m}");
+    assert!(m.starts_with("No keyring file found for 'Other'"), "{m}");
 
-    e.binary_keyring("Empty");
+    // The empty keyring needs no file: it is not part of the backup.
+    e.binary_keyring("Other");
     std::fs::write(&e.backups, b"not a directory").unwrap();
     let (plan_id, _) = e.plan_consolidation(false);
     e.send(apply(plan_id));
@@ -858,8 +856,9 @@ fn consolidation_backup_failure_changes_nothing() {
     assert_eq!(block(e.store.read_alias("default")).unwrap(), None);
 }
 
-/// Empty plaintext orphan files are retired in one batch after a completed
-/// consolidation; both passphrases are asked for first with the plan kept.
+/// Empty plaintext orphan files are retired after a completed consolidation
+/// without a backup or passphrase; the consolidation backup holds only the
+/// target and the move sources (binary), so it needs no passphrase either.
 #[test]
 fn orphan_batch_runs_after_consolidation() {
     let e = gnome();
@@ -871,42 +870,30 @@ fn orphan_batch_runs_after_consolidation() {
     let (plan_id, summary) = e.plan_consolidation(true);
     assert_eq!(summary.orphan_files, ["orphan"]);
     assert!(
-        summary.backup_needs_passphrase,
-        "plaintext files in the set"
+        !summary.backup_needs_passphrase,
+        "the plaintext files are not in the backup"
     );
-    let apply = |backup: Option<&str>, orphan: Option<&str>| Command::ApplyConsolidation {
+    e.send(Command::ApplyConsolidation {
         plan_id,
         choices: vec![vec![]],
-        backup_passphrase: backup.map(SecretValue::from_text),
-        orphan_files_passphrase: orphan.map(SecretValue::from_text),
-    };
-    let asked = |e: &Env| match e.next() {
-        Event::ApplyPassphrasesNeeded {
-            plan_id: p,
-            backup,
-            orphan_files,
-        } => {
-            assert_eq!(p, plan_id);
-            (backup, orphan_files)
-        }
-        other => panic!("expected ApplyPassphrasesNeeded, got {other:?}"),
-    };
-    e.send(apply(None, None));
-    assert_eq!(asked(&e), (true, true));
-    e.send(apply(Some(PASSPHRASE), None));
-    assert_eq!(asked(&e), (false, true));
-    e.send(apply(None, Some(PASSPHRASE)));
-    assert_eq!(asked(&e), (true, false));
-    assert!(e.has_collection(&e.other));
-    assert_eq!(e.backup_count(), 0);
-
-    e.send(apply(Some(PASSPHRASE), Some(PASSPHRASE)));
+        backup_passphrase: None,
+        orphan_files_passphrase: None,
+    });
     let events = e.until(|ev| matches!(ev, Event::ConsolidationDone(_, _)));
-    let backups = events
+    let backups: Vec<_> = events
         .iter()
-        .filter(|ev| matches!(ev, Event::BackupCreated(_)))
-        .count();
-    assert_eq!(backups, 1, "the empty orphan needs no backup");
+        .filter_map(|ev| match ev {
+            Event::BackupCreated(info) => Some(info),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "the empty orphan needs no backup");
+    let originals: Vec<_> = backups[0]
+        .files
+        .iter()
+        .map(|f| f.original.clone())
+        .collect();
+    assert_eq!(originals, [e.keyring("Main"), e.keyring("Other")]);
     match events.last() {
         Some(Event::ConsolidationDone(report, Some(retired))) => {
             assert!(report.completed);
@@ -920,6 +907,66 @@ fn orphan_batch_runs_after_consolidation() {
     assert!(e.keyring("full").exists());
     assert!(!e.has_collection(&e.other));
     assert_eq!(e.backup_count(), 1);
+}
+
+/// A consolidation with only empty keyrings to delete takes no backup and
+/// asks no passphrase, even with plaintext keyrings around.
+#[test]
+fn consolidation_of_empty_keyrings_takes_no_backup() {
+    let e = gnome();
+    let empty = e.store.add_collection("Empty", "pw", false);
+    e.fixture_keyring(TEXTUAL, "Main");
+    e.fixture_keyring(TEXTUAL, "Other");
+    let (plan_id, summary) = e.plan_consolidation(false);
+    assert!(summary.steps.is_empty());
+    assert_eq!(summary.delete_empty.len(), 2);
+    assert!(!summary.backup_needs_passphrase);
+    e.send(Command::ApplyConsolidation {
+        plan_id,
+        choices: vec![],
+        backup_passphrase: None,
+        orphan_files_passphrase: None,
+    });
+    let events = e.until(|ev| matches!(ev, Event::ConsolidationDone(_, _)));
+    assert!(
+        !events.iter().any(|ev| matches!(
+            ev,
+            Event::BackupCreated(_) | Event::ApplyPassphrasesNeeded { .. }
+        )),
+        "{events:?}"
+    );
+    match events.last() {
+        Some(Event::ConsolidationDone(report, None)) => assert!(report.completed),
+        other => panic!("expected ConsolidationDone, got {other:?}"),
+    }
+    assert!(!e.has_collection(&e.other) && !e.has_collection(&empty));
+    assert_eq!(e.backup_count(), 0);
+}
+
+/// A plaintext target or move source makes the backup need a passphrase.
+#[test]
+fn consolidation_backup_of_plaintext_target_needs_passphrase() {
+    let e = gnome();
+    e.add_item(&e.other, "b", &[("k", "2")], "y");
+    e.fixture_keyring(TEXTUAL, "Main");
+    e.binary_keyring("Other");
+    let (plan_id, summary) = e.plan_consolidation(false);
+    assert!(summary.backup_needs_passphrase);
+    e.send(Command::ApplyConsolidation {
+        plan_id,
+        choices: vec![vec![]],
+        backup_passphrase: None,
+        orphan_files_passphrase: None,
+    });
+    match e.next() {
+        Event::ApplyPassphrasesNeeded {
+            backup,
+            orphan_files,
+            ..
+        } => assert_eq!((backup, orphan_files), (true, false)),
+        other => panic!("expected ApplyPassphrasesNeeded, got {other:?}"),
+    }
+    assert_eq!(e.backup_count(), 0);
 }
 
 /// A consolidation that stops (an empty collection got an item after the
@@ -936,8 +983,8 @@ fn failed_consolidation_keeps_orphan_files() {
     let (plan_id, summary) = e.plan_consolidation(true);
     assert_eq!(summary.orphan_files, ["orphan"]);
     assert!(
-        summary.backup_needs_passphrase,
-        "plaintext files in the set"
+        !summary.backup_needs_passphrase,
+        "the plaintext orphan is not in the backup"
     );
     e.add_item(&empty, "late", &[("k", "3")], "z");
     e.send(Command::ApplyConsolidation {

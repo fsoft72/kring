@@ -41,6 +41,8 @@ pub use crate::worker_wallet::{OfflineItemView, WalletEntryKind, WalletInfo, kwa
 const PAM_DIR: &str = "/etc/pam.d";
 /// Message used when the provider forbids an operation.
 pub(crate) const MSG_UNSUPPORTED: &str = "Not supported on this provider";
+/// Reason of an [`Event::BackupSkipped`] for an empty keyring.
+pub const BACKUP_SKIPPED_EMPTY: &str = "empty keyring";
 /// Message used when no provider is running.
 pub(crate) const MSG_NO_PROVIDER: &str = "No Secret Service provider running";
 /// Object path prefix of Secret Service collections.
@@ -124,9 +126,11 @@ pub enum Command {
         target: CollectionId,
     },
     /// Retire a plaintext keyring file (live ones go through `DeleteCollection`).
+    /// An empty file needs no backup, so no passphrase; one holding items
+    /// without a passphrase is answered with [`Event::PassphraseNeeded`].
     RetireFile {
         name: String,
-        backup_passphrase: SecretValue,
+        backup_passphrase: Option<SecretValue>,
     },
     /// Delete a keyring file the daemon does not serve, optionally after a
     /// backup (the passphrase encrypts the backup of a plaintext file).
@@ -320,6 +324,10 @@ pub enum Event {
     Secret(ItemId, SecretValue),
     /// A backup was written.
     BackupCreated(BackupInfo),
+    /// The backup step was skipped on purpose (no secrets), e.g. because the
+    /// keyring is empty ([`BACKUP_SKIPPED_EMPTY`]); emitted before the
+    /// operation's [`Event::Done`].
+    BackupSkipped { reason: String },
     /// A backup needs a passphrase; carries the command to resend with it.
     ///
     /// Only Plan 1/2 commands are echoed, always with their passphrase
@@ -328,8 +336,9 @@ pub enum Event {
     PassphraseNeeded(Box<Command>),
     /// The pending plan `plan_id` needs passphrases before it can be applied:
     /// `backup` for the pre-apply backup, `orphan_files` for the retired
-    /// orphan files. The plan stays valid; resend the apply command with all
-    /// of them.
+    /// orphan files (never set by a consolidation: its orphan files are
+    /// empty and retired without a backup). The plan stays valid; resend the
+    /// apply command with all of them.
     ApplyPassphrasesNeeded {
         plan_id: u64,
         backup: bool,
@@ -516,6 +525,10 @@ pub(crate) fn passphrase_echo(cmd: &Command) -> Event {
         Command::DeleteFile { name, backup, .. } => Command::DeleteFile {
             name,
             backup,
+            backup_passphrase: None,
+        },
+        Command::RetireFile { name, .. } => Command::RetireFile {
+            name,
             backup_passphrase: None,
         },
         Command::RestoreBackup { dir, files, .. } => Command::RestoreBackup {
@@ -787,14 +800,72 @@ fn backup_before<N: Fn()>(
     )
 }
 
-/// Takes ONE backup of all keyrings before changing `collections`, failing closed.
+/// Which files a backup before changing some collections holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackupScope {
+    /// Every keyring file of the keyrings dir (and its `default` file).
+    AllKeyrings,
+    /// Only the keyring files of the named collections (and the `default` file).
+    NamedOnly,
+}
+
+/// Name of the file holding the `default` alias in the keyrings dir.
+const DEFAULT_FILE: &str = "default";
+
+/// Returns the files to back up before changing `collections`, failing closed.
 ///
 /// Every named collection except the in-memory `session` one must have its
-/// `<decoded name>.keyring` in the backup set, otherwise nothing is backed up
-/// and the operation is refused. When only `session` is named no backup is
-/// needed. A missing passphrase emits [`Event::PassphraseNeeded`] with the
-/// echo of `original` when one is given (Plan 1/2 commands); apply commands
-/// pass `None` and report [`BackupStep::AwaitingPassphrase`] themselves.
+/// `<decoded name>.keyring` in the keyring backup set, otherwise the error
+/// message refuses the operation. When only `session` is named the list is
+/// empty (no backup needed). `scope` picks every keyring file or only the
+/// named ones; the `default` file is kept in both.
+pub(crate) fn backup_files(
+    config: &WorkerConfig,
+    collections: &[CollectionId],
+    scope: BackupScope,
+    wording: &BackupWording,
+) -> Result<Vec<PathBuf>, String> {
+    let mut names: Vec<String> = Vec::new();
+    for collection in collections {
+        match keyring_name(collection, wording.refusal)? {
+            Some(name) if !names.contains(&name) => names.push(name),
+            _ => {}
+        }
+    }
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let files =
+        keyring_backup_set(&config.keyrings_dir).map_err(|e| format!("{}: {e}", wording.failed))?;
+    let mut named = Vec::new();
+    for name in &names {
+        let file = config.keyrings_dir.join(format!("{name}.keyring"));
+        if !files.contains(&file) {
+            let dir = config.keyrings_dir.display();
+            return Err(format!(
+                "No keyring file found for '{name}' in {dir}: {}",
+                wording.refusal
+            ));
+        }
+        named.push(file);
+    }
+    if scope == BackupScope::AllKeyrings {
+        return Ok(files);
+    }
+    let default = config.keyrings_dir.join(DEFAULT_FILE);
+    Ok(files
+        .into_iter()
+        .filter(|f| named.contains(f) || *f == default)
+        .collect())
+}
+
+/// Takes ONE backup of all keyrings before changing `collections`, failing closed.
+///
+/// The files are chosen by [`backup_files`] with [`BackupScope::AllKeyrings`];
+/// an error is reported and stops the operation. A missing passphrase emits
+/// [`Event::PassphraseNeeded`] with the echo of `original` when one is given
+/// (Plan 1/2 commands); apply commands pass `None` and report
+/// [`BackupStep::AwaitingPassphrase`] themselves.
 pub(crate) fn backup_collections<N: Fn()>(
     out: &Emitter<N>,
     config: &WorkerConfig,
@@ -804,40 +875,32 @@ pub(crate) fn backup_collections<N: Fn()>(
     original: Option<&Command>,
     wording: &BackupWording,
 ) -> BackupStep {
-    let mut names: Vec<String> = Vec::new();
-    for collection in collections {
-        match keyring_name(collection, wording.refusal) {
-            Ok(Some(name)) if !names.contains(&name) => names.push(name),
-            Ok(_) => {}
-            Err(message) => {
-                out.error(message);
-                return BackupStep::Stop;
-            }
-        }
-    }
-    if names.is_empty() {
-        return BackupStep::Proceed(None);
-    }
-    let files = match keyring_backup_set(&config.keyrings_dir) {
+    let files = match backup_files(config, collections, BackupScope::AllKeyrings, wording) {
         Ok(files) => files,
-        Err(e) => {
-            out.error(format!("{}: {e}", wording.failed));
+        Err(message) => {
+            out.error(message);
             return BackupStep::Stop;
         }
     };
-    for name in &names {
-        let file = config.keyrings_dir.join(format!("{name}.keyring"));
-        if files.contains(&file) {
-            continue;
-        }
-        let dir = config.keyrings_dir.display();
-        out.error(format!(
-            "No keyring file found for '{name}' in {dir}: {}",
-            wording.refusal
-        ));
-        return BackupStep::Stop;
+    create_backup(out, config, &files, reason, passphrase, original, wording)
+}
+
+/// Backs up `files` (none: nothing to back up, proceed) and emits
+/// [`Event::BackupCreated`]. A missing passphrase emits
+/// [`Event::PassphraseNeeded`] with the echo of `original` when one is given.
+pub(crate) fn create_backup<N: Fn()>(
+    out: &Emitter<N>,
+    config: &WorkerConfig,
+    files: &[PathBuf],
+    reason: &str,
+    passphrase: Option<&SecretValue>,
+    original: Option<&Command>,
+    wording: &BackupWording,
+) -> BackupStep {
+    if files.is_empty() {
+        return BackupStep::Proceed(None);
     }
-    match config.backups.create(reason, &files, passphrase) {
+    match config.backups.create(reason, files, passphrase) {
         Ok(info) => {
             let dir = info.dir.clone();
             // A prune failure travels in `info.prune_warning` (a notice, not
@@ -856,6 +919,69 @@ pub(crate) fn backup_collections<N: Fn()>(
             BackupStep::Stop
         }
     }
+}
+
+/// Emits [`Event::BackupSkipped`] with `reason` (no secrets).
+pub(crate) fn skip_backup<N: Fn()>(out: &Emitter<N>, reason: &str) {
+    out.emit(Event::BackupSkipped {
+        reason: reason.to_string(),
+    });
+}
+
+/// Returns the label of `c`, or its object path when the label is blank.
+fn shown_label(c: &CollectionInfo) -> &str {
+    if c.label.trim().is_empty() {
+        return &c.id.0;
+    }
+    &c.label
+}
+
+/// Deletes `collection` and returns the Done message, or `None` when the
+/// backup step answered instead (passphrase requested or backup failed:
+/// nothing was deleted).
+///
+/// Emptiness is decided on a fresh listing, never on what the UI saw: an
+/// empty collection (locked or not, gnome-keyring reports the item count
+/// of locked collections) holds no secrets and is deleted without a backup
+/// after [`Event::BackupSkipped`]; any other one after a backup of all
+/// keyrings ([`backup_before`]).
+async fn delete_collection<S, N>(
+    out: &Emitter<N>,
+    store: &S,
+    config: &WorkerConfig,
+    collection: &CollectionId,
+    passphrase: Option<&SecretValue>,
+    cmd: &Command,
+) -> kring_core::Result<Option<String>>
+where
+    S: SecretStore,
+    N: Fn(),
+{
+    let fresh = store.list_collections().await?;
+    let empty = fresh
+        .iter()
+        .find(|c| &c.id == collection && c.item_count == 0);
+    if let Some(empty) = empty {
+        // TOCTOU: an item could be added between this listing and the
+        // delete; the Secret Service has no conditional delete.
+        skip_backup(out, BACKUP_SKIPPED_EMPTY);
+        store.delete_collection(collection).await?;
+        let label = shown_label(empty);
+        return Ok(Some(format!("{label} deleted (empty, no backup needed)")));
+    }
+    let step = backup_before(
+        out,
+        config,
+        collection,
+        "delete-collection",
+        passphrase,
+        cmd,
+    );
+    let BackupStep::Proceed(backup) = step else {
+        return Ok(None);
+    };
+    store.delete_collection(collection).await?;
+    Ok(Some(deleted_message("Collection", backup.as_ref())))
 }
 
 /// Builds the success message of a delete, naming the backup when one was made.
@@ -1069,13 +1195,11 @@ where
             backup_passphrase,
         } => {
             let pass = backup_passphrase.as_ref();
-            let BackupStep::Proceed(backup) =
-                backup_before(out, config, collection, "delete-collection", pass, cmd)
-            else {
+            let deleted = delete_collection(out, store, config, collection, pass, cmd).await?;
+            let Some(done) = deleted else {
                 return Ok(());
             };
-            store.delete_collection(collection).await?;
-            deleted_message("Collection", backup.as_ref())
+            done
         }
         Command::ScanFiles
         | Command::OpenFile { .. }

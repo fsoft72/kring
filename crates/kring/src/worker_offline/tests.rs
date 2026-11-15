@@ -22,6 +22,8 @@ const FIXTURES: &str = concat!(
 );
 /// Textual fixture with two items.
 const TEXTUAL: &str = "textual_two_items";
+/// Textual fixture without items.
+const EMPTY_TEXTUAL: &str = "empty_textual";
 /// Binary fixture with two items.
 const BINARY: &str = "binary_two_items";
 /// Password of the binary fixture.
@@ -204,6 +206,32 @@ impl Env {
         self.keyrings.join(format!("{name}.keyring"))
     }
 
+    /// Creates one item in `collection`, consuming the resulting events.
+    fn add_item(&self, collection: &CollectionId) {
+        self.send(Command::CreateItem {
+            collection: collection.clone(),
+            item: NewItem {
+                label: "site".into(),
+                attributes: Default::default(),
+                secret: SecretValue::from_text("s3cret"),
+                replace: false,
+            },
+        });
+        assert!(matches!(self.next(), Event::Collections(_)));
+        assert!(matches!(self.next(), Event::Items(_, _)));
+        assert!(matches!(self.next(), Event::Done(_)));
+    }
+
+    /// Asserts the next event is [`Event::BackupSkipped`] for an empty keyring.
+    fn expect_backup_skipped(&self) {
+        match self.next() {
+            Event::BackupSkipped { reason } => {
+                assert_eq!(reason, crate::worker::BACKUP_SKIPPED_EMPTY)
+            }
+            other => panic!("expected BackupSkipped, got {other:?}"),
+        }
+    }
+
     /// Imports the textual fixture into `Main`, consuming the events.
     fn import_textual(&self) {
         self.send(Command::ImportFile {
@@ -324,13 +352,15 @@ fn import_file_reports_counts() {
     }
 }
 
-/// Retiring the file of a live collection deletes the collection after a backup.
+/// Retiring the file of a live collection holding items deletes the
+/// collection after a backup.
 #[test]
 fn retire_live_file_uses_delete_collection_with_backup() {
     let e = env(gnome(), &[(TEXTUAL, MAIN)]);
+    e.add_item(&e.main);
     e.send(Command::RetireFile {
         name: MAIN.into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     });
     let info = match e.next() {
         Event::BackupCreated(info) => info,
@@ -350,13 +380,79 @@ fn retire_live_file_uses_delete_collection_with_backup() {
     assert!(e.keyring(MAIN).exists());
 }
 
+/// Retiring the file of an empty live collection deletes it without a
+/// backup, and needs no passphrase.
+#[test]
+fn retire_empty_live_file_skips_backup() {
+    let e = env(gnome(), &[(TEXTUAL, MAIN)]);
+    e.send(Command::RetireFile {
+        name: MAIN.into(),
+        backup_passphrase: None,
+    });
+    e.expect_backup_skipped();
+    assert!(matches!(e.next(), Event::Collections(_)));
+    match e.next() {
+        Event::Done(m) => assert_eq!(m, "Main deleted (empty, no backup needed)"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(matches!(e.next(), Event::Files(_)));
+    assert!(!e.backups.exists());
+}
+
+/// An empty plaintext file is retired without a backup or passphrase.
+#[test]
+fn retire_empty_textual_file_skips_backup() {
+    let e = env(gnome(), &[(EMPTY_TEXTUAL, "loose")]);
+    e.send(Command::RetireFile {
+        name: "loose".into(),
+        backup_passphrase: None,
+    });
+    e.expect_backup_skipped();
+    match e.next() {
+        Event::Done(m) => assert_eq!(m, "Plaintext file retired (empty, no backup needed)"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    match e.next() {
+        Event::Files(files) => assert!(files.is_empty()),
+        other => panic!("expected Files, got {other:?}"),
+    }
+    assert!(!e.keyring("loose").exists());
+    assert!(!e.backups.exists());
+}
+
+/// A plaintext file holding items without a passphrase asks for one (the
+/// echo carries none) and is kept.
+#[test]
+fn retire_textual_with_items_asks_passphrase() {
+    let e = env(gnome(), &[(TEXTUAL, TEXTUAL)]);
+    e.send(Command::RetireFile {
+        name: TEXTUAL.into(),
+        backup_passphrase: None,
+    });
+    match e.next() {
+        Event::PassphraseNeeded(resend) => match *resend {
+            Command::RetireFile {
+                name,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, TEXTUAL);
+                assert!(backup_passphrase.is_none());
+            }
+            other => panic!("expected RetireFile, got {other:?}"),
+        },
+        other => panic!("expected PassphraseNeeded, got {other:?}"),
+    }
+    assert!(e.keyring(TEXTUAL).exists());
+    assert!(!e.backups.exists());
+}
+
 /// A live collection on a provider without writes is refused and the file kept.
 #[test]
 fn retire_live_file_refused_without_writes() {
     let e = env(provider(ProviderKind::KWallet), &[(TEXTUAL, MAIN)]);
     e.send(Command::RetireFile {
         name: MAIN.into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     });
     assert_eq!(e.expect_error(), "Not supported on this provider");
     assert!(e.keyring(MAIN).exists());
@@ -369,7 +465,7 @@ fn retire_live_binary_file_refused() {
     let e = env(gnome(), &[(BINARY, MAIN)]);
     e.send(Command::RetireFile {
         name: MAIN.into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     });
     assert!(
         e.expect_error()
@@ -390,7 +486,7 @@ fn retire_plaintext_file_backs_up_then_removes() {
     let e = env(gnome(), &[(TEXTUAL, TEXTUAL)]);
     e.send(Command::RetireFile {
         name: TEXTUAL.into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     });
     match e.next() {
         Event::BackupCreated(info) => {
@@ -420,7 +516,7 @@ fn retire_without_provider_removes_file() {
     }
     h.tx.send(Command::RetireFile {
         name: MAIN.into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     })
     .unwrap();
     assert!(matches!(recv(&h), Event::BackupCreated(_)));
@@ -446,7 +542,7 @@ fn retire_refuses_when_list_collections_fails() {
     store.fail.store(true, Ordering::SeqCst);
     h.tx.send(Command::RetireFile {
         name: MAIN.into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     })
     .unwrap();
     match recv(&h) {
@@ -648,7 +744,7 @@ fn rejects_path_traversal_names() {
     }
     e.send(Command::RetireFile {
         name: "../textual_two_items".into(),
-        backup_passphrase: SecretValue::from_text(PASSPHRASE),
+        backup_passphrase: Some(SecretValue::from_text(PASSPHRASE)),
     });
     assert!(e.expect_error().ends_with("Invalid keyring file name"));
     assert!(e.keyring(TEXTUAL).exists());

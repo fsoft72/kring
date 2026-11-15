@@ -395,6 +395,8 @@ impl AppState {
                     self.notices.push(format!("{MSG_PRUNE_FAILED}: {w}"));
                 }
             }
+            // Shown by the progress modal; the Done that follows sets the status.
+            Event::BackupSkipped { .. } => {}
             Event::PassphraseNeeded(cmd) => {
                 if matches!(
                     *cmd,

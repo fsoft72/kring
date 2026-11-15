@@ -118,8 +118,9 @@ pub struct ConsolidationSummary {
     pub conflict_count: usize,
     /// Names of the empty plaintext orphan files to retire (when requested).
     pub orphan_files: Vec<String>,
-    /// True when the keyring backup set holds a plaintext keyring at plan
-    /// time, so the pre-apply backup will need a passphrase.
+    /// True when the pre-apply backup (the keyring files of the target and
+    /// the move sources, none without any move) holds a plaintext keyring at
+    /// plan time, so it will need a passphrase.
     pub backup_needs_passphrase: bool,
 }
 

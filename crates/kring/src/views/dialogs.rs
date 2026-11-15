@@ -1066,7 +1066,7 @@ mod tests {
                 backup_passphrase,
             } => {
                 assert_eq!(name, "t");
-                assert_eq!(backup_passphrase.as_text(), Some("pp"));
+                assert_eq!(backup_passphrase.unwrap().as_text(), Some("pp"));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1219,7 +1219,7 @@ mod tests {
         else {
             panic!("expected a retire");
         };
-        assert_eq!(backup_passphrase.as_text(), Some("kept"));
+        assert_eq!(backup_passphrase.as_ref().unwrap().as_text(), Some("kept"));
         assert!(d.to_remember(&cmd).is_none());
         d.remember = true;
         assert_eq!(d.to_remember(&cmd).unwrap().as_text(), Some("kept"));

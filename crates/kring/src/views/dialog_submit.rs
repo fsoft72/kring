@@ -361,7 +361,7 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             ..
         } => Command::RetireFile {
             name: name.clone(),
-            backup_passphrase: _new_password(passphrase, confirm)?,
+            backup_passphrase: Some(_new_password(passphrase, confirm)?),
         },
         DialogKind::DeleteFile {
             name,

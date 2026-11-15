@@ -197,10 +197,7 @@ pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
         Command::OpenFile { password, .. } | Command::ImportFile { password, .. } => {
             password.as_ref()
         }
-        Command::RetireFile {
-            backup_passphrase, ..
-        }
-        | Command::ExportCollection {
+        Command::ExportCollection {
             passphrase: backup_passphrase,
             ..
         }
@@ -215,6 +212,9 @@ pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
             backup_passphrase, ..
         }
         | Command::DeleteFile {
+            backup_passphrase, ..
+        }
+        | Command::RetireFile {
             backup_passphrase, ..
         }
         | Command::ApplyTransfer {
@@ -416,7 +416,7 @@ mod tests {
         else {
             panic!("expected a retire");
         };
-        assert_eq!(backup_passphrase.as_text(), Some(PASS));
+        assert_eq!(backup_passphrase.unwrap().as_text(), Some(PASS));
     }
 
     /// Both consolidation passphrases are filled.
