@@ -122,6 +122,37 @@ fn delete_empty_live_without_backup() {
     assert!(!e.backups.exists());
 }
 
+/// A locked live keyring never counts as empty: no backup is refused, nothing deleted.
+#[test]
+fn delete_locked_empty_live_without_backup_refused() {
+    let (_dir, keyrings, config) = dirs(&[(BINARY, MAIN)]);
+    let store = FakeStore::new();
+    let main = store.add_collection(MAIN, "pw", true);
+    let backups = config.backups.root.clone();
+    let h = spawn(Some(Arc::new(store)), gnome(), config, || {});
+    for _ in 0..3 {
+        recv(&h);
+    }
+    h.tx.send(delete(MAIN, false, None)).unwrap();
+    match recv(&h) {
+        Event::Error(m) => assert!(
+            m.ends_with("Loaded keyrings are always backed up before deletion"),
+            "{m}"
+        ),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    h.tx.send(Command::Refresh).unwrap();
+    match recv(&h) {
+        Event::Collections(list) => {
+            let c = list.iter().find(|c| c.id == main).expect("keyring kept");
+            assert!(c.locked && c.item_count == 0);
+        }
+        other => panic!("expected Collections, got {other:?}"),
+    }
+    assert!(keyrings.join("Main.keyring").exists());
+    assert!(!backups.exists());
+}
+
 /// A live keyring is deleted through the daemon after a backup of all keyrings.
 #[test]
 fn delete_live_with_backup_uses_delete_collection() {

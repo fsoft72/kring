@@ -361,7 +361,8 @@ where
     let collection = request.collection.id.clone();
     let passphrase = match request.backup {
         DeleteBackup::With(passphrase) => passphrase,
-        DeleteBackup::Without if request.collection.item_count > 0 => {
+        // Fail closed: a locked keyring never counts as empty.
+        DeleteBackup::Without if !is_empty_unlocked(request.collection) => {
             return Err(invalid(MSG_LIVE_NEEDS_BACKUP));
         }
         DeleteBackup::Without => {
@@ -373,9 +374,22 @@ where
             if !gate(out, provider, &gated) {
                 return Ok(());
             }
-            store.delete_collection(&collection).await?;
-            refresh(out, store).await;
-            out.emit(Event::Done(MSG_EMPTY_KEYRING_DELETED.into()));
+            // TOCTOU: an item could be added between the fresh listing above
+            // and this call; the Secret Service has no conditional delete, so
+            // the window is kept as small as possible but cannot be closed.
+            match store.delete_collection(&collection).await {
+                Ok(()) => {
+                    refresh(out, store).await;
+                    out.emit(Event::Done(MSG_EMPTY_KEYRING_DELETED.into()));
+                }
+                // Reported like `run_store_command`: NotFound re-lists the collections.
+                Err(e) => {
+                    out.error(e.to_string());
+                    if matches!(e, KringError::NotFound(_)) {
+                        refresh(out, store).await;
+                    }
+                }
+            }
             return emit_files(out, config);
         }
     };
@@ -389,6 +403,12 @@ where
     };
     run_store_command(out, store, provider, config, delete).await;
     emit_files(out, config)
+}
+
+/// Returns true for a live keyring that may be deleted without a backup:
+/// unlocked and without items (a locked keyring may hide its items).
+fn is_empty_unlocked(c: &CollectionInfo) -> bool {
+    !c.locked && c.item_count == 0
 }
 
 /// Returns true when the backup of all keyrings holds a plaintext keyring

@@ -422,7 +422,8 @@ impl DialogKind {
 }
 
 /// Returns the suggested archive path `<home>/kring-<name>-<date>.kring.age`;
-/// characters of `name` other than ASCII letters, digits, `-` and `_` become `_`.
+/// characters of `name` other than ASCII letters, digits, `-` and `_` become `_`,
+/// and runs of `_` collapse into one.
 pub fn default_export_path(home: &Path, name: &str, date: &str) -> String {
     let safe: String = name
         .chars()
@@ -434,7 +435,14 @@ pub fn default_export_path(home: &Path, name: &str, date: &str) -> String {
             }
         })
         .collect();
-    home.join(format!("kring-{safe}-{date}.kring.age"))
+    let mut collapsed = String::with_capacity(safe.len());
+    for c in safe.chars() {
+        if c == '_' && collapsed.ends_with('_') {
+            continue;
+        }
+        collapsed.push(c);
+    }
+    home.join(format!("kring-{collapsed}-{date}.kring.age"))
         .display()
         .to_string()
 }

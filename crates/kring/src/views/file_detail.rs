@@ -205,7 +205,8 @@ pub fn delete_spec(state: &AppState, info: &KeyringFileInfo) -> DeleteSpec {
     };
     let key = collection_key(&c.id);
     let label = _label_part(c);
-    let empty = c.item_count == 0;
+    // Fail closed: a locked keyring never counts as empty.
+    let empty = !c.locked && c.item_count == 0;
     let line = if empty {
         format!(
             "\"{key}\" is loaded by gnome-keyring{label} and holds no items: it will be \
@@ -674,13 +675,22 @@ mod tests {
         assert_eq!(spec.passphrase_note, MSG_DELETE_LIVE_PLAINTEXT);
 
         live.item_count = 0;
-        s.apply(Event::Collections(vec![live]));
+        s.apply(Event::Collections(vec![live.clone()]));
         let spec = delete_spec(&s, &b);
         assert!(
             spec.backup_optional,
             "an empty loaded keyring may skip the backup"
         );
         assert!(spec.lines[0].contains("holds no items"));
+
+        live.locked = true;
+        s.apply(Event::Collections(vec![live]));
+        let spec = delete_spec(&s, &b);
+        assert!(
+            !spec.backup_optional,
+            "a locked keyring never counts as empty"
+        );
+        assert!(spec.lines[0].ends_with("after a backup."));
     }
 
     /// The live note names the keyring id and its label.

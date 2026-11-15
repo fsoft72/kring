@@ -520,6 +520,12 @@ mod tests {
             panic!("expected ExportCollection");
         };
         assert_eq!(path, "/h/kring-My_keys-20261115.kring.age");
+        let shared = crate::views::dialogs::default_export_path(
+            Path::new("/h"),
+            "Default · Default_10",
+            "20261115",
+        );
+        assert_eq!(shared, "/h/kring-Default_Default_10-20261115.kring.age");
         assert!(command_for(&kind).is_err(), "empty passphrase rejected");
         if let DialogKind::ExportCollection {
             passphrase,
