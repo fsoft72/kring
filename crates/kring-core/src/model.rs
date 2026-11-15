@@ -7,6 +7,12 @@ use zeroize::Zeroizing;
 /// Object path of the login collection.
 pub const LOGIN_COLLECTION_PATH: &str = "/org/freedesktop/secrets/collection/login";
 
+/// Attribute holding an item's schema name.
+pub const SCHEMA_ATTRIBUTE: &str = "xdg:schema";
+
+/// Schema gnome-keyring assumes (and writes) for items without one.
+pub const GENERIC_SCHEMA: &str = "org.freedesktop.Secret.Generic";
+
 /// Content type used for text secrets.
 const TEXT_CONTENT_TYPE: &str = "text/plain";
 

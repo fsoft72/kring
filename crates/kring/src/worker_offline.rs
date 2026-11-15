@@ -249,15 +249,10 @@ where
     emit_files(out, config)
 }
 
-/// Emits [`Event::BackupCreated`] and, if pruning failed, a warning.
+/// Emits [`Event::BackupCreated`]; a prune failure travels in
+/// `prune_warning` and is shown as a notice, never as an error.
 pub(crate) fn emit_backup<N: Fn()>(out: &Emitter<N>, backup: BackupInfo) {
-    let warning = backup.prune_warning.clone();
     out.emit(Event::BackupCreated(backup));
-    if let Some(w) = warning {
-        out.error(format!(
-            "Backup created but old backups could not be pruned: {w}"
-        ));
-    }
 }
 
 /// Restores `files` (original paths) of the listed backup `dir`.

@@ -580,13 +580,9 @@ pub(crate) fn backup_collections<N: Fn()>(
     match config.backups.create(reason, &files, passphrase) {
         Ok(info) => {
             let dir = info.dir.clone();
-            let warning = info.prune_warning.clone();
+            // A prune failure travels in `info.prune_warning` (a notice, not
+            // an error: the operation goes on).
             out.emit(Event::BackupCreated(info));
-            if let Some(w) = warning {
-                out.error(format!(
-                    "Backup created but old backups could not be pruned: {w}"
-                ));
-            }
             BackupStep::Proceed(Some(dir))
         }
         Err(KringError::PassphraseRequired) => {

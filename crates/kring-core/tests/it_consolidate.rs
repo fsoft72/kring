@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use common::within;
 use kring_core::model::{
-    Attributes, CollectionId, CollectionInfo, ItemInfo, LOGIN_COLLECTION_PATH, NewItem, SecretValue,
+    Attributes, CollectionId, CollectionInfo, GENERIC_SCHEMA, ItemInfo, LOGIN_COLLECTION_PATH,
+    NewItem, SCHEMA_ATTRIBUTE, SecretValue,
 };
 use kring_core::paths::keyrings_dir;
 use kring_core::secret_service::SecretServiceBackend;
@@ -23,9 +24,11 @@ use kring_core::{MasterPasswordStore, SecretStore};
 const ORPHAN_PASSWORD: &str = "orphan-pw";
 /// Alias that consolidation points at the target.
 const DEFAULT_ALIAS: &str = "default";
-/// Schema attribute set explicitly on every test item: gnome-keyring adds it by
-/// itself to items created in `login` only, which would make identical items differ.
-const SCHEMA: (&str, &str) = ("xdg:schema", "org.freedesktop.Secret.Generic");
+/// Schema attribute set on the login items only: gnome-keyring adds it by
+/// itself (asynchronously, on reload), and the orphan items are created
+/// without it on purpose, so the planner must treat a missing schema as the
+/// generic one.
+const SCHEMA: (&str, &str) = (SCHEMA_ATTRIBUTE, GENERIC_SCHEMA);
 
 /// Builds an attribute map from pairs.
 fn attrs(pairs: &[(&str, &str)]) -> Attributes {
@@ -102,13 +105,16 @@ async fn consolidate_orphans_into_login() {
     let login = CollectionId(LOGIN_COLLECTION_PATH.to_string());
     let password = SecretValue::from_text(ORPHAN_PASSWORD);
 
-    // Login holds the identities the orphans will clash with.
-    let alice = [SCHEMA, ("app", "kring-it"), ("user", "alice")];
-    let bob = [SCHEMA, ("app", "kring-it"), ("user", "bob")];
-    within(backend.create_item(&login, new_item("alice", &alice, "alice-secret")))
+    // Login holds the identities the orphans will clash with; only the
+    // login items carry the schema.
+    let alice = [("app", "kring-it"), ("user", "alice")];
+    let bob = [("app", "kring-it"), ("user", "bob")];
+    let login_alice = [SCHEMA, alice[0], alice[1]];
+    let login_bob = [SCHEMA, bob[0], bob[1]];
+    within(backend.create_item(&login, new_item("alice", &login_alice, "alice-secret")))
         .await
         .unwrap();
-    within(backend.create_item(&login, new_item("bob", &bob, "bob-old")))
+    within(backend.create_item(&login, new_item("bob", &login_bob, "bob-old")))
         .await
         .unwrap();
 
@@ -134,7 +140,7 @@ async fn consolidate_orphans_into_login() {
         &locked,
         new_item(
             "carol",
-            &[SCHEMA, ("app", "kring-it"), ("user", "carol")],
+            &[("app", "kring-it"), ("user", "carol")],
             "carol-secret",
         ),
     ))

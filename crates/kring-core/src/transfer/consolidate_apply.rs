@@ -1,10 +1,11 @@
 //! Executes a [`ConsolidationPlan`] step by step, stopping on the first error.
 //!
-//! Order: every move step, then for each move source the deletion of the
-//! source collection (only when it is empty now), then the `delete_empty`
-//! collections (re-checked empty; a non-empty one fails the run), then the
-//! `default` alias. Backups are the caller's job (the worker takes one of the
-//! whole keyring set before calling this).
+//! Order: every move step, then the `default` alias (so a failure in a later
+//! deletion never leaves `default` on a collection about to go), then for each
+//! move source the deletion of the source collection (only when it is empty
+//! now), then the `delete_empty` collections (re-checked empty; a non-empty
+//! one fails the run). Backups are the caller's job (the worker takes one of
+//! the whole keyring set before calling this).
 //!
 //! Every move step is re-planned against the live target and the live source
 //! right before it runs, so the preview's placeholder ids never reach the
@@ -24,7 +25,7 @@ use crate::transfer::plan::{
     Action, Choice, Existing, Incoming, TransferSource, identity, plan_transfer,
 };
 
-/// Alias pointed at the target at the end.
+/// Alias pointed at the target right after the moves.
 const DEFAULT_ALIAS: &str = "default";
 
 /// Result of one consolidation step (labels only, never secrets).
@@ -117,7 +118,7 @@ impl Runner<'_> {
 /// return `Err`: they end the run with [`StepOutcome::Failed`] and
 /// `completed == false`. A move with any failed item counts as failed.
 /// `progress` is called with `(0, total)` first and after every step, where
-/// `total` = moves + source deletions considered + `delete_empty` + default.
+/// `total` = moves + default + source deletions considered + `delete_empty`.
 pub async fn apply_consolidation<S: SecretStore + ?Sized>(
     store: &S,
     plan: &ConsolidationPlan,
@@ -241,6 +242,13 @@ async fn run<S: SecretStore + ?Sized>(
             report,
         });
     }
+    if plan.set_default {
+        store
+            .set_alias(DEFAULT_ALIAS, &plan.target)
+            .await
+            .map_err(|e| ("Set default".to_string(), e.to_string()))?;
+        runner.step(StepOutcome::DefaultSet);
+    }
     for step in &plan.moves {
         let outcome = delete_if_empty(store, &step.source, &step.label, false).await?;
         runner.step(outcome);
@@ -248,13 +256,6 @@ async fn run<S: SecretStore + ?Sized>(
     for (id, label) in &plan.delete_empty {
         let outcome = delete_if_empty(store, id, label, true).await?;
         runner.step(outcome);
-    }
-    if plan.set_default {
-        store
-            .set_alias(DEFAULT_ALIAS, &plan.target)
-            .await
-            .map_err(|e| ("Set default".to_string(), e.to_string()))?;
-        runner.step(StepOutcome::DefaultSet);
     }
     Ok(())
 }
@@ -373,8 +374,8 @@ fn pick(picks: &[Pick], index: usize) -> Option<Pick> {
 }
 
 /// Re-reads the step's live sources: returns the unchanged items with their
-/// preview index, and the labels of items whose attributes or secret changed.
-/// Items no longer in the source are dropped.
+/// preview index, and the labels of items whose identity (see [`identity`])
+/// or secret changed. Items no longer in the source are dropped.
 async fn fresh_incoming<S: SecretStore + ?Sized>(
     store: &S,
     step: &MoveStep,
@@ -390,7 +391,8 @@ async fn fresh_incoming<S: SecretStore + ?Sized>(
             continue;
         };
         let secret: SecretValue = store.read_secret(id).await?;
-        if info.attributes != item.attributes || secret.as_bytes() != item.secret.as_bytes() {
+        let same_identity = identity(&info.attributes) == identity(&item.attributes);
+        if !same_identity || secret.as_bytes() != item.secret.as_bytes() {
             changed.push(item.label.clone());
             continue;
         }
@@ -431,12 +433,34 @@ mod tests {
     use super::*;
     use crate::fake_store::FakeStore;
     use crate::model::{
-        CollectionInfo, ItemId, ItemInfo, ItemUpdate, LOGIN_COLLECTION_PATH, NewItem,
+        CollectionInfo, GENERIC_SCHEMA, ItemId, ItemInfo, ItemUpdate, LOGIN_COLLECTION_PATH,
+        NewItem, SCHEMA_ATTRIBUTE,
     };
-    use crate::transfer::consolidate::{CollectionSnapshot, PLANNED_ID_PREFIX, plan_consolidation};
+    use crate::transfer::consolidate::{
+        CollectionSnapshot, PLANNED_ID_PREFIX, SkipReason, plan_consolidation, snapshot_collections,
+    };
 
-    /// Store wrapper whose `create_item` fails for one label.
-    struct FailingStore(FakeStore, &'static str);
+    /// Store wrapper injecting failures into a [`FakeStore`] (field 0).
+    struct FailingStore(FakeStore, Faults);
+
+    /// Failures injected by [`FailingStore`].
+    #[derive(Default)]
+    struct Faults {
+        /// `create_item` fails for this label.
+        create_label: Option<&'static str>,
+        /// `list_items` fails with a D-Bus error for this collection.
+        list: Option<CollectionId>,
+        /// `delete_collection` fails for this collection.
+        delete: Option<CollectionId>,
+    }
+
+    /// Builds the D-Bus error injected by [`FailingStore`].
+    fn injected() -> KringError {
+        KringError::Dbus {
+            context: "injected".into(),
+            message: "injected failure".into(),
+        }
+    }
 
     #[async_trait::async_trait]
     impl SecretStore for FailingStore {
@@ -444,13 +468,16 @@ mod tests {
             self.0.list_collections().await
         }
         async fn list_items(&self, c: &CollectionId) -> Result<Vec<ItemInfo>> {
+            if self.1.list.as_ref() == Some(c) {
+                return Err(injected());
+            }
             self.0.list_items(c).await
         }
         async fn read_secret(&self, i: &ItemId) -> Result<SecretValue> {
             self.0.read_secret(i).await
         }
         async fn create_item(&self, c: &CollectionId, item: NewItem) -> Result<ItemId> {
-            if item.label == self.1 {
+            if self.1.create_label == Some(item.label.as_str()) {
                 return Err(KringError::NotFound("injected failure".into()));
             }
             self.0.create_item(c, item).await
@@ -474,6 +501,9 @@ mod tests {
             self.0.rename_collection(c, l).await
         }
         async fn delete_collection(&self, c: &CollectionId) -> Result<()> {
+            if self.1.delete.as_ref() == Some(c) {
+                return Err(injected());
+            }
             self.0.delete_collection(c).await
         }
     }
@@ -516,7 +546,11 @@ mod tests {
                 }
                 Some(items)
             };
-            out.push(CollectionSnapshot { info, items });
+            out.push(CollectionSnapshot {
+                info,
+                items,
+                unreadable: None,
+            });
         }
         out
     }
@@ -581,7 +615,7 @@ mod tests {
         login
     }
 
-    /// Moves, deletes the emptied source and empty orphans, then sets default.
+    /// Moves, sets default, then deletes the emptied source and empty orphans.
     #[tokio::test]
     async fn applies_in_order_and_sets_default() {
         let store = FakeStore::new();
@@ -612,9 +646,9 @@ mod tests {
         assert_eq!(
             report.outcomes[1..],
             [
+                StepOutcome::DefaultSet,
                 StepOutcome::Deleted("A".into()),
                 StepOutcome::Deleted("B".into()),
-                StepOutcome::DefaultSet
             ]
         );
         assert_eq!(labels(&store, &login).await, ["fresh", "shared"]);
@@ -625,7 +659,11 @@ mod tests {
     /// A failed item stops the run: nothing after it happens.
     #[tokio::test]
     async fn stops_on_first_failure() {
-        let store = FailingStore(FakeStore::new(), "bad");
+        let faults = Faults {
+            create_label: Some("bad"),
+            ..Faults::default()
+        };
+        let store = FailingStore(FakeStore::new(), faults);
         let login = add_login(&store.0);
         let a = store.0.add_collection("A", "p", false);
         let b = store.0.add_collection("B", "p", false);
@@ -662,7 +700,8 @@ mod tests {
         assert_eq!(store.0.read_alias("default").await.unwrap(), None);
     }
 
-    /// An "empty" collection that gained an item is not deleted and stops the run.
+    /// An "empty" collection that gained an item is not deleted and stops the
+    /// run; the default alias set before it stays on the target.
     #[tokio::test]
     async fn non_empty_at_apply_time_not_deleted() {
         let store = FakeStore::new();
@@ -677,10 +716,71 @@ mod tests {
         assert!(!report.completed);
         assert!(matches!(
             &report.outcomes[..],
-            [StepOutcome::Failed { step, .. }] if step == "Delete B"
+            [StepOutcome::DefaultSet, StepOutcome::Failed { step, .. }] if step == "Delete B"
         ));
         assert_eq!(labels(&store, &b).await, ["late"]);
-        assert_eq!(store.read_alias("default").await.unwrap(), None);
+        assert_eq!(store.read_alias("default").await.unwrap(), Some(login));
+    }
+
+    /// The default alias is set right after the moves, before any deletion:
+    /// a failing source deletion leaves it on the target.
+    #[tokio::test]
+    async fn default_set_before_deletions() {
+        let store = FakeStore::new();
+        let login = add_login(&store);
+        let a = store.add_collection("A", "p", false);
+        let b = store.add_collection("B", "p", false);
+        put(&store, &a, "x", "x", "1").await;
+        store.set_alias("default", &a).await.unwrap();
+        let plan = plan_for(&store, &login).await;
+        let faults = Faults {
+            delete: Some(a.clone()),
+            ..Faults::default()
+        };
+        let store = FailingStore(store, faults);
+        let report = apply_consolidation(&store, &plan, &defaults(&plan), &mut |_, _| {})
+            .await
+            .unwrap();
+        assert!(!report.completed);
+        assert_eq!(report.outcomes[1], StepOutcome::DefaultSet);
+        assert!(matches!(
+            &report.outcomes[2..],
+            [StepOutcome::Failed { step, .. }] if step == "Delete A"
+        ));
+        assert_eq!(store.0.read_alias("default").await.unwrap(), Some(login));
+        assert!(exists(&store.0, &a).await && exists(&store.0, &b).await);
+    }
+
+    /// A collection failing to read with an error other than `Locked` is
+    /// recorded as unreadable; the others are still read.
+    #[tokio::test]
+    async fn snapshot_keeps_going_past_unreadable() {
+        let store = FakeStore::new();
+        let login = add_login(&store);
+        let a = store.add_collection("A", "p", false);
+        let b = store.add_collection("B", "p", false);
+        put(&store, &b, "y", "y", "2").await;
+        let faults = Faults {
+            list: Some(a.clone()),
+            ..Faults::default()
+        };
+        let store = FailingStore(store, faults);
+        let collections = store.list_collections().await.unwrap();
+        let snaps = snapshot_collections(&store, &collections, &login)
+            .await
+            .unwrap();
+        let of = |id: &CollectionId| snaps.iter().find(|s| &s.info.id == id).unwrap();
+        assert!(of(&a).items.is_none());
+        let why = of(&a).unreadable.clone().unwrap();
+        assert!(why.contains("injected failure"), "{why}");
+        assert_eq!(of(&b).items.as_ref().map(Vec::len), Some(1));
+        assert!(of(&b).unreadable.is_none() && of(&login).unreadable.is_none());
+        let plan = plan_consolidation(&snaps, &login, None).unwrap();
+        assert!(
+            plan.skipped
+                .contains(&(a, "A".into(), SkipReason::Unreadable(why)))
+        );
+        assert_eq!(plan.moves.len(), 1);
     }
 
     /// Protected collections or the target smuggled into a plan are refused.
@@ -731,12 +831,12 @@ mod tests {
         assert_eq!(
             report.outcomes[2..],
             [
+                StepOutcome::DefaultSet,
                 StepOutcome::Kept {
                     source: "A".into(),
                     remaining: 1
                 },
                 StepOutcome::Deleted("C".into()),
-                StepOutcome::DefaultSet
             ]
         );
         assert_eq!(labels(&store, &a).await, ["second"]);
@@ -776,6 +876,34 @@ mod tests {
             store.read_secret(&changed).await.unwrap().as_bytes(),
             b"newer"
         );
+    }
+
+    /// A source item that only gained the generic `xdg:schema` since the
+    /// preview (gnome-keyring adds it on reload) is still moved.
+    #[tokio::test]
+    async fn generic_schema_added_since_preview_still_moves() {
+        let store = FakeStore::new();
+        let login = add_login(&store);
+        let a = store.add_collection("A", "p", false);
+        let id = put(&store, &a, "x", "x", "1").await;
+        let plan = plan_for(&store, &login).await;
+        let mut attributes = store.list_items(&a).await.unwrap()[0].attributes.clone();
+        attributes.insert(SCHEMA_ATTRIBUTE.into(), GENERIC_SCHEMA.into());
+        let update = ItemUpdate {
+            attributes: Some(attributes),
+            ..ItemUpdate::default()
+        };
+        store.update_item(&id, update).await.unwrap();
+        let report = apply_consolidation(&store, &plan, &defaults(&plan), &mut |_, _| {})
+            .await
+            .unwrap();
+        assert!(report.completed, "{:?}", report.outcomes);
+        let StepOutcome::Moved { report: moved, .. } = &report.outcomes[0] else {
+            panic!("expected a move: {:?}", report.outcomes);
+        };
+        assert!(moved.source_kept.is_empty(), "{:?}", moved.source_kept);
+        assert_eq!(labels(&store, &login).await, ["x"]);
+        assert!(!exists(&store, &a).await);
     }
 
     /// Steps after the first see what it created: duplicates are dropped and
@@ -839,7 +967,7 @@ mod tests {
         };
         assert_eq!(moved.source_kept, ["from-b"]);
         assert_eq!(
-            report.outcomes[2..4],
+            report.outcomes[3..5],
             [
                 StepOutcome::Deleted("A".into()),
                 StepOutcome::Kept {

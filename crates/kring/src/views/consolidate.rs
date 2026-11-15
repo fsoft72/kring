@@ -41,6 +41,9 @@ use crate::worker::{Command, ConsolidationSummary};
 const MSG_EXPLAIN: &str = "Moves every item of the other readable keyrings into the target \
      and deletes the keyrings left empty. Locked, login and session keyrings are never \
      touched. One backup of all keyring files is taken before anything changes.";
+/// Hint of the start card: an unlock invalidates the pending plan.
+const MSG_UNLOCK_HINT: &str =
+    "Unlock the keyrings you want to include before previewing: unlocking discards the preview.";
 /// Tooltip of Preview without a target.
 const MSG_NO_TARGET: &str = "Choose a target keyring";
 /// Tooltip of Consolidate while the apply runs.
@@ -71,6 +74,8 @@ pub enum LineKind {
     Delete,
     /// Locked keyrings skipped (followed by Unlock shortcuts).
     Skipped,
+    /// Keyrings skipped because reading them failed (followed by the errors).
+    Unreadable,
     /// Protected keyrings never touched.
     NotTouched,
     /// The default alias moves to the target.
@@ -135,6 +140,8 @@ pub enum Role {
     Delete,
     /// Locked: skipped.
     Locked,
+    /// Reading it failed: skipped.
+    Unreadable,
     /// Never touched (login, session, alias).
     Protected,
 }
@@ -147,6 +154,7 @@ impl Role {
             Self::Move => ("move", theme::PRIMARY),
             Self::Delete => ("delete", theme::TERTIARY),
             Self::Locked => ("locked", theme::TERTIARY),
+            Self::Unreadable => ("unreadable", theme::ERROR),
             Self::Protected => ("protected", theme::LABEL),
         }
     }
@@ -169,8 +177,8 @@ fn _step_items(counts: &TransferCounts) -> usize {
 }
 
 /// Returns the summary cards of a preview into `target_label`, in order:
-/// move, delete, skipped (locked only), not touched (protected), default,
-/// retire. Lines with nothing to say are left out, except the move line.
+/// move, delete, skipped (locked), skipped (unreadable), not touched
+/// (protected), default, retire. Lines with nothing to say are left out, except the move line.
 pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<SummaryLine> {
     let line = |kind, text: String| SummaryLine { kind, text };
     let items: usize = summary.steps.iter().map(|s| _step_items(&s.counts)).sum();
@@ -207,6 +215,16 @@ pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<
             count_noun(locked, "locked keyring")
         );
         out.push(line(LineKind::Skipped, text));
+    }
+    let unreadable: Vec<String> = summary
+        .skipped
+        .iter()
+        .filter(|(_, _, r)| matches!(r, SkipReason::Unreadable(_)))
+        .map(|(id, label, _)| collection_name(id, label))
+        .collect();
+    if !unreadable.is_empty() {
+        let text = format!("Skipped: unreadable {}", unreadable.join(", "));
+        out.push(line(LineKind::Unreadable, text));
     }
     let protected: Vec<String> = summary
         .skipped
@@ -345,9 +363,10 @@ pub fn keyring_role(
     if summary.delete_empty.iter().any(|(id, _)| id == &c.id) {
         return Some(Role::Delete);
     }
-    let reason = summary.skipped.iter().find(|(id, _, _)| id == &c.id)?.2;
+    let reason = &summary.skipped.iter().find(|(id, _, _)| id == &c.id)?.2;
     match reason {
         SkipReason::Locked => Some(Role::Locked),
+        SkipReason::Unreadable(_) => Some(Role::Unreadable),
         SkipReason::Protected(_) => Some(Role::Protected),
         SkipReason::Target => Some(Role::Target),
     }
@@ -584,6 +603,7 @@ fn _start_card(
     card(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 6.0;
         ui.label(RichText::new(MSG_EXPLAIN).color(theme::TEXT).size(13.0));
+        ui.label(muted_text(MSG_UNLOCK_HINT));
         ui.add_space(6.0);
         field_label(ui, "Target keyring");
         _target_combo(ui, state, &mut view.target);
@@ -615,6 +635,7 @@ fn _line_color(kind: LineKind) -> Color32 {
     match kind {
         LineKind::Move => theme::PRIMARY,
         LineKind::Delete | LineKind::Retire | LineKind::Skipped => theme::TERTIARY,
+        LineKind::Unreadable => theme::ERROR,
         LineKind::NotTouched => theme::LABEL,
         LineKind::Default => theme::SECONDARY,
     }
@@ -700,6 +721,14 @@ fn _line_extra(
                 }
             });
             return action;
+        }
+        LineKind::Unreadable => {
+            for (id, label, reason) in &summary.skipped {
+                let SkipReason::Unreadable(why) = reason else {
+                    continue;
+                };
+                ui.label(muted_text(format!("{}: {why}", collection_name(id, label))));
+            }
         }
         LineKind::NotTouched | LineKind::Default => {}
     }
@@ -996,6 +1025,11 @@ mod tests {
                     String::new(),
                     SkipReason::Protected("session"),
                 ),
+                (
+                    CollectionId("/c/d4".into()),
+                    "Default_4".into(),
+                    SkipReason::Unreadable("D-Bus error".into()),
+                ),
             ],
             locked_count: 1,
             set_default: true,
@@ -1020,6 +1054,7 @@ mod tests {
                     LineKind::Skipped,
                     "Skipped: 1 locked keyring (unlock them first to include)"
                 ),
+                (LineKind::Unreadable, "Skipped: unreadable Default_4"),
                 (LineKind::NotTouched, "Not touched: session (protected)"),
                 (LineKind::Default, "Set Login as default"),
                 (LineKind::Retire, "Retire 1 empty plaintext file"),
@@ -1064,12 +1099,12 @@ mod tests {
                         ..TransferReport::default()
                     },
                 },
+                StepOutcome::DefaultSet,
                 StepOutcome::Kept {
                     source: "Work".into(),
                     remaining: 1,
                 },
                 StepOutcome::Deleted("Default_3".into()),
-                StepOutcome::DefaultSet,
                 StepOutcome::Failed {
                     step: "Delete Default_2".into(),
                     error: "boom".into(),
@@ -1091,9 +1126,9 @@ mod tests {
                     OutcomeTone::Ok,
                     "Moved Work: 2 new, 1 already there, 0 replaced, 0 kept"
                 ),
+                (OutcomeTone::Ok, "Default keyring set"),
                 (OutcomeTone::Kept, "Kept Work: 1 item remain"),
                 (OutcomeTone::Ok, "Deleted Default_3"),
-                (OutcomeTone::Ok, "Default keyring set"),
                 (OutcomeTone::Failed, "Delete Default_2 failed: boom"),
                 (OutcomeTone::Ok, "Retired 2 orphan files"),
                 (OutcomeTone::Kept, "Kept file c: not empty"),
@@ -1195,6 +1230,7 @@ mod tests {
         assert_eq!(role("/c/d3"), Some(Role::Delete));
         assert_eq!(role("/c/d1"), Some(Role::Locked));
         assert_eq!(role("/c/session"), Some(Role::Protected));
+        assert_eq!(role("/c/d4"), Some(Role::Unreadable));
         assert_eq!(role("/c/other"), None);
         let target = CollectionId("/c/a".into());
         assert_eq!(

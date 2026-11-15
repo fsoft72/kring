@@ -8,7 +8,10 @@
 //! - The target: skipped as [`SkipReason::Target`].
 //! - The login collection ([`LOGIN_COLLECTION_PATH`]) and any id ending in
 //!   `/collection/session`: skipped as [`SkipReason::Protected`].
-//! - Locked or unreadable (`items: None`, or `info.locked`): skipped as
+//! - Unreadable (reading its items failed with an error other than
+//!   `Locked`, see [`CollectionSnapshot::unreadable`]): skipped as
+//!   [`SkipReason::Unreadable`]; never touched.
+//! - Locked (`items: None`, or `info.locked`): skipped as
 //!   [`SkipReason::Locked`]; never touched.
 //! - Readable and empty: listed in [`ConsolidationPlan::delete_empty`].
 //! - Readable and non-empty: a [`MoveStep`] planned with [`plan_transfer`]
@@ -44,13 +47,18 @@ pub struct CollectionSnapshot {
     pub info: CollectionInfo,
     /// Items with secrets; `None` when locked or unreadable.
     pub items: Option<Vec<Existing>>,
+    /// Why reading the items failed (an error other than `Locked`, never
+    /// carrying secrets); `None` when read or not read at all.
+    pub unreadable: Option<String>,
 }
 
 /// Why a collection is left out of the consolidation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Locked or unreadable: unlock it first to include it.
+    /// Locked: unlock it first to include it.
     Locked,
+    /// Reading its items failed with this error (no secrets in it).
+    Unreadable(String),
     /// Never consolidated (`"login"`, `"session"` or `"alias"`).
     Protected(&'static str),
     /// The consolidation target itself.
@@ -112,6 +120,8 @@ pub fn protected_reason(id: &CollectionId) -> Option<&'static str> {
 /// Locked collections, and protected ones that are not the target (login,
 /// session, aliases: never consolidated), are not read and become
 /// `items: None`; a collection that reports `Locked` while read does too.
+/// Any other read error does not stop the snapshot: that collection gets
+/// `items: None` and the error message in `unreadable`.
 pub async fn snapshot_collections<S: SecretStore + ?Sized>(
     store: &S,
     collections: &[CollectionInfo],
@@ -120,18 +130,19 @@ pub async fn snapshot_collections<S: SecretStore + ?Sized>(
     let mut out = Vec::with_capacity(collections.len());
     for info in collections {
         let skip = info.locked || (&info.id != target && protected_reason(&info.id).is_some());
-        let items = if skip {
-            None
+        let (items, unreadable) = if skip {
+            (None, None)
         } else {
             match read_existing(store, &info.id).await {
-                Ok(items) => Some(items),
-                Err(KringError::Locked(_)) => None,
-                Err(e) => return Err(e),
+                Ok(items) => (Some(items), None),
+                Err(KringError::Locked(_)) => (None, None),
+                Err(e) => (None, Some(e.to_string())),
             }
         };
         out.push(CollectionSnapshot {
             info: info.clone(),
             items,
+            unreadable,
         });
     }
     Ok(out)
@@ -158,8 +169,8 @@ async fn read_existing<S: SecretStore + ?Sized>(
 
 /// Plans the consolidation of `snapshots` into `target` (pure).
 ///
-/// Fails with `InvalidInput` when the target is missing from the snapshots
-/// or is not readable. See the module docs for the rules.
+/// Fails with `InvalidInput` when the target is missing from the snapshots,
+/// is locked or is unreadable. See the module docs for the rules.
 pub fn plan_consolidation(
     snapshots: &[CollectionSnapshot],
     target: &CollectionId,
@@ -169,6 +180,12 @@ pub fn plan_consolidation(
         .iter()
         .find(|s| &s.info.id == target)
         .ok_or_else(|| KringError::InvalidInput(format!("target {} not found", target.0)))?;
+    if let Some(why) = &target_snapshot.unreadable {
+        return Err(KringError::InvalidInput(format!(
+            "target {} is unreadable: {why}",
+            target.0
+        )));
+    }
     let target_items = target_snapshot
         .items
         .as_ref()
@@ -191,6 +208,8 @@ pub fn plan_consolidation(
             Some(SkipReason::Target)
         } else if let Some(why) = protected_reason(id) {
             Some(SkipReason::Protected(why))
+        } else if let Some(why) = &snapshot.unreadable {
+            Some(SkipReason::Unreadable(why.clone()))
         } else if snapshot.info.locked || snapshot.items.is_none() {
             Some(SkipReason::Locked)
         } else {
@@ -250,7 +269,7 @@ fn as_planned(step: usize, index: usize, item: &Incoming) -> Existing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Attributes, SecretValue};
+    use crate::model::{Attributes, GENERIC_SCHEMA, SCHEMA_ATTRIBUTE, SecretValue};
 
     /// Builds a collection summary for a path under the collection prefix.
     fn info(name: &str, locked: bool) -> CollectionInfo {
@@ -289,6 +308,7 @@ mod tests {
         CollectionSnapshot {
             info: info(name, false),
             items: Some(items),
+            unreadable: None,
         }
     }
 
@@ -297,6 +317,7 @@ mod tests {
         CollectionSnapshot {
             info: info(name, true),
             items: None,
+            unreadable: None,
         }
     }
 
@@ -423,6 +444,47 @@ mod tests {
         half.info.locked = true;
         let err = plan_consolidation(&[half], &cid("login"), None).unwrap_err();
         assert!(matches!(err, KringError::InvalidInput(_)));
+    }
+
+    /// A collection that failed to read is skipped as unreadable, with its
+    /// error; an unreadable target fails the plan.
+    #[test]
+    fn unreadable_skipped() {
+        let bad = CollectionSnapshot {
+            info: info("Bad", false),
+            items: None,
+            unreadable: Some("D-Bus error".into()),
+        };
+        let snapshots = [snap("login", vec![]), bad.clone(), snap("A", vec![])];
+        let plan = plan_consolidation(&snapshots, &cid("login"), None).unwrap();
+        assert_eq!(
+            plan.skipped[1],
+            (
+                cid("Bad"),
+                "Bad".into(),
+                SkipReason::Unreadable("D-Bus error".into())
+            )
+        );
+        assert_eq!(plan.delete_empty, [(cid("A"), "A".into())]);
+        let err = plan_consolidation(&[bad], &cid("Bad"), None).unwrap_err();
+        assert!(err.to_string().contains("unreadable"), "{err}");
+    }
+
+    /// Orphan items without `xdg:schema` are duplicates of target items
+    /// carrying the generic schema.
+    #[test]
+    fn generic_schema_dedupes() {
+        let mut target_item = item("login", 1, "a", "s");
+        target_item
+            .attributes
+            .insert(SCHEMA_ATTRIBUTE.into(), GENERIC_SCHEMA.into());
+        let snapshots = [
+            snap("login", vec![target_item]),
+            snap("A", vec![item("A", 1, "a", "s")]),
+        ];
+        let plan = plan_consolidation(&snapshots, &cid("login"), None).unwrap();
+        assert_eq!(plan.moves[0].plan.counts().duplicate, 1);
+        assert_eq!(plan.conflict_count, 0);
     }
 
     /// The default alias is set unless it already points at the target.

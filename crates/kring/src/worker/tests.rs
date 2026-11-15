@@ -530,7 +530,8 @@ fn session_collection_delete_skips_backup() {
     assert!(!f.backups.exists());
 }
 
-/// A failed prune is reported, but the backup exists so the delete proceeds.
+/// A failed prune travels in the backup event (a notice, never an Error
+/// event), and the backup exists so the delete proceeds.
 #[test]
 fn prune_failure_warns_and_deletes() {
     use std::os::unix::fs::PermissionsExt;
@@ -550,24 +551,18 @@ fn prune_failure_warns_and_deletes() {
         item,
         backup_passphrase: None,
     });
-    let events: Vec<Event> = (0..5).map(|_| f.next()).collect();
+    let events: Vec<Event> = (0..4).map(|_| f.next()).collect();
     set_mode(0o700).unwrap();
-    assert!(matches!(events[0], Event::BackupCreated(_)), "{events:?}");
-    match &events[1] {
-        Event::Error(m) => {
-            assert!(
-                m.starts_with("Backup created but old backups could not be pruned: "),
-                "{m}"
-            )
-        }
-        other => panic!("expected Error, got {other:?}"),
+    match &events[0] {
+        Event::BackupCreated(info) => assert!(info.prune_warning.is_some(), "{info:?}"),
+        other => panic!("expected BackupCreated, got {other:?}"),
     }
-    assert!(matches!(events[2], Event::Collections(_)), "{events:?}");
-    match &events[3] {
+    assert!(matches!(events[1], Event::Collections(_)), "{events:?}");
+    match &events[2] {
         Event::Items(_, items) => assert!(items.is_empty()),
         other => panic!("expected Items, got {other:?}"),
     }
-    assert!(matches!(events[4], Event::Done(_)), "{events:?}");
+    assert!(matches!(events[3], Event::Done(_)), "{events:?}");
 }
 
 /// Successful mutations end with a Done message for the status bar.

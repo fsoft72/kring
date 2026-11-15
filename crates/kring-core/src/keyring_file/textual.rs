@@ -29,12 +29,10 @@ use std::collections::HashMap;
 use zeroize::Zeroizing;
 
 use crate::error::{KringError, Result};
-use crate::model::{Attributes, SecretValue};
+use crate::model::{Attributes, GENERIC_SCHEMA, SCHEMA_ATTRIBUTE, SecretValue};
 
 /// Group name holding keyring metadata.
 const KEYRING_GROUP: &str = "keyring";
-/// Attribute holding the schema name.
-const SCHEMA_ATTRIBUTE: &str = "xdg:schema";
 /// Content type of `secret=` values.
 const TEXT_CONTENT_TYPE: &str = "text/plain";
 /// Content type of `binary-secret=` values.
@@ -168,7 +166,7 @@ fn unescape(raw: &str) -> (Zeroizing<String>, bool) {
 /// Maps a gnome-keyring `item-type` to its schema name.
 fn item_type_schema(item_type: u32) -> Option<&'static str> {
     match item_type {
-        0 => Some("org.freedesktop.Secret.Generic"),
+        0 => Some(GENERIC_SCHEMA),
         1 => Some("org.gnome.keyring.NetworkPassword"),
         2 => Some("org.gnome.keyring.Note"),
         3 => Some("org.gnome.keyring.ChainedKeyring"),

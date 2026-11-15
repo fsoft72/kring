@@ -129,6 +129,8 @@ pub struct ApplyPassphrases {
 const STALE_PLAN_PREFIX: &str = "Plan is out of date";
 /// Most secret requests of previews remembered at once (oldest dropped).
 const MAX_REVEAL_REQUESTS: usize = 32;
+/// Notice shown when a backup was written but old backups could not be pruned.
+const MSG_PRUNE_FAILED: &str = "Backup created but old backups could not be pruned";
 
 /// Formats `n noun`, adding `s` unless `n` is 1 (e.g. `2 items`).
 pub fn count_noun(n: usize, noun: &str) -> String {
@@ -269,6 +271,11 @@ impl AppState {
                 if !info.pruned.is_empty() {
                     let removed = count_noun(info.pruned.len(), "old backup");
                     self.notices.push(format!("Removed {removed}"));
+                }
+                // The backup itself is fine: a notice, never an error (an
+                // error would end an apply that is still running).
+                if let Some(w) = &info.prune_warning {
+                    self.notices.push(format!("{MSG_PRUNE_FAILED}: {w}"));
                 }
             }
             Event::PassphraseNeeded(cmd) => self.pending_passphrase = Some(*cmd),
@@ -974,6 +981,35 @@ mod tests {
             import_summary(&report),
             "Imported 1 item, skipped 0 duplicates, 0 conflicts, 3 without secret"
         );
+    }
+
+    /// A prune failure after a backup is a notice, not an error: a running
+    /// consolidation apply stays in flight.
+    #[test]
+    fn prune_warning_is_a_notice() {
+        let mut s = AppState::default();
+        s.track_transfer_command(&Command::ApplyConsolidation {
+            plan_id: 1,
+            choices: vec![],
+            backup_passphrase: None,
+            orphan_files_passphrase: None,
+        });
+        let info = BackupInfo {
+            dir: "/b/new".into(),
+            reason: "consolidate".into(),
+            created: String::new(),
+            files: vec![],
+            seq: 1,
+            prune_warning: Some("permission denied".into()),
+            pruned: vec![],
+        };
+        s.apply(Event::BackupCreated(info));
+        assert!(s.is_applying_consolidation());
+        assert_eq!(
+            s.drain_notices(),
+            ["Backup created but old backups could not be pruned: permission denied"]
+        );
+        assert!(s.drain_messages().1.is_empty());
     }
 
     /// A backup that pruned old ones queues a notice, drained once.

@@ -40,6 +40,8 @@ pub(crate) const MSG_STALE_PLAN: &str = "Plan is out of date, preview again";
 pub(crate) const MSG_MOVE_INTO_SELF: &str = "Cannot move items into the collection they are in";
 /// Message for a transfer of live items that changed after the preview.
 pub(crate) const MSG_SOURCES_CHANGED: &str = "Items changed since the preview, preview again";
+/// Message for a transfer whose target changed after the preview.
+pub(crate) const MSG_TARGET_CHANGED: &str = "Target changed since the preview, preview again";
 /// Message for a transfer request without items.
 const MSG_NO_ITEMS: &str = "No items selected";
 /// Alias read to know whether consolidation must set the default.
@@ -639,6 +641,8 @@ fn emit_preview<N: Fn()>(out: &Emitter<N>, plans: &mut PlanState, job: TransferJ
 /// of the target and (for Move) of every source collection. Copy without
 /// `UseIncoming` only adds items and needs no backup. Live sources are
 /// re-read first: if any changed or vanished since the preview nothing runs.
+/// The target is re-read and re-planned too: if the plan differs from the
+/// previewed one (see [`target_unchanged`]) nothing runs.
 async fn apply_job<S, N>(
     ctx: &Ctx<'_, S, N>,
     job: TransferJob,
@@ -664,6 +668,10 @@ where
     }
     if job.origin == Origin::Live && !sources_unchanged(ctx.store, &job.incoming).await? {
         ctx.out.error(MSG_SOURCES_CHANGED);
+        return Ok(None);
+    }
+    if !target_unchanged(ctx.store, &job).await? {
+        ctx.out.error(MSG_TARGET_CHANGED);
         return Ok(None);
     }
     let mut names: Vec<CollectionId> = Vec::new();
@@ -716,8 +724,25 @@ where
     Ok(None)
 }
 
+/// Returns true when planning the job's incoming items against the target as
+/// it is now gives the previewed plan: the same actions and the same
+/// conflicts (target item and incoming index).
+async fn target_unchanged<S: SecretStore>(store: &S, job: &TransferJob) -> Result<bool> {
+    let existing = target_existing(store, &job.target, &job.incoming).await?;
+    let now = plan_transfer(&job.incoming, &existing);
+    if now.actions != job.plan.actions || now.conflicts.len() != job.plan.conflicts.len() {
+        return Ok(false);
+    }
+    let same = now
+        .conflicts
+        .iter()
+        .zip(&job.plan.conflicts)
+        .all(|(a, b)| a.existing == b.existing && a.incoming == b.incoming);
+    Ok(same)
+}
+
 /// Returns true when every live incoming item still exists with the same
-/// attributes and secret as when it was planned.
+/// label, identity (see [`identity`]) and secret as when it was planned.
 async fn sources_unchanged<S: SecretStore>(store: &S, incoming: &[Incoming]) -> Result<bool> {
     let mut listed: Vec<(CollectionId, Vec<ItemInfo>)> = Vec::new();
     for item in incoming {
@@ -737,7 +762,7 @@ async fn sources_unchanged<S: SecretStore>(store: &S, incoming: &[Incoming]) -> 
         let Some(info) = found else {
             return Ok(false);
         };
-        if info.label != item.label || info.attributes != item.attributes {
+        if info.label != item.label || identity(&info.attributes) != identity(&item.attributes) {
             return Ok(false);
         }
         let secret = store.read_secret(id).await?;

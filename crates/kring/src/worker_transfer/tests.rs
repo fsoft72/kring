@@ -18,7 +18,7 @@ use kring_core::transfer::archive::{ExportedItem, write_archive};
 use kring_core::transfer::consolidate::SkipReason;
 use kring_core::transfer::plan::{Choice, TransferCounts};
 
-use super::{MSG_MOVE_INTO_SELF, MSG_SOURCES_CHANGED, MSG_STALE_PLAN};
+use super::{MSG_MOVE_INTO_SELF, MSG_SOURCES_CHANGED, MSG_STALE_PLAN, MSG_TARGET_CHANGED};
 use crate::worker::{Command, ConflictView, Event, WorkerConfig, WorkerHandle, spawn};
 
 /// Directory of the synthetic keyring fixtures.
@@ -514,6 +514,59 @@ fn changed_source_refused() {
     e.apply(plan_id, vec![], None);
     assert_eq!(e.expect_error(), MSG_SOURCES_CHANGED);
     assert!(e.items(&e.main).is_empty());
+}
+
+/// A live source that only gained the generic `xdg:schema` since the preview
+/// (gnome-keyring adds it on reload) is still applied.
+#[test]
+fn generic_schema_added_to_source_still_applies() {
+    let e = gnome();
+    let item = e.add_item(&e.other, "site", &[("k", "1")], "s1");
+    let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
+    let update = ItemUpdate {
+        label: None,
+        attributes: Some(attrs(&[("k", "1"), (SCHEMA, GENERIC)])),
+        secret: None,
+    };
+    block(e.store.update_item(&item, update)).unwrap();
+    e.apply(plan_id, vec![], None);
+    let events = e.until(|ev| matches!(ev, Event::Collections(_)));
+    assert_eq!(transfer_done(&events).created, 1);
+    assert_eq!(e.items(&e.main).len(), 1);
+}
+
+/// A target that changed since the preview (a duplicate deleted, a conflict
+/// turned into a duplicate) refuses the apply; the source stays untouched.
+#[test]
+fn changed_target_refused() {
+    let e = gnome();
+    e.binary_keyring("Main");
+    e.binary_keyring("Other");
+    let dup = e.add_item(&e.main, "dup", &[("k", "1")], "same");
+    let item = e.add_item(&e.other, "site", &[("k", "1")], "same");
+    let (plan_id, conflicts) = e.plan(&[&item], &e.main, TransferMode::Move);
+    assert!(conflicts.is_empty());
+    block(e.store.delete_item(&dup)).unwrap();
+    e.apply(plan_id, vec![], Some(PASSPHRASE));
+    assert_eq!(e.expect_error(), MSG_TARGET_CHANGED);
+    assert!(e.items(&e.main).is_empty());
+    assert_eq!(e.items(&e.other).len(), 1);
+    assert_eq!(e.backup_count(), 0);
+
+    let clash = e.add_item(&e.main, "clash", &[("k", "1")], "theirs");
+    let (plan_id, conflicts) = e.plan(&[&item], &e.main, TransferMode::Move);
+    assert_eq!(conflicts.len(), 1);
+    let same = ItemUpdate {
+        label: None,
+        attributes: None,
+        secret: Some(SecretValue::from_text("same")),
+    };
+    block(e.store.update_item(&clash, same)).unwrap();
+    e.apply(plan_id, vec![Choice::UseIncoming], Some(PASSPHRASE));
+    assert_eq!(e.expect_error(), MSG_TARGET_CHANGED);
+    assert_eq!(e.items(&e.other).len(), 1);
+    assert_eq!(e.secret(&item), "same");
+    assert_eq!(e.backup_count(), 0);
 }
 
 /// Plan 1 and Plan 2 mutations (DeleteItem, RetireFile, RestoreBackup) also

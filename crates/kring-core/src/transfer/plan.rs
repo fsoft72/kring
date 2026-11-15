@@ -2,7 +2,8 @@
 //!
 //! The planner is pure: it compares incoming items (live or offline) with the
 //! items already in the target and decides, per incoming item, what to do.
-//! Identity of an item is its attribute map without `xdg:content-type`.
+//! Identity of an item is its attribute map without `xdg:content-type`, with
+//! a missing `xdg:schema` counted as the generic schema (see [`identity`]).
 //!
 //! Rules, applied per incoming item in order:
 //!
@@ -21,7 +22,7 @@
 
 use oo7::CONTENT_TYPE_ATTRIBUTE;
 
-use crate::model::{Attributes, ItemId, SecretValue};
+use crate::model::{Attributes, GENERIC_SCHEMA, ItemId, SCHEMA_ATTRIBUTE, SecretValue};
 
 /// Where an incoming item comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,10 +156,17 @@ impl TransferPlan {
     }
 }
 
-/// Returns the attributes used for equality, without `xdg:content-type`.
+/// Returns the attributes used for equality: without `xdg:content-type`,
+/// and with `xdg:schema` set to the generic schema when missing.
+///
+/// gnome-keyring adds `xdg:schema=org.freedesktop.Secret.Generic` by itself
+/// (asynchronously, when it reloads a keyring file after a write), so an item
+/// without a schema and the same item with the generic one are the same item.
 pub fn identity(attrs: &Attributes) -> Attributes {
     let mut out = attrs.clone();
     out.remove(CONTENT_TYPE_ATTRIBUTE);
+    out.entry(SCHEMA_ATTRIBUTE.to_string())
+        .or_insert_with(|| GENERIC_SCHEMA.to_string());
     out
 }
 
@@ -358,7 +366,7 @@ mod tests {
     #[test]
     fn content_type_ignored() {
         let a = attrs(&[("a", "1"), (CONTENT_TYPE_ATTRIBUTE, "text/plain")]);
-        assert_eq!(identity(&a), attrs(&[("a", "1")]));
+        assert_eq!(identity(&a), identity(&attrs(&[("a", "1")])));
         let existing = [ex(
             "/1",
             &[("a", "1"), (CONTENT_TYPE_ATTRIBUTE, "text/plain")],
@@ -377,6 +385,30 @@ mod tests {
             &existing,
         );
         assert_eq!(plan.counts().conflict, 1);
+    }
+
+    /// A missing `xdg:schema` counts as the generic schema; any other schema
+    /// still makes a different identity.
+    #[test]
+    fn missing_schema_is_generic() {
+        let bare = attrs(&[("a", "1")]);
+        let generic = attrs(&[("a", "1"), (SCHEMA_ATTRIBUTE, GENERIC_SCHEMA)]);
+        let other = attrs(&[("a", "1"), (SCHEMA_ATTRIBUTE, "org.gnome.keyring.Note")]);
+        assert_eq!(identity(&bare), identity(&generic));
+        assert_ne!(identity(&bare), identity(&other));
+        let existing = [ex(
+            "/1",
+            &[("a", "1"), (SCHEMA_ATTRIBUTE, GENERIC_SCHEMA)],
+            "s",
+            1,
+        )];
+        let plan = plan_transfer(&[inc(0, &[("a", "1")], "s", 1)], &existing);
+        assert_eq!(plan.counts().duplicate, 1);
+        let plan = plan_transfer(
+            &[inc(0, &[("a", "1"), (SCHEMA_ATTRIBUTE, "x.Y")], "s", 1)],
+            &existing,
+        );
+        assert_eq!(plan.counts().create, 1);
     }
 
     /// Several existing items sharing an identity: any same secret is a

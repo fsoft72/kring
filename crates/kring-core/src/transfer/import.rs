@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn comparable_drops_content_type() {
         let a = attrs(&[("a", "1"), (CONTENT_TYPE_ATTRIBUTE, "text/plain")]);
-        assert_eq!(identity(&a), attrs(&[("a", "1")]));
+        assert_eq!(identity(&a), identity(&attrs(&[("a", "1")])));
         let ex = [existing(
             &[("a", "1"), (CONTENT_TYPE_ATTRIBUTE, "text/plain")],
             "s",
