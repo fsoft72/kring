@@ -11,3 +11,4 @@ pub mod startup;
 pub mod ui;
 pub mod views;
 pub mod worker;
+mod worker_offline;

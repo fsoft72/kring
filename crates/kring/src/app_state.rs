@@ -1,8 +1,12 @@
 //! UI-side application state, updated by worker events.
 
+use kring_core::backup::{BackupInfo, RestoreReport};
+use kring_core::keyring_file::KeyringFileInfo;
+use kring_core::keyring_file::textual::{OfflineItem, ParseWarning};
 use kring_core::model::{CollectionId, CollectionInfo, ItemId, ItemInfo, SecretValue};
 use kring_core::pam::PamStatus;
 use kring_core::provider::ProviderInfo;
+use kring_core::transfer::import::ImportReport;
 
 use crate::worker::{Command, Event};
 
@@ -25,6 +29,22 @@ pub struct AppState {
     pub status: String,
     pub errors: Vec<String>,
     pub pending_passphrase: Option<Command>,
+    /// Keyring files of the keyrings directory (last scan).
+    pub files: Vec<KeyringFileInfo>,
+    /// Name of the keyring file being viewed.
+    pub selected_file: Option<String>,
+    /// Items read offline from the selected file; holds secrets, cleared on file change.
+    pub file_items: Vec<OfflineItem>,
+    /// Parse warnings of the selected file.
+    pub file_warnings: Vec<ParseWarning>,
+    /// Binary keyring file waiting for its password.
+    pub pending_file_password: Option<String>,
+    /// Backups, newest first.
+    pub backups: Vec<BackupInfo>,
+    /// Outcome of the last import.
+    pub last_import: Option<ImportReport>,
+    /// Outcome of the last restore.
+    pub last_restore: Option<RestoreReport>,
 }
 
 /// Sort key: login first, then default alias, then label (case-insensitive).
@@ -67,6 +87,22 @@ impl AppState {
                 self.status = format!("Backup created: {}", info.dir.display());
             }
             Event::PassphraseNeeded(cmd) => self.pending_passphrase = Some(*cmd),
+            Event::Files(v) => self._set_files(v),
+            Event::FileItems {
+                name,
+                items,
+                warnings,
+            } => {
+                if self.selected_file.as_ref() != Some(&name) {
+                    return;
+                }
+                self.file_items = items;
+                self.file_warnings = warnings;
+            }
+            Event::PasswordNeeded(name) => self.pending_file_password = Some(name),
+            Event::ImportDone(report) => self.last_import = Some(report),
+            Event::Backups(v) => self.backups = v,
+            Event::RestoreDone(report) => self.last_restore = Some(report),
             Event::Done(msg) => self.status = msg,
             Event::Error(msg) => {
                 self.errors.push(msg);
@@ -90,6 +126,32 @@ impl AppState {
             self.selected_item = None;
             self.revealed = None;
         }
+    }
+
+    /// Replaces the file list, closing a selected file that no longer exists.
+    fn _set_files(&mut self, files: Vec<KeyringFileInfo>) {
+        self.files = files;
+        let exists = self
+            .selected_file
+            .as_ref()
+            .is_some_and(|s| self.files.iter().any(|f| &f.name == s));
+        if !exists {
+            self.close_file();
+        }
+    }
+
+    /// Selects a keyring file, dropping the items (and secrets) of the previous one.
+    pub fn select_file(&mut self, name: String) {
+        self.close_file();
+        self.selected_file = Some(name);
+    }
+
+    /// Closes the selected file and drops its items and secrets (e.g. on area change).
+    pub fn close_file(&mut self) {
+        self.selected_file = None;
+        self.file_items.clear();
+        self.file_warnings.clear();
+        self.pending_file_password = None;
     }
 
     /// Selects a collection and clears everything below it.
@@ -231,6 +293,95 @@ mod tests {
         assert_eq!(errors, ["e1", "e2"]);
         assert!(s.status.is_empty() && s.errors.is_empty());
         assert_eq!(s.drain_messages(), (None, vec![]));
+    }
+
+    /// Builds a file info named `name`.
+    fn file(name: &str) -> KeyringFileInfo {
+        KeyringFileInfo {
+            path: format!("/k/{name}.keyring").into(),
+            name: name.into(),
+            format: kring_core::keyring_file::KeyringFormat::Textual,
+            size: 0,
+            modified: 0,
+            display_name: None,
+            item_count: None,
+            daemon_readable: None,
+            plaintext: true,
+            error: None,
+        }
+    }
+
+    /// Builds an offline item with a secret.
+    fn offline(label: &str) -> OfflineItem {
+        OfflineItem {
+            label: label.into(),
+            attributes: Default::default(),
+            secret: SecretValue::from_text("s"),
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    /// Items of another file are ignored; selecting another file drops the secrets.
+    #[test]
+    fn file_items_follow_selection() {
+        let mut s = AppState::default();
+        s.apply(Event::Files(vec![file("a"), file("b")]));
+        s.select_file("a".into());
+        s.apply(Event::FileItems {
+            name: "b".into(),
+            items: vec![offline("x")],
+            warnings: vec![],
+        });
+        assert!(s.file_items.is_empty());
+        s.apply(Event::FileItems {
+            name: "a".into(),
+            items: vec![offline("x")],
+            warnings: vec![],
+        });
+        assert_eq!(s.file_items.len(), 1);
+        s.select_file("b".into());
+        assert!(s.file_items.is_empty());
+        assert_eq!(s.selected_file.as_deref(), Some("b"));
+    }
+
+    /// A rescan without the selected file closes it; close_file drops the secrets.
+    #[test]
+    fn vanished_file_closes_selection() {
+        let mut s = AppState::default();
+        s.apply(Event::Files(vec![file("a")]));
+        s.select_file("a".into());
+        s.apply(Event::FileItems {
+            name: "a".into(),
+            items: vec![offline("x")],
+            warnings: vec![],
+        });
+        s.apply(Event::Files(vec![file("a"), file("b")]));
+        assert_eq!(s.file_items.len(), 1);
+        s.apply(Event::Files(vec![file("b")]));
+        assert!(s.selected_file.is_none() && s.file_items.is_empty());
+        s.select_file("b".into());
+        s.apply(Event::PasswordNeeded("b".into()));
+        s.close_file();
+        assert!(s.selected_file.is_none() && s.pending_file_password.is_none());
+    }
+
+    /// Import, backup and restore results are stored.
+    #[test]
+    fn offline_results_stored() {
+        let mut s = AppState::default();
+        s.apply(Event::ImportDone(ImportReport {
+            created: 2,
+            ..Default::default()
+        }));
+        assert_eq!(s.last_import.as_ref().map(|r| r.created), Some(2));
+        s.apply(Event::Backups(vec![]));
+        assert!(s.backups.is_empty());
+        s.apply(Event::RestoreDone(RestoreReport {
+            restored: vec!["/k/a.keyring".into()],
+            pre_restore_backup: None,
+        }));
+        assert_eq!(s.last_restore.as_ref().map(|r| r.restored.len()), Some(1));
     }
 
     /// Errors are capped at the last 20.
