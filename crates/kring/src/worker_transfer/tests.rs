@@ -283,6 +283,7 @@ fn may_carry_secret(event: &Event) -> bool {
         | Event::Items(..)
         | Event::BackupCreated(_)
         | Event::ApplyPassphrasesNeeded { .. }
+        | Event::UnlockManyDone { .. }
         | Event::Files(_)
         | Event::PasswordNeeded(_)
         | Event::ImportDone(_)

@@ -19,6 +19,7 @@ pub mod gpg_detail;
 pub mod gpg_list;
 pub mod item_detail;
 pub mod item_list;
+pub mod locked_list;
 pub mod progress;
 pub mod rail;
 pub mod sidebar;
@@ -94,6 +95,9 @@ pub enum Action {
     SelectSshKey(String),
     /// Select a GPG key (full fingerprint) and read its public key.
     SelectGpgKey(String),
+    /// Unlock these collections with one password: the remembered one, or
+    /// the one asked by a dialog (see `locked_list::unlock_all`).
+    UnlockMany(Vec<CollectionId>),
     /// Show an informational toast (e.g. after copying a public key).
     Info(String),
 }

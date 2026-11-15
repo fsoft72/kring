@@ -5,7 +5,7 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use kring_core::model::SecretValue;
+use kring_core::model::{CollectionId, SecretValue};
 
 use crate::app_state::AppState;
 use crate::clipboard::ArboardClipboard;
@@ -21,6 +21,7 @@ use crate::views::consolidate::{self, ConsolidateView, PassphraseNeeds};
 use crate::views::dialogs::{Dialog, DialogKind, Outcome, WalletTarget};
 use crate::views::file_items::FileView;
 use crate::views::item_detail::AttrEditor;
+use crate::views::locked_list::{UnlockAll, unlock_all};
 use crate::views::progress;
 use crate::views::rail::WorkerActivity;
 use crate::views::transfer::{self, TransferView};
@@ -257,6 +258,7 @@ impl KringApp {
     /// Sends a command to the worker as command number `next_seq`.
     fn _send(&mut self, cmd: Command) {
         let id = self.next_seq;
+        self.state.track_consolidation_command(&cmd, id);
         self.state.track_file_command(&cmd);
         self.state.track_wallet_command(&cmd, id);
         self.state.track_transfer_command(&cmd);
@@ -359,6 +361,7 @@ impl KringApp {
             }
             Action::CloseConsolidationPreview => {
                 self.state.close_consolidation_preview();
+                self.state.forget_consolidation_request();
                 self._send(Command::DiscardPlan);
             }
             Action::DismissConsolidation => {
@@ -381,7 +384,31 @@ impl KringApp {
                     self._send(cmd);
                 }
             }
+            Action::UnlockMany(collections) => self._unlock_many(collections),
             Action::Info(text) => self.toasts.push(ToastKind::Info, text, Instant::now()),
+        }
+    }
+
+    /// Unlocks `collections` with one password: the remembered one right
+    /// away (with an info toast), otherwise the one asked by a dialog.
+    fn _unlock_many(&mut self, collections: Vec<CollectionId>) {
+        if collections.is_empty() {
+            return;
+        }
+        match unlock_all(self.state.session.value(), collections) {
+            UnlockAll::Send(cmd, text) => {
+                self._send(cmd);
+                self.toasts.push(ToastKind::Info, text, Instant::now());
+            }
+            UnlockAll::Ask(kind) => self.dialog = Some(Dialog::new(kind)),
+        }
+    }
+
+    /// Asks the consolidation preview again once an unlock sent from it
+    /// finished (the unlock discarded its plan).
+    fn _repreview_consolidation(&mut self) {
+        if let Some(cmd) = self.state.take_repreview() {
+            self._send(cmd);
         }
     }
 
@@ -636,9 +663,10 @@ impl KringApp {
             Outcome::Submitted(cmd) => {
                 let id = self.next_seq;
                 if let Some(value) = dialog.to_remember(&cmd) {
-                    // A password that reopens the dialog when wrong is kept
-                    // only once its command proves it right.
-                    if dialog.reopens_when_wrong() {
+                    // A password that reopens the dialog when wrong (or
+                    // unlocks many keyrings) is kept only once its command
+                    // proves it right.
+                    if dialog.remembers_only_when_correct() {
                         self.state.session.remember_if_correct(value, id);
                     } else {
                         self.state.session.remember(value);
@@ -768,6 +796,7 @@ impl eframe::App for KringApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self._drain_events();
+        self._repreview_consolidation();
         self._reload_stale_backups();
         self.copier.finish(&mut self.state);
         self._hide_locked_secret();

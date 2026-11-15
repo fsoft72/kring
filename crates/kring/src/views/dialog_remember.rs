@@ -33,6 +33,7 @@ const MSG_TYPE_ANOTHER: &str = "Type another";
 pub fn asks_passphrase(kind: &DialogKind) -> bool {
     match kind {
         DialogKind::Unlock { .. }
+        | DialogKind::UnlockMany { .. }
         | DialogKind::FilePassword { .. }
         | DialogKind::WalletPassword { .. }
         | DialogKind::RetireFile { .. }
@@ -52,10 +53,21 @@ pub fn asks_passphrase(kind: &DialogKind) -> bool {
 
 /// Returns true when a dialog opened by the user may use the remembered
 /// passphrase instead of its fields: every passphrase dialog except the
-/// unlock one (an unlock is first tried with it, its dialog opens only
-/// after that failed).
+/// unlock ones (an unlock is first tried with it, its dialog opens only
+/// after that failed; an unlock of many keyrings is sent with it directly).
 pub fn uses_remembered(kind: &DialogKind) -> bool {
-    !matches!(kind, DialogKind::Unlock { .. }) && asks_passphrase(kind)
+    !matches!(
+        kind,
+        DialogKind::Unlock { .. } | DialogKind::UnlockMany { .. }
+    ) && asks_passphrase(kind)
+}
+
+/// Returns true when a password typed with "Remember for this session" is
+/// kept only once its command proves it right: the dialogs that reopen
+/// when wrong (see [`reopens_when_wrong`]), and the unlock of many
+/// keyrings (right when one keyring unlocked).
+pub fn remembers_only_when_correct(kind: &DialogKind) -> bool {
+    reopens_when_wrong(kind) || matches!(kind, DialogKind::UnlockMany { .. })
 }
 
 /// Returns true for the password dialogs that reopen (fields empty, "Wrong
@@ -179,6 +191,7 @@ pub fn fill_passphrases(kind: &mut DialogKind, secret: &SecretValue) {
 pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
     match cmd {
         Command::Unlock { password, .. }
+        | Command::UnlockMany { password, .. }
         | Command::CreateWalletCollection { password, .. }
         | Command::OpenWallet { password, .. } => Some(password),
         Command::OpenFile { password, .. } | Command::ImportFile { password, .. } => {

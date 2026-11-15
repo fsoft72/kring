@@ -8,7 +8,7 @@ use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
 
 pub use crate::ui::buttons::{
-    add_button, danger_button, ico_button, primary_button, secondary_button,
+    add_button, compact_button, danger_button, ico_button, primary_button, secondary_button,
 };
 
 /// Vertical inner margin of every text input.

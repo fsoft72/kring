@@ -193,7 +193,8 @@ impl SessionSecret {
     }
 
     /// Follows the events of the candidate's command; remembers it when the
-    /// command finished without a wrong-passphrase error, drops it otherwise.
+    /// command finished without a wrong-passphrase error (and, for an
+    /// unlock of many keyrings, unlocked at least one), drops it otherwise.
     fn _observe_candidate(&mut self, event: &Event, running: u64) {
         let Some(c) = self.candidate.as_mut() else {
             return;
@@ -208,6 +209,8 @@ impl SessionSecret {
                 }
             }
             Event::Error(msg) if running == c.id => c.wrong |= is_wrong_passphrase(msg),
+            // An unlock of many keyrings proves the password by one success.
+            Event::UnlockManyDone { unlocked, .. } if running == c.id => c.wrong |= *unlocked == 0,
             _ => {}
         }
     }
@@ -406,6 +409,28 @@ mod tests {
             8,
             &[Event::Done(Default::default()), Event::CommandFinished(8)],
         );
+        assert_eq!(s.value().and_then(|v| v.as_text()), Some("good"));
+    }
+
+    /// The password typed to unlock many keyrings is remembered only when
+    /// at least one keyring unlocked with it (failures carry no wrong
+    /// passphrase error).
+    #[test]
+    fn unlock_many_candidate_needs_one_unlock() {
+        let none = Event::UnlockManyDone {
+            unlocked: 0,
+            failed: vec![("A".into(), "invalid password".into())],
+        };
+        let mut s = SessionSecret::default();
+        s.remember_if_correct(SecretValue::from_text("bad"), 3);
+        feed(&mut s, 3, &[none, Event::CommandFinished(3)]);
+        assert!(!s.is_remembered());
+        let some = Event::UnlockManyDone {
+            unlocked: 1,
+            failed: vec![("A".into(), "invalid password".into())],
+        };
+        s.remember_if_correct(SecretValue::from_text("good"), 4);
+        feed(&mut s, 4, &[some, Event::CommandFinished(4)]);
         assert_eq!(s.value().and_then(|v| v.as_text()), Some("good"));
     }
 

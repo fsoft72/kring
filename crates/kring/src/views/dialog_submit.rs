@@ -234,6 +234,13 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             collection: collection.clone(),
             password: _secret(password),
         },
+        DialogKind::UnlockMany {
+            collections,
+            password,
+        } => Command::UnlockMany {
+            collections: collections.clone(),
+            password: _secret(password),
+        },
         DialogKind::CreateCollection {
             label,
             password,

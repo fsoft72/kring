@@ -19,6 +19,9 @@
 #   Default_3  empty, password `d3`
 # With KRING_DEV_SHARED_LABELS=1 Default_1 and Default_3 are both labelled
 # "Default" (like real gnome-keyring orphans), to show the disambiguated names.
+# With KRING_DEV_MANY_LOCKED=1 twelve more keyrings labelled "Default keyring"
+# are created locked (password `backup`, the last one `odd`), for the locked
+# keyrings list of the consolidation preview.
 # and, before the daemon starts, the synthetic fixtures of
 # crates/kring-core/tests/fixtures/keyrings are copied into the TEMP keyrings
 # dir (never from the real one), so the Offline files area has binary,

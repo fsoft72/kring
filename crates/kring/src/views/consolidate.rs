@@ -32,6 +32,7 @@ use crate::ui::widgets::{
 use crate::views::collection::{display_name, display_names};
 use crate::views::conflict_row::{MSG_CONFLICTS, RowEvent, conflict_row};
 use crate::views::dialogs::DialogKind;
+use crate::views::locked_list;
 use crate::views::sidebar::row_background;
 use crate::views::transfer::{default_choices, preview_header};
 use crate::views::{Action, Gates};
@@ -41,9 +42,9 @@ use crate::worker::{Command, ConsolidationSummary};
 const MSG_EXPLAIN: &str = "Moves every item of the other readable keyrings into the target \
      and deletes the keyrings left empty. Locked, login and session keyrings are never \
      touched. One backup of all keyring files is taken before anything changes.";
-/// Hint of the start card: an unlock invalidates the pending plan.
+/// Hint of the start card: locked keyrings are unlocked from the preview.
 const MSG_UNLOCK_HINT: &str =
-    "Unlock the keyrings you want to include before previewing: unlocking discards the preview.";
+    "Locked keyrings are skipped: unlock them from the preview, which then refreshes.";
 /// Tooltip of Preview without a target.
 const MSG_NO_TARGET: &str = "Choose a target keyring";
 /// Tooltip of Consolidate while the apply runs.
@@ -72,7 +73,7 @@ pub enum LineKind {
     Move,
     /// Empty keyrings deleted (followed by their names).
     Delete,
-    /// Locked keyrings skipped (followed by Unlock shortcuts).
+    /// Locked keyrings skipped (rendered as the locked keyrings card).
     Skipped,
     /// Keyrings skipped because reading them failed (followed by the errors).
     Unreadable,
@@ -225,10 +226,7 @@ pub fn summary_lines(
         .filter(|(_, _, r)| *r == SkipReason::Locked)
         .count();
     if locked > 0 {
-        let text = format!(
-            "Skipped: {} (unlock them first to include)",
-            count_noun(locked, "locked keyring")
-        );
+        let text = format!("Skipped: {}", count_noun(locked, "locked keyring"));
         out.push(line(LineKind::Skipped, text));
     }
     let unreadable: Vec<String> = summary
@@ -414,6 +412,8 @@ pub struct ConsolidateView {
     expanded: BTreeSet<usize>,
     /// Passphrases given for the plan.
     kept: KeptPassphrases,
+    /// Every locked keyring of the preview is listed (not only the first rows).
+    show_all_locked: bool,
 }
 
 impl ConsolidateView {
@@ -713,15 +713,15 @@ fn _steps(
     }
 }
 
-/// Renders the extra content of a summary line; returns an Unlock action.
+/// Renders the extra content of a summary line (the locked keyrings have
+/// their own card, see [`locked_list::card`]).
 fn _line_extra(
     ui: &mut Ui,
     kind: LineKind,
     names: &HashMap<CollectionId, String>,
     summary: &ConsolidationSummary,
     view: &mut ConsolidateView,
-    gates: Gates,
-) -> Option<Action> {
+) {
     match kind {
         LineKind::Move => _steps(ui, names, summary, view),
         LineKind::Delete => {
@@ -735,24 +735,6 @@ fn _line_extra(
         LineKind::Retire => {
             ui.label(muted_text(summary.orphan_files.join(", ")));
         }
-        LineKind::Skipped => {
-            let mut action = None;
-            let locked = summary
-                .skipped
-                .iter()
-                .filter(|(_, _, r)| *r == SkipReason::Locked);
-            ui.horizontal_wrapped(|ui| {
-                for (id, label, _) in locked {
-                    let name = name_in(names, id, label);
-                    ui.label(RichText::new(&name).color(theme::TEXT).size(13.0));
-                    if secondary_button(ui, "Unlock", gates.master) {
-                        action = Some(Action::Open(DialogKind::unlock(id.clone(), name)));
-                    }
-                    ui.add_space(12.0);
-                }
-            });
-            return action;
-        }
         LineKind::Unreadable => {
             for (id, label, reason) in &summary.skipped {
                 let SkipReason::Unreadable(why) = reason else {
@@ -761,9 +743,8 @@ fn _line_extra(
                 ui.label(muted_text(format!("{}: {why}", name_in(names, id, label))));
             }
         }
-        LineKind::NotTouched | LineKind::Default => {}
+        LineKind::Skipped | LineKind::NotTouched | LineKind::Default => {}
     }
-    None
 }
 
 /// Renders the conflicts of every step with the shared conflict row.
@@ -832,11 +813,17 @@ fn _preview_body(
     let names = display_names(&state.collections);
     let mut action = None;
     for line in summary_lines(summary, &target_label, &names) {
-        accent_card(ui, _line_color(line.kind), |ui| {
-            ui.label(semibold(&line.text, 14.0));
-            let found = _line_extra(ui, line.kind, &names, summary, view, gates);
+        if line.kind == LineKind::Skipped {
+            let entries = locked_list::locked_entries(summary, &names);
+            let show_all = &mut view.show_all_locked;
+            let found = locked_list::card(ui, &line.text, &entries, show_all, gates);
             action = found.or(action.take());
-        });
+        } else {
+            accent_card(ui, _line_color(line.kind), |ui| {
+                ui.label(semibold(&line.text, 14.0));
+                _line_extra(ui, line.kind, &names, summary, view);
+            });
+        }
         ui.add_space(6.0);
     }
     let found = _conflicts(ui, state, summary, view, &target_label);
@@ -1083,10 +1070,7 @@ mod tests {
             [
                 (LineKind::Move, "Move 5 items from 2 keyrings into Login"),
                 (LineKind::Delete, "Delete 1 empty keyring"),
-                (
-                    LineKind::Skipped,
-                    "Skipped: 1 locked keyring (unlock them first to include)"
-                ),
+                (LineKind::Skipped, "Skipped: 1 locked keyring"),
                 (LineKind::Unreadable, "Skipped: unreadable Default_4"),
                 (LineKind::NotTouched, "Not touched: session (protected)"),
                 (LineKind::Default, "Set Login as default"),

@@ -105,6 +105,36 @@ pub fn consolidation_status(
     }
 }
 
+/// Most failed keyrings named in the toast of an unlock of many keyrings.
+const MAX_FAILED_NAMES: usize = 3;
+
+/// Returns the toast text of a finished unlock of many keyrings, e.g.
+/// `Unlocked 2 of 5 keyrings, 3 failed: A, B, C (invalid password)`: at
+/// most [`MAX_FAILED_NAMES`] failed keyrings are named (`and N more`), and
+/// the reason follows when every failure shares it.
+pub fn unlock_many_summary(unlocked: usize, failed: &[(String, String)]) -> String {
+    let total = unlocked + failed.len();
+    let mut text = format!("Unlocked {unlocked} of {}", count_noun(total, "keyring"));
+    if failed.is_empty() {
+        return text;
+    }
+    let names: Vec<&str> = failed
+        .iter()
+        .take(MAX_FAILED_NAMES)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    text.push_str(&format!(", {} failed: {}", failed.len(), names.join(", ")));
+    let more = failed.len().saturating_sub(MAX_FAILED_NAMES);
+    if more > 0 {
+        text.push_str(&format!(" and {more} more"));
+    }
+    let reason = &failed[0].1;
+    if failed.iter().all(|(_, r)| r == reason) {
+        text.push_str(&format!(" ({reason})"));
+    }
+    text
+}
+
 /// A transfer preview waiting for the user's choices (no secrets).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferPreview {
@@ -268,6 +298,14 @@ pub struct AppState {
     pub session: SessionSecret,
     /// Destructive operation in flight (or finished, until its modal is closed).
     pub operation: Option<Operation>,
+    /// Last consolidation preview asked `(target, include orphan files)`,
+    /// kept until its flow ends (cancel, apply, leaving the area).
+    consolidation_request: Option<(CollectionId, bool)>,
+    /// Number of the unlock command sent from the consolidation preview:
+    /// once it finished the preview is asked again.
+    repreview_after: Option<u64>,
+    /// The consolidation preview must be asked again (see [`Self::take_repreview`]).
+    repreview_due: bool,
     /// Number of the command the worker is handling: every command before it
     /// sent [`Event::CommandFinished`] (events before the first one, such as
     /// the startup ones, count for command 0).
@@ -289,6 +327,10 @@ impl AppState {
         match event {
             Event::CommandFinished(id) => {
                 self.running = id + 1;
+                if self.repreview_after == Some(id) {
+                    self.repreview_after = None;
+                    self.repreview_due = true;
+                }
                 if self.wallet_create.as_ref().is_some_and(|(_, c)| *c == id) {
                     self.wallet_create = None;
                 }
@@ -358,6 +400,14 @@ impl AppState {
                     return self.errors.push(MSG_KEY_CHANGED.to_string());
                 }
                 self.pending_passphrase = Some(*cmd);
+            }
+            Event::UnlockManyDone { unlocked, failed } => {
+                let text = unlock_many_summary(unlocked, &failed);
+                match (unlocked, failed.is_empty()) {
+                    (0, _) => self.errors.push(text),
+                    (_, true) => self.status = text,
+                    (_, false) => self.notices.push(text),
+                }
             }
             Event::Files(v) => self._set_files(v),
             Event::FileItems {
@@ -469,6 +519,7 @@ impl AppState {
             }
             Event::ConsolidationDone(report, retired) => {
                 self.status = consolidation_status(&report, retired.as_ref());
+                self.forget_consolidation_request();
                 self.close_consolidation_preview();
                 self.pending_apply_passphrases = None;
                 self.last_consolidation = Some((report, retired));
@@ -842,6 +893,9 @@ impl AppState {
     /// the secrets revealed in its preview.
     pub fn set_consolidation_shown(&mut self, shown: bool) {
         self.consolidation_shown = shown;
+        if !shown {
+            self.forget_consolidation_request();
+        }
         if !shown && self.transfer_preview.is_none() {
             self.transfer_revealed.clear();
         }
@@ -967,6 +1021,45 @@ impl AppState {
             }
             _ => {}
         }
+    }
+
+    /// Records a sent command (number `id`) for the consolidation preview:
+    /// the preview asked, or an unlock sent while the Consolidate area shows
+    /// a preview flow, whose end asks that preview again (the unlock
+    /// discarded the plan).
+    pub fn track_consolidation_command(&mut self, cmd: &Command, id: u64) {
+        match cmd {
+            Command::PlanConsolidation {
+                target,
+                include_orphan_files,
+            } => self.consolidation_request = Some((target.clone(), *include_orphan_files)),
+            Command::Unlock { .. } | Command::UnlockMany { .. }
+                if self.consolidation_shown && self.consolidation_request.is_some() =>
+            {
+                self.repreview_after = Some(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Ends the consolidation preview flow: no preview is asked again.
+    pub fn forget_consolidation_request(&mut self) {
+        self.consolidation_request = None;
+        self.repreview_after = None;
+        self.repreview_due = false;
+    }
+
+    /// Returns (once) the consolidation preview to ask again after an
+    /// unlock sent from it finished.
+    pub fn take_repreview(&mut self) -> Option<Command> {
+        if !std::mem::take(&mut self.repreview_due) {
+            return None;
+        }
+        let (target, include_orphan_files) = self.consolidation_request.clone()?;
+        Some(Command::PlanConsolidation {
+            target,
+            include_orphan_files,
+        })
     }
 
     /// Records a sent command for the progress modal: a destructive one
@@ -2478,5 +2571,156 @@ mod tests {
             s.pending_passphrase,
             Some(Command::DeleteSshKey { .. })
         ));
+    }
+
+    /// Failed keyrings of an unlock-many summary named `names`, all with `reason`.
+    fn failures(names: &[&str], reason: &str) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), reason.to_string()))
+            .collect()
+    }
+
+    /// The summary counts the unlocked keyrings and names at most three
+    /// failed ones; a reason they share follows in parentheses.
+    #[test]
+    fn unlock_many_summary_texts() {
+        assert_eq!(unlock_many_summary(3, &[]), "Unlocked 3 of 3 keyrings");
+        let one = failures(&["A"], "invalid password");
+        assert_eq!(
+            unlock_many_summary(2, &one),
+            "Unlocked 2 of 3 keyrings, 1 failed: A (invalid password)"
+        );
+        let five = failures(&["A", "B", "C", "D", "E"], "invalid password");
+        assert_eq!(
+            unlock_many_summary(0, &five),
+            "Unlocked 0 of 5 keyrings, 5 failed: A, B, C and 2 more (invalid password)"
+        );
+        let mixed = vec![
+            ("A".to_string(), "invalid password".to_string()),
+            ("B".to_string(), "gone".to_string()),
+        ];
+        assert_eq!(
+            unlock_many_summary(1, &mixed),
+            "Unlocked 1 of 3 keyrings, 2 failed: A, B"
+        );
+    }
+
+    /// All unlocked is a success status, some failed an info notice, none
+    /// unlocked an error.
+    #[test]
+    fn unlock_many_done_toasts() {
+        let mut s = AppState::default();
+        s.apply(Event::UnlockManyDone {
+            unlocked: 2,
+            failed: vec![],
+        });
+        assert_eq!(
+            s.drain_messages(),
+            (Some("Unlocked 2 of 2 keyrings".to_string()), vec![])
+        );
+        s.apply(Event::UnlockManyDone {
+            unlocked: 1,
+            failed: failures(&["A"], "x"),
+        });
+        assert_eq!(
+            s.drain_notices(),
+            ["Unlocked 1 of 2 keyrings, 1 failed: A (x)"]
+        );
+        assert_eq!(s.drain_messages(), (None, vec![]));
+        s.apply(Event::UnlockManyDone {
+            unlocked: 0,
+            failed: failures(&["A"], "x"),
+        });
+        assert_eq!(
+            s.drain_messages(),
+            (
+                None,
+                vec!["Unlocked 0 of 1 keyring, 1 failed: A (x)".to_string()]
+            )
+        );
+        assert!(s.drain_notices().is_empty());
+    }
+
+    /// The consolidation preview asked last.
+    fn plan(target: &str) -> Command {
+        Command::PlanConsolidation {
+            target: CollectionId(target.into()),
+            include_orphan_files: true,
+        }
+    }
+
+    /// An unlock sent from the Consolidate area after a preview re-runs
+    /// that preview once its command finished (and only then, once).
+    #[test]
+    fn unlock_from_consolidate_repreviews() {
+        let mut s = AppState::default();
+        s.set_consolidation_shown(true);
+        s.track_consolidation_command(&plan("/c/login"), 0);
+        let many = Command::UnlockMany {
+            collections: vec![CollectionId("/c/a".into())],
+            password: SecretValue::from_text("pw"),
+        };
+        s.track_consolidation_command(&many, 1);
+        s.apply(Event::CommandFinished(0));
+        assert!(s.take_repreview().is_none());
+        s.apply(Event::CommandFinished(1));
+        let Some(Command::PlanConsolidation {
+            target,
+            include_orphan_files: true,
+        }) = s.take_repreview()
+        else {
+            panic!("expected the same preview again");
+        };
+        assert_eq!(target.0, "/c/login");
+        assert!(s.take_repreview().is_none(), "only once");
+        let single = Command::Unlock {
+            collection: CollectionId("/c/a".into()),
+            password: SecretValue::from_text("pw"),
+        };
+        s.track_consolidation_command(&single, 2);
+        s.apply(Event::CommandFinished(2));
+        assert!(s.take_repreview().is_some(), "a single unlock too");
+    }
+
+    /// No re-preview outside the Consolidate area, without a preview asked,
+    /// or after the flow ended (cancel, apply, leaving the area).
+    #[test]
+    fn repreview_only_in_preview_flow() {
+        let unlock = Command::Unlock {
+            collection: CollectionId("/c/a".into()),
+            password: SecretValue::from_text("pw"),
+        };
+        let mut s = AppState::default();
+        s.track_consolidation_command(&plan("/c/login"), 0);
+        s.track_consolidation_command(&unlock, 1);
+        s.apply(Event::CommandFinished(1));
+        assert!(s.take_repreview().is_none(), "area not shown");
+        let mut s = AppState::default();
+        s.set_consolidation_shown(true);
+        s.track_consolidation_command(&unlock, 0);
+        s.apply(Event::CommandFinished(0));
+        assert!(s.take_repreview().is_none(), "no preview asked");
+        s.track_consolidation_command(&plan("/c/login"), 1);
+        s.forget_consolidation_request();
+        s.track_consolidation_command(&unlock, 2);
+        s.apply(Event::CommandFinished(2));
+        assert!(s.take_repreview().is_none(), "cancelled");
+        s.track_consolidation_command(&plan("/c/login"), 3);
+        s.apply(Event::ConsolidationDone(
+            ConsolidationReport {
+                outcomes: vec![],
+                completed: true,
+            },
+            None,
+        ));
+        s.track_consolidation_command(&unlock, 4);
+        s.apply(Event::CommandFinished(4));
+        assert!(s.take_repreview().is_none(), "applied");
+        s.track_consolidation_command(&plan("/c/login"), 5);
+        s.track_consolidation_command(&unlock, 6);
+        s.set_consolidation_shown(false);
+        s.apply(Event::CommandFinished(6));
+        assert!(s.take_repreview().is_none(), "area left");
     }
 }

@@ -77,6 +77,17 @@ pub fn secondary_button(ui: &mut Ui, text: &str, blocked: Option<&str>) -> bool 
     _gated(ui, egui::Button::new(text), blocked)
 }
 
+/// Compact hairline button for actions inside list rows and card headers.
+pub fn compact_button(ui: &mut Ui, text: &str, blocked: Option<&str>) -> bool {
+    let label = RichText::new(text).size(12.5);
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(10.0, 2.0);
+        ui.spacing_mut().interact_size.y = 24.0;
+        _gated(ui, egui::Button::new(label), blocked)
+    })
+    .inner
+}
+
 /// Small text button with a leading `+` for "add" actions inside cards.
 pub fn add_button(ui: &mut Ui, text: &str, blocked: Option<&str>) -> bool {
     let label = RichText::new(format!("+  {text}"))

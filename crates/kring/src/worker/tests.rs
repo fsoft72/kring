@@ -687,3 +687,117 @@ fn collection_of_returns_parent_path() {
         "/org/freedesktop/secrets/collection/login"
     );
 }
+
+/// Password of the locked keyrings of the unlock-many tests.
+const MANY_PW: &str = "many-pw";
+
+/// Starts a worker over `store` with `provider` and consumes the startup
+/// events; returns the temp dir (kept alive) and the handle.
+fn worker_over(
+    store: Arc<FakeStore>,
+    provider: Option<ProviderInfo>,
+) -> (tempfile::TempDir, WorkerHandle) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = WorkerConfig {
+        backups: BackupManager {
+            root: dir.path().join("b"),
+            keep: BACKUP_KEEP,
+        },
+        keyrings_dir: dir.path().join("k"),
+        pam_dir: dir.path().join("p"),
+        kwallet_dir: dir.path().join("w"),
+        ssh_dir: None,
+        ssh_agent_sock: None,
+        gnupg_home: Some(std::path::PathBuf::from(crate::worker::NO_GNUPG_HOME)),
+    };
+    let handle = spawn(Some(store), provider, config, || {});
+    // Startup with a store: Provider, Pam, Collections.
+    for _ in 0..3 {
+        next_event(&handle, Duration::from_secs(5));
+    }
+    (dir, handle)
+}
+
+/// Three locked keyrings labelled alike: two with [`MANY_PW`], one with another password.
+fn many_locked_store() -> (Arc<FakeStore>, Vec<CollectionId>) {
+    let store = Arc::new(FakeStore::new());
+    store.add_collection("login", "pw", false);
+    let ids = vec![
+        store.add_collection("Dk", MANY_PW, true),
+        store.add_collection("Dk", "other-pw", true),
+        store.add_collection("Dk", MANY_PW, true),
+    ];
+    (store, ids)
+}
+
+/// One password is tried on every keyring: a wrong one does not stop the
+/// others; UnlockManyDone (named, secret free) comes before Collections and
+/// the command ends with one CommandFinished.
+#[test]
+fn unlock_many_tries_every_keyring() {
+    let (store, ids) = many_locked_store();
+    let p = provider(ProviderKind::GnomeKeyring, true);
+    let (_dir, h) = worker_over(store, Some(p));
+    h.tx.send(Command::UnlockMany {
+        collections: ids.clone(),
+        password: SecretValue::from_text(MANY_PW),
+    })
+    .unwrap();
+    let raw = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    match raw() {
+        Event::UnlockManyDone { unlocked, failed } => {
+            assert_eq!(unlocked, 2);
+            assert_eq!(failed.len(), 1);
+            assert_eq!(failed[0].0, "Dk · Dk_2");
+            assert!(failed[0].1.contains("invalid password"), "{failed:?}");
+            let text = format!("{failed:?}");
+            assert!(!text.contains(MANY_PW) && !text.contains("other-pw"));
+        }
+        other => panic!("expected UnlockManyDone, got {other:?}"),
+    }
+    match raw() {
+        Event::Collections(list) => {
+            let locked = |id: &CollectionId| list.iter().find(|c| &c.id == id).unwrap().locked;
+            assert!(!locked(&ids[0]) && locked(&ids[1]) && !locked(&ids[2]));
+        }
+        other => panic!("expected Collections, got {other:?}"),
+    }
+    assert!(matches!(raw(), Event::CommandFinished(0)));
+    assert!(h.rx.recv_timeout(Duration::from_millis(200)).is_err());
+}
+
+/// Without the master password interface the command is refused like Unlock.
+#[test]
+fn unlock_many_gated_like_unlock() {
+    let (store, ids) = many_locked_store();
+    let p = provider(ProviderKind::GnomeKeyring, false);
+    let (_dir, h) = worker_over(store.clone(), Some(p));
+    h.tx.send(Command::UnlockMany {
+        collections: ids.clone(),
+        password: SecretValue::from_text(MANY_PW),
+    })
+    .unwrap();
+    match next_event(&h, Duration::from_secs(5)) {
+        Event::Error(m) => assert_eq!(m, MSG_UNSUPPORTED),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let list = rt.block_on(store.list_collections()).unwrap();
+    assert!(
+        list.iter()
+            .filter(|c| ids.contains(&c.id))
+            .all(|c| c.locked)
+    );
+}
+
+/// Unlocking many keyrings changes keyring data: it drops the pending plan.
+#[test]
+fn unlock_many_invalidates_plans() {
+    let cmd = Command::UnlockMany {
+        collections: vec![],
+        password: SecretValue::from_text(MANY_PW),
+    };
+    assert!(crate::worker_transfer::invalidates_plan(&cmd));
+}

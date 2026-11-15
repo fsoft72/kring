@@ -5,7 +5,7 @@ use kring_core::model::CollectionId;
 use kring_core::transfer::apply::TransferMode;
 use zeroize::Zeroizing;
 
-use crate::app_state::FileAction;
+use crate::app_state::{FileAction, count_noun};
 use crate::ui::password_field::{
     FIELD_CONFIRM, FIELD_OLD, FIELD_PASSWORD, FIELD_SECOND, FIELD_SECOND_CONFIRM, FIELD_SECRET,
     password_field,
@@ -46,6 +46,9 @@ const MSG_DELETE_NO_BACKUP: &str = "Permanent deletion: no backup will be made";
 /// Note of the wallet import dialog when the keyring is created first.
 const MSG_CREATE_THEN_IMPORT: &str = "The keyring is created and unlocked, then the import \
      continues into it.";
+/// Note of the dialog unlocking many keyrings.
+const MSG_UNLOCK_MANY: &str = "The password is tried on each keyring; \
+     those it does not open stay locked.";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -264,6 +267,17 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
             label, password, ..
         } => {
             _title(ui, &format!("Unlock \"{label}\""));
+            _password_field(ui, false, "Password", FIELD_PASSWORD, password);
+            _primary("Unlock")
+        }
+        DialogKind::UnlockMany {
+            collections,
+            password,
+        } => {
+            let title = format!("Unlock {}", count_noun(collections.len(), "keyring"));
+            _title(ui, &title);
+            _muted(ui, MSG_UNLOCK_MANY);
+            ui.add_space(4.0);
             _password_field(ui, false, "Password", FIELD_PASSWORD, password);
             _primary("Unlock")
         }

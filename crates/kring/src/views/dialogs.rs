@@ -19,7 +19,7 @@ use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_gpg::GpgDialog;
 use crate::views::dialog_remember::{
     cleared, fill_passphrases, offers_remember, passphrase_of, remember_row, remembered_row,
-    reopens_when_wrong, uses_remembered,
+    remembers_only_when_correct, reopens_when_wrong, uses_remembered,
 };
 use crate::views::dialog_ssh::SshDialog;
 use crate::views::dialog_submit::command_for;
@@ -88,6 +88,11 @@ pub enum DialogKind {
     Unlock {
         collection: CollectionId,
         label: String,
+        password: Zeroizing<String>,
+    },
+    /// Unlock several collections with one password.
+    UnlockMany {
+        collections: Vec<CollectionId>,
         password: Zeroizing<String>,
     },
     /// Create a password protected collection.
@@ -272,6 +277,14 @@ impl DialogKind {
         Self::Unlock {
             collection,
             label,
+            password: new_buffer(),
+        }
+    }
+
+    /// Dialog unlocking `collections` with one password.
+    pub fn unlock_many(collections: Vec<CollectionId>) -> Self {
+        Self::UnlockMany {
+            collections,
             password: new_buffer(),
         }
     }
@@ -626,6 +639,12 @@ impl Dialog {
     /// Returns true when a wrong password reopens this dialog.
     pub fn reopens_when_wrong(&self) -> bool {
         reopens_when_wrong(&self.kind)
+    }
+
+    /// Returns true when the passphrase to remember is kept only once its
+    /// command proves it right (see [`remembers_only_when_correct`]).
+    pub fn remembers_only_when_correct(&self) -> bool {
+        remembers_only_when_correct(&self.kind)
     }
 
     /// Returns the passphrase to remember from the sent command, when
@@ -1218,6 +1237,40 @@ mod tests {
             panic!("expected an unlock");
         };
         assert_eq!(password.as_text(), Some(""));
+    }
+
+    /// The dialog unlocking many keyrings sends one password for all of
+    /// them, offers "Remember" (kept only once one keyring unlocked) and
+    /// never uses or reopens with the remembered value.
+    #[test]
+    fn unlock_many_dialog() {
+        let ids = vec![CollectionId("/c/a".into()), CollectionId("/c/b".into())];
+        let kind = DialogKind::unlock_many(ids.clone());
+        assert!(offers_remember(&kind));
+        assert!(!uses_remembered(&kind));
+        let secret = SecretValue::from_text("kept");
+        let mut d = Dialog::with_remembered(kind, Some(&secret));
+        assert!(d.remembers_only_when_correct());
+        assert!(d.retry_kind().is_none());
+        if let DialogKind::UnlockMany { password, .. } = &mut d.kind {
+            *password = buf("typed");
+        }
+        let Ok(cmd) = d.submit() else {
+            panic!("expected a command");
+        };
+        let Command::UnlockMany {
+            collections,
+            password,
+        } = &cmd
+        else {
+            panic!("expected UnlockMany");
+        };
+        assert_eq!(collections, &ids);
+        assert_eq!(password.as_text(), Some("typed"));
+        d.remember = true;
+        assert_eq!(d.to_remember(&cmd).unwrap().as_text(), Some("typed"));
+        let one = Dialog::new(DialogKind::unlock(ids[0].clone(), "a".into()));
+        assert!(!one.remembers_only_when_correct());
     }
 
     /// A failed submit with the remembered passphrase empties the fields

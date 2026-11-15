@@ -43,6 +43,22 @@ const DIALOG_CONSOLIDATE_PREVIEW: &str = "consolidate-preview";
 const VAR_SHARED_LABELS: &str = "KRING_DEV_SHARED_LABELS";
 /// Label given to the orphans by [`VAR_SHARED_LABELS`].
 const SHARED_LABEL: &str = "Default";
+/// With value `1`, [`MANY_LOCKED_COUNT`] more locked keyrings labelled
+/// [`MANY_LOCKED_LABEL`] are created (the daemon names them
+/// `Default_keyring`, `Default_keyring_1`...), for the locked list of the
+/// consolidation preview.
+const VAR_MANY_LOCKED: &str = "KRING_DEV_MANY_LOCKED";
+/// Label of the keyrings added by [`VAR_MANY_LOCKED`].
+const MANY_LOCKED_LABEL: &str = "Default keyring";
+/// Number of keyrings added by [`VAR_MANY_LOCKED`].
+const MANY_LOCKED_COUNT: usize = 12;
+/// Password of the keyrings added by [`VAR_MANY_LOCKED`], except the last
+/// one: the app's remembered dev passphrase (`KRING_DEV_REMEMBER`), so a
+/// remembered "Unlock all" opens them.
+const MANY_LOCKED_PASSWORD: &str = "backup";
+/// Password of the last keyring added by [`VAR_MANY_LOCKED`] (so "Unlock
+/// all" with [`MANY_LOCKED_PASSWORD`] leaves one locked).
+const MANY_LOCKED_ODD_PASSWORD: &str = "odd";
 /// Attributes of the item `login` and `Work` share with different secrets.
 const GITHUB_ATTRS: [(&str, &str); 2] = [("service", "gh"), ("user", "dev")];
 /// Attributes of the item `login` and `Work` share with the same secret.
@@ -134,7 +150,31 @@ async fn _seed() -> kring_core::Result<()> {
     if _preset_is(DIALOG_CONSOLIDATE_PREVIEW) {
         backend.lock(&default_1).await?;
     }
+    if _many_locked() {
+        _seed_many_locked(&backend).await?;
+    }
     Ok(())
+}
+
+/// Creates the [`MANY_LOCKED_COUNT`] locked keyrings of [`VAR_MANY_LOCKED`].
+async fn _seed_many_locked(backend: &SecretServiceBackend) -> kring_core::Result<()> {
+    for index in 0..MANY_LOCKED_COUNT {
+        let password = if index + 1 == MANY_LOCKED_COUNT {
+            MANY_LOCKED_ODD_PASSWORD
+        } else {
+            MANY_LOCKED_PASSWORD
+        };
+        let id = backend
+            .create_with_password(MANY_LOCKED_LABEL, &SecretValue::from_text(password))
+            .await?;
+        backend.lock(&id).await?;
+    }
+    Ok(())
+}
+
+/// Returns true when the many locked keyrings are wanted (see [`VAR_MANY_LOCKED`]).
+fn _many_locked() -> bool {
+    std::env::var(VAR_MANY_LOCKED).is_ok_and(|v| v == "1")
 }
 
 /// Returns true when the orphans must share one label (see [`VAR_SHARED_LABELS`]).
@@ -207,6 +247,11 @@ async fn main() -> ExitCode {
                 DEFAULT_3.1,
                 BACKUP_PASSPHRASE
             );
+            if _many_locked() {
+                println!(
+                    "seed_dev: added {MANY_LOCKED_COUNT} locked {MANY_LOCKED_LABEL:?} keyrings (password {MANY_LOCKED_PASSWORD:?}, the last one {MANY_LOCKED_ODD_PASSWORD:?})"
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

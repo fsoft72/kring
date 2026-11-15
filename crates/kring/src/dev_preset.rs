@@ -14,6 +14,7 @@ use kring_core::transfer::apply::TransferMode;
 
 use crate::app_state::AppState;
 use crate::views::backups::{BackupView, path_exists, restore_dialog};
+use crate::views::collection::display_names;
 use crate::views::collection::{display_name, export_dialog, shown_name};
 use crate::views::consolidate::{default_target, needs_passphrases};
 use crate::views::dialog_gpg::GpgDialog;
@@ -23,6 +24,7 @@ use crate::views::file_detail::{delete_dialog, retire_dialog};
 use crate::views::file_items::displayed_file_items;
 use crate::views::gpg_detail::selected_key as selected_gpg_key;
 use crate::views::item_list::displayed_items;
+use crate::views::locked_list::locked_entries;
 use crate::views::ssh_detail::selected_key;
 use crate::views::transfer::default_choices;
 use crate::views::wallet_detail::import_dialog;
@@ -50,8 +52,9 @@ const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
 /// consolidate area `consolidate-preview` (plans a consolidation into the
 /// default target with the orphan files; with [`VAR_REVEAL`] both sides of
 /// the first conflict are revealed), `consolidate-apply` (then opens the
-/// passphrase dialog of the apply) or `consolidate-now` (then applies with
-/// the preselected choices and [`DEV_PASSPHRASE`] for every passphrase).
+/// passphrase dialog of the apply), `consolidate-now` (then applies with
+/// the preselected choices and [`DEV_PASSPHRASE`] for every passphrase) or
+/// `consolidate-unlock-all` (then clicks "Unlock all" of the locked keyrings).
 const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
 /// Area to show first: `files`, `kwallet`, `ssh`, `gpg`, `backups` or `consolidate`.
 const VAR_AREA: &str = "KRING_DEV_AREA";
@@ -111,6 +114,9 @@ const DIALOG_CONSOLIDATE_PREVIEW: &str = "consolidate-preview";
 const DIALOG_CONSOLIDATE_APPLY: &str = "consolidate-apply";
 /// Value of [`VAR_DIALOG`] applying the consolidation right away.
 const DIALOG_CONSOLIDATE_NOW: &str = "consolidate-now";
+/// Value of [`VAR_DIALOG`] unlocking every locked keyring of the preview
+/// ("Unlock all": the password dialog unless a passphrase is remembered).
+const DIALOG_CONSOLIDATE_UNLOCK_ALL: &str = "consolidate-unlock-all";
 /// Passphrase used by `consolidate-now` (same as the seeded backups).
 const DEV_PASSPHRASE: &str = "backup";
 
@@ -544,7 +550,7 @@ impl DevPreset {
     /// fires once.
     ///
     /// With `consolidate-apply` / `consolidate-now` the apply follows once
-    /// the preview arrived.
+    /// the preview arrived; with `consolidate-unlock-all` "Unlock all".
     pub fn take_consolidate_actions(&mut self, state: &AppState) -> Vec<Action> {
         if self.consolidate_follow.is_some() {
             return self._take_consolidate_follow(state);
@@ -553,6 +559,7 @@ impl DevPreset {
             DIALOG_CONSOLIDATE_PREVIEW,
             DIALOG_CONSOLIDATE_APPLY,
             DIALOG_CONSOLIDATE_NOW,
+            DIALOG_CONSOLIDATE_UNLOCK_ALL,
         ];
         if !self.dialog.as_deref().is_some_and(|d| wanted.contains(&d)) {
             return Vec::new();
@@ -570,7 +577,8 @@ impl DevPreset {
     }
 
     /// Opens the passphrase dialog or sends the apply of the consolidation
-    /// preview with its preselected choices; fires once.
+    /// preview with its preselected choices, or unlocks all its locked
+    /// keyrings; fires once.
     fn _take_consolidate_follow(&mut self, state: &AppState) -> Vec<Action> {
         let Some((plan_id, summary)) = &state.consolidation_preview else {
             return Vec::new();
@@ -578,6 +586,13 @@ impl DevPreset {
         let Some(follow) = self.consolidate_follow.take() else {
             return Vec::new();
         };
+        if follow == DIALOG_CONSOLIDATE_UNLOCK_ALL {
+            let names = display_names(&state.collections);
+            let entries = locked_entries(summary, &names);
+            return vec![Action::UnlockMany(
+                entries.into_iter().map(|(id, _)| id).collect(),
+            )];
+        }
         let choices: Vec<_> = summary
             .steps
             .iter()
@@ -983,6 +998,55 @@ mod tests {
             &reveal[..],
             [Action::RevealPreviewSecret(id)] if id.0 == "/c/w/1"
         ));
+    }
+
+    /// `consolidate-unlock-all` asks to unlock every locked keyring of the
+    /// preview once it arrived (naturally sorted, see `locked_entries`).
+    #[test]
+    fn consolidate_unlock_all_follows_preview() {
+        use crate::worker::ConsolidationSummary;
+        use kring_core::model::LOGIN_COLLECTION_PATH;
+        use kring_core::transfer::consolidate::SkipReason;
+        let login = CollectionId(LOGIN_COLLECTION_PATH.into());
+        let collections = vec![CollectionInfo {
+            id: login.clone(),
+            label: "Login".into(),
+            locked: false,
+            item_count: 1,
+            aliases: vec![],
+            is_login: true,
+            created: 0,
+            modified: 0,
+        }];
+        let locked = |p: &str| (CollectionId(p.into()), p.into(), SkipReason::Locked);
+        let summary = ConsolidationSummary {
+            target: login,
+            steps: vec![],
+            delete_empty: vec![],
+            skipped: vec![locked("d10"), locked("d9")],
+            locked_count: 2,
+            set_default: false,
+            conflict_count: 0,
+            orphan_files: vec![],
+            backup_needs_passphrase: false,
+        };
+        let mut p = DevPreset {
+            dialog: Some(DIALOG_CONSOLIDATE_UNLOCK_ALL.into()),
+            ..DevPreset::default()
+        };
+        let mut s = AppState::default();
+        s.apply(Event::Collections(collections));
+        assert_eq!(p.take_consolidate_actions(&s).len(), 1);
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 7,
+            summary,
+        });
+        let next = p.take_consolidate_actions(&s);
+        let [Action::UnlockMany(ids)] = &next[..] else {
+            panic!("expected UnlockMany");
+        };
+        let ids: Vec<_> = ids.iter().map(|id| id.0.as_str()).collect();
+        assert_eq!(ids, ["d9", "d10"]);
     }
 
     /// `consolidate-now` applies the preview once it arrived (plain

@@ -28,6 +28,7 @@ use kring_core::transfer::import::ImportReport;
 use kring_core::transfer::plan::{Choice, TransferCounts};
 use kring_core::{KringError, MasterPasswordStore, SecretStore};
 
+use crate::views::collection::{collection_key, display_names};
 use crate::worker_gpg;
 use crate::worker_offline;
 use crate::worker_ssh;
@@ -80,6 +81,12 @@ pub enum Command {
     /// Unlock a collection with its password.
     Unlock {
         collection: CollectionId,
+        password: SecretValue,
+    },
+    /// Try one password on several collections: a wrong password for one
+    /// does not stop the others (answered by [`Event::UnlockManyDone`]).
+    UnlockMany {
+        collections: Vec<CollectionId>,
         password: SecretValue,
     },
     /// Create a collection protected by a password.
@@ -328,6 +335,13 @@ pub enum Event {
         plan_id: u64,
         backup: bool,
         orphan_files: bool,
+    },
+    /// A [`Command::UnlockMany`] finished: `unlocked` keyrings were
+    /// unlocked, `failed` holds `(shown name, error message)` of the others
+    /// (no secrets). Followed by [`Event::Collections`].
+    UnlockManyDone {
+        unlocked: usize,
+        failed: Vec<(String, String)>,
     },
     /// Keyring files found in the keyrings directory.
     Files(Vec<KeyringFileInfo>),
@@ -866,7 +880,8 @@ pub(crate) fn gate<N: Fn()>(
         Command::ChangePassword { .. } => (true, true),
         Command::CreateCollection { .. }
         | Command::CreateWalletCollection { .. }
-        | Command::Unlock { .. } => (false, true),
+        | Command::Unlock { .. }
+        | Command::UnlockMany { .. } => (false, true),
         _ => (false, false),
     };
     let allowed = match provider {
@@ -1025,6 +1040,13 @@ where
             affected = Some(collection.clone());
             "Collection unlocked".into()
         }
+        Command::UnlockMany {
+            collections,
+            password,
+        } => {
+            unlock_many(out, store, collections, password).await;
+            return Ok(());
+        }
         Command::CreateCollection { label, password } => {
             store.create_with_password(label, password).await?;
             "Collection created".into()
@@ -1106,6 +1128,40 @@ where
     }
     out.emit(Event::Done(done));
     Ok(())
+}
+
+/// Tries `password` on every collection of `collections`, then emits
+/// [`Event::UnlockManyDone`] (failures named as the UI shows them, see
+/// [`display_names`]) and the refreshed collections.
+async fn unlock_many<S, N>(
+    out: &Emitter<N>,
+    store: &S,
+    collections: &[CollectionId],
+    password: &SecretValue,
+) where
+    S: SecretStore + MasterPasswordStore,
+    N: Fn(),
+{
+    // Names only: a listing failure falls back to the object path name and
+    // is reported by the refresh below.
+    let names = store
+        .list_collections()
+        .await
+        .map(|list| display_names(&list))
+        .unwrap_or_default();
+    let mut unlocked = 0;
+    let mut failed = Vec::new();
+    for id in collections {
+        match store.unlock_with_password(id, password).await {
+            Ok(()) => unlocked += 1,
+            Err(e) => {
+                let name = names.get(id).cloned().unwrap_or_else(|| collection_key(id));
+                failed.push((name, e.to_string()));
+            }
+        }
+    }
+    out.emit(Event::UnlockManyDone { unlocked, failed });
+    refresh(out, store).await;
 }
 
 /// Receives the next event of `handle` other than [`Event::CommandFinished`]
