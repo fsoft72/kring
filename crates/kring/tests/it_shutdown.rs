@@ -43,6 +43,8 @@ fn worker_shuts_down_without_panic() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = WorkerConfig::default_paths();
     config.backups.root = dir.path().join("backups");
+    config.ssh_dir = None;
+    config.ssh_agent_sock = None;
     let WorkerHandle { tx, rx } = worker::spawn(connected.store, connected.provider, config, || {});
 
     // Wait until the worker has started and listed the collections.

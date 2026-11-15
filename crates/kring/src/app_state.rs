@@ -532,6 +532,11 @@ impl AppState {
 
     /// Replaces the SSH key list, deselecting a key that no longer exists.
     fn _set_ssh_keys(&mut self, keys: Vec<SshKeyInfo>) {
+        let old_fingerprint = self
+            .selected_ssh_key
+            .as_ref()
+            .and_then(|s| self.ssh_keys.iter().find(|k| &k.name == s))
+            .map(|k| k.fingerprint.clone());
         self.ssh_keys = keys;
         let exists = self
             .selected_ssh_key
@@ -539,6 +544,17 @@ impl AppState {
             .is_some_and(|s| self.ssh_keys.iter().any(|k| &k.name == s));
         if !exists {
             self.selected_ssh_key = None;
+            self.ssh_public_key = None;
+            return;
+        }
+        // The key was replaced (same name, new fingerprint): the cached public
+        // key text is stale, so drop it and let the view request it again.
+        let new_fingerprint = self
+            .selected_ssh_key
+            .as_ref()
+            .and_then(|s| self.ssh_keys.iter().find(|k| &k.name == s))
+            .map(|k| k.fingerprint.clone());
+        if old_fingerprint != new_fingerprint {
             self.ssh_public_key = None;
         }
     }
@@ -2240,6 +2256,15 @@ mod tests {
         s.apply(Event::SshKeys(vec![ssh_key("a", "SHA256:a")]));
         assert_eq!(s.selected_ssh_key.as_deref(), Some("a"));
         assert!(s.ssh_public_key.is_some());
+        s.apply(Event::SshKeys(vec![ssh_key("a", "SHA256:changed")]));
+        assert!(
+            s.ssh_public_key.is_none(),
+            "dropped when the fingerprint changed"
+        );
+        s.apply(Event::SshPublicKey {
+            name: "a".into(),
+            text: "ssh-ed25519 AAAA a".into(),
+        });
         s.select_ssh_key("b".into());
         assert!(s.ssh_public_key.is_none(), "dropped on selection change");
         s.apply(Event::SshKeys(vec![ssh_key("a", "SHA256:a")]));

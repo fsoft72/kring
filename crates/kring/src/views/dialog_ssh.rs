@@ -218,6 +218,11 @@ pub enum SshDialog {
         passphrase: Zeroizing<String>,
         confirm: Zeroizing<String>,
     },
+    /// Confirm removing every identity from the ssh-agent.
+    RemoveAllAgent {
+        /// Identities currently held by the agent.
+        count: usize,
+    },
 }
 
 impl SshDialog {
@@ -294,6 +299,18 @@ impl SshDialog {
         }
     }
 
+    /// Confirmation of "Remove all" for an agent holding `count` identities.
+    pub fn remove_all_agent(count: usize) -> Self {
+        Self::RemoveAllAgent { count }
+    }
+
+    /// Returns the one-line question of the "Remove all" confirmation.
+    pub fn remove_all_text(count: usize) -> String {
+        format!(
+            "Remove all {count} identities from the ssh-agent? This includes keys not added by kring."
+        )
+    }
+
     /// Returns true when the dialog shows a passphrase field whose value
     /// may be remembered for the session (key or backup passphrase; never
     /// a new key passphrase).
@@ -310,7 +327,7 @@ impl SshDialog {
                 needs_backup_passphrase,
                 ..
             } => *needs_backup_passphrase,
-            Self::Generate { .. } | Self::Import { .. } => false,
+            Self::Generate { .. } | Self::Import { .. } | Self::RemoveAllAgent { .. } => false,
         }
     }
 
@@ -353,7 +370,7 @@ impl SshDialog {
                 _set(passphrase, text);
                 _set(confirm, text);
             }
-            Self::Generate { .. } | Self::Import { .. } => {}
+            Self::Generate { .. } | Self::Import { .. } | Self::RemoveAllAgent { .. } => {}
         }
     }
 
@@ -370,7 +387,7 @@ impl SshDialog {
                 confirm,
                 ..
             } => vec![passphrase, confirm],
-            Self::Import { .. } => vec![],
+            Self::Import { .. } | Self::RemoveAllAgent { .. } => vec![],
             Self::AgentAdd { passphrase, .. } => vec![passphrase],
             Self::Export {
                 passphrase,
@@ -522,6 +539,7 @@ impl SshDialog {
                     false => None,
                 },
             },
+            Self::RemoveAllAgent { .. } => Command::AgentRemoveAll,
         };
         Ok(cmd)
     }
@@ -696,6 +714,11 @@ impl SshDialog {
                     _muted(ui, "A backup is created first.");
                 }
                 _main("Delete", true)
+            }
+            Self::RemoveAllAgent { count } => {
+                _title(ui, "Remove all identities");
+                _text(ui, &Self::remove_all_text(*count));
+                _main("Remove all", true)
             }
         }
     }

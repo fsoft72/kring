@@ -203,11 +203,8 @@ pub fn passphrase_of(cmd: &Command) -> Option<&SecretValue> {
         Command::AgentAdd { passphrase, .. } | Command::ExportSshPrivate { passphrase, .. } => {
             passphrase.as_ref()
         }
-        Command::ChangeSshPassphrase {
-            old,
-            backup_passphrase,
-            ..
-        } => old.as_ref().or(backup_passphrase.as_ref()),
+        // Nothing is remembered for ChangeSshPassphrase: the old passphrase no
+        // longer opens the key after success and the backup one is single use.
         Command::DeleteSshKey {
             backup_passphrase, ..
         } => backup_passphrase.as_ref(),
@@ -331,7 +328,11 @@ mod tests {
             assert!(uses_remembered(&kind) && reopens_when_wrong(&kind));
             fill_passphrases(&mut kind, &SecretValue::from_text(PASS));
             let cmd = command_for(&kind).unwrap();
-            assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+            if matches!(cmd, Command::ChangeSshPassphrase { .. }) {
+                assert!(passphrase_of(&cmd).is_none());
+            } else {
+                assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+            }
             assert!(command_for(&cleared(&kind)).is_err(), "fields emptied");
         }
         assert!(!reopens_when_wrong(&DialogKind::retire_file(
@@ -431,9 +432,21 @@ mod tests {
                 _set(confirm, "new-key-pass");
             }
             let cmd = command_for(&kind).unwrap();
-            assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+            if matches!(cmd, Command::ChangeSshPassphrase { .. }) {
+                assert!(passphrase_of(&cmd).is_none(), "nothing remembered");
+            } else {
+                assert_eq!(passphrase_of(&cmd).unwrap().as_text(), Some(PASS));
+            }
             assert!(command_for(&cleared(&kind)).is_err(), "fields emptied");
         }
+        let change = Command::ChangeSshPassphrase {
+            name: "k".into(),
+            old: Some(SecretValue::from_text(PASS)),
+            new: None,
+            allow_unencrypted: true,
+            backup_passphrase: Some(SecretValue::from_text(PASS)),
+        };
+        assert!(passphrase_of(&change).is_none(), "nothing remembered");
         let mut export = SshDialog::export(&encrypted);
         if let SshDialog::Export { reencrypt, .. } = &mut export {
             *reencrypt = true;

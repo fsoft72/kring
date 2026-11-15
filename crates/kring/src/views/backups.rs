@@ -38,6 +38,11 @@ const MSG_NOTHING_SELECTED: &str = "Select at least one file";
 /// Explanation under the backup header.
 const MSG_RESTORE_NOTE: &str = "Restoring overwrites the keyring files with these copies. The \
      current versions are backed up first. gnome-keyring loads them after a restart.";
+/// Explanation under the header of a backup holding SSH key files.
+const MSG_SSH_NOTE: &str = "These are copies of SSH key files. kring cannot restore them: \
+     copy them back by hand (see the README, section SSH keys).";
+/// Tooltip of `Restore selected` when a selected file is not a keyring file.
+const MSG_SSH_BY_HAND: &str = "SSH key backups are restored by hand: see README";
 
 /// Returns a readable reason, e.g. `delete-item` -> `Before deleting an item`.
 pub fn humanize_reason(reason: &str) -> String {
@@ -46,6 +51,8 @@ pub fn humanize_reason(reason: &str) -> String {
         "delete-collection" => Some("Before deleting a keyring"),
         "retire-plaintext" => Some("Before retiring a plaintext file"),
         "pre-restore" => Some("Before a restore"),
+        "delete-ssh-key" => Some("Before deleting an SSH key"),
+        "change-ssh-passphrase" => Some("Before changing an SSH key passphrase"),
         _ => None,
     };
     if let Some(text) = known {
@@ -65,6 +72,25 @@ pub fn file_name(file: &BackupFile) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| file.original.display().to_string())
+}
+
+/// Returns true when the core can restore `file`: a `*.keyring` file or `default`.
+pub fn is_restorable(file: &BackupFile) -> bool {
+    let name = file_name(file);
+    name == "default" || name.ends_with(".keyring")
+}
+
+/// Returns true when any of `files` cannot be restored by kring (SSH keys).
+pub fn has_unrestorable(files: &[&BackupFile]) -> bool {
+    files.iter().any(|f| !is_restorable(f))
+}
+
+/// Returns the restore note matching the content of `info`.
+pub fn restore_note(info: &BackupInfo) -> &'static str {
+    if info.files.iter().any(|f| !is_restorable(f)) {
+        return MSG_SSH_NOTE;
+    }
+    MSG_RESTORE_NOTE
 }
 
 /// Returns the total size on disk of the stored copies (missing files count 0).
@@ -376,7 +402,9 @@ pub fn detail(
         ui.add(egui::Label::new(semibold(humanize_reason(&info.reason), 22.0)).truncate());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let busy = state.operation_open().then_some(MSG_OPERATION_RUNNING);
-            let blocked = busy.or(checked.is_empty().then_some(MSG_NOTHING_SELECTED));
+            let blocked = busy
+                .or(checked.is_empty().then_some(MSG_NOTHING_SELECTED))
+                .or(has_unrestorable(&checked).then_some(MSG_SSH_BY_HAND));
             if danger_button(ui, "Restore selected", blocked) {
                 let kind = restore_dialog(info, &checked, &state.files, keyrings_dir, path_exists);
                 action = Some(Action::Open(kind));
@@ -398,7 +426,7 @@ pub fn detail(
     ui.add_space(4.0);
     accent_card(ui, theme::SECONDARY, |ui| {
         ui.label(
-            RichText::new(MSG_RESTORE_NOTE)
+            RichText::new(restore_note(info))
                 .color(theme::MUTED)
                 .size(12.5),
         );
@@ -475,6 +503,14 @@ mod tests {
             "Before retiring a plaintext file"
         );
         assert_eq!(humanize_reason("pre-restore"), "Before a restore");
+        assert_eq!(
+            humanize_reason("delete-ssh-key"),
+            "Before deleting an SSH key"
+        );
+        assert_eq!(
+            humanize_reason("change-ssh-passphrase"),
+            "Before changing an SSH key passphrase"
+        );
         assert_eq!(humanize_reason("manual-copy"), "Manual copy");
         assert_eq!(humanize_reason(""), "Backup");
     }
@@ -613,5 +649,23 @@ mod tests {
         view.sync(&state);
         assert!(view.selected.is_none());
         assert_eq!(view.size_of(Path::new("/b/2")), 0);
+    }
+
+    /// Only `*.keyring` and `default` files are restorable; SSH keys block the restore.
+    #[test]
+    fn ssh_files_are_not_restorable() {
+        let s = Path::new("/s");
+        let kr = bfile("/k/login.keyring", s, false);
+        let def = bfile("/k/default", s, false);
+        let ssh = bfile("/home/u/.ssh/id_ed25519", s, false);
+        let pubk = bfile("/home/u/.ssh/id_ed25519.pub", s, false);
+        assert!(is_restorable(&kr) && is_restorable(&def));
+        assert!(!is_restorable(&ssh) && !is_restorable(&pubk));
+        assert!(!has_unrestorable(&[&kr, &def]));
+        assert!(has_unrestorable(&[&kr, &ssh]));
+        let ssh_backup = backup("/b/1", vec![ssh.clone(), pubk]);
+        assert!(!restore_note(&ssh_backup).contains("gnome-keyring"));
+        let kr_backup = backup("/b/2", vec![kr]);
+        assert!(restore_note(&kr_backup).contains("gnome-keyring"));
     }
 }

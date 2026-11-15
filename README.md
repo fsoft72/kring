@@ -133,6 +133,19 @@ clear in a backup: deleting it, or changing its passphrase, asks for a backup
 passphrase in the same dialog and the copy is age-encrypted (a remembered
 passphrase fills it). Encrypted keys and public keys are copied as they are.
 
+The Restore button of the Backups area is disabled for SSH key backups: kring
+restores only keyring files, so an SSH key is recovered by hand from the backup
+directory (`$XDG_DATA_HOME/kring/backups/<date>-delete-ssh-key` or
+`...-change-ssh-passphrase`; the manifest there lists the original paths). Stop
+using the key you replace first, and do not overwrite a key you still need.
+
+- **Encrypted private key** (stored as is, under its own name): copy it back and
+  restrict it: `cp <backup>/id_ed25519 ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519`.
+- **Unencrypted private key** (stored as `<name>.age`, encrypted with the backup
+  passphrase): `age -d -o ~/.ssh/<name> <backup>/<name>.age`, then
+  `chmod 600 ~/.ssh/<name>`.
+- **Public key** (`<name>.pub`, stored as is): copy it back and `chmod 644 ~/.ssh/<name>.pub`.
+
 Legacy PEM keys are read only: they can be listed, copied (public key) and
 deleted. Convert one with `ssh-keygen -p -f <file>` (it rewrites it in the
 OpenSSH format) to manage it in kring.

@@ -52,6 +52,8 @@ fn delete_collection_backs_up_its_keyring_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = WorkerConfig::default_paths();
     config.backups.root = dir.path().join("backups");
+    config.ssh_dir = None;
+    config.ssh_agent_sock = None;
     let keyrings = config.keyrings_dir.clone();
     let handle = worker::spawn(connected.store, connected.provider, config, || {});
     handle

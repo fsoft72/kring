@@ -266,7 +266,9 @@ fn _agent(ui: &mut Ui, state: &AppState) -> Option<Action> {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if secondary_button(ui, "Remove all", remove_all_blocked(state)) {
-                    action = Some(Action::Send(Command::AgentRemoveAll));
+                    let count = state.agent_identities.len();
+                    let dialog = SshDialog::remove_all_agent(count);
+                    action = Some(Action::Open(DialogKind::Ssh(dialog)));
                 }
                 if ico_button(ui, Ico::Refresh, "List the agent again", None, false) {
                     action = Some(Action::Send(Command::AgentList));

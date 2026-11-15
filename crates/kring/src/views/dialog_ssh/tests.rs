@@ -391,3 +391,15 @@ fn lifetime_labels() {
     assert_eq!(lifetime_label(Some(3600)), "1 hour");
     assert_eq!(lifetime_label(Some(42)), "42 s");
 }
+
+/// "Remove all" asks a one-line confirmation and sends AgentRemoveAll.
+#[test]
+fn remove_all_agent_confirmation() {
+    let dialog = SshDialog::remove_all_agent(3);
+    assert_eq!(
+        SshDialog::remove_all_text(3),
+        "Remove all 3 identities from the ssh-agent? This includes keys not added by kring."
+    );
+    assert!(!dialog.asks_passphrase() && !dialog.reopens_when_wrong());
+    assert!(matches!(dialog.command_for(), Ok(Command::AgentRemoveAll)));
+}

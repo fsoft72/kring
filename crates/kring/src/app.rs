@@ -150,7 +150,12 @@ impl KringApp {
                     if matches!(event, Event::ConsolidationDone(..)) {
                         self.consolidate_view.forget_passphrases();
                     }
+                    let is_scan = matches!(event, Event::SshKeys(_));
+                    let had_public = self.state.ssh_public_key.is_some();
                     self.state.apply(event);
+                    if is_scan && had_public && self.state.ssh_public_key.is_none() {
+                        self._reread_ssh_public_key();
+                    }
                     if let Some(follow) = follow {
                         self._follow_up(follow);
                     }
@@ -164,6 +169,23 @@ impl KringApp {
                     break;
                 }
             }
+        }
+    }
+
+    /// Requests the public key of the selected SSH key again (a rescan found
+    /// it changed and dropped the cached text).
+    fn _reread_ssh_public_key(&mut self) {
+        let Some(name) = self.state.selected_ssh_key.clone() else {
+            return;
+        };
+        let cmd = self
+            .state
+            .ssh_keys
+            .iter()
+            .find(|k| k.name == name)
+            .and_then(ssh_detail::select_command);
+        if let Some(cmd) = cmd {
+            self._send(cmd);
         }
     }
 
