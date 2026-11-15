@@ -38,6 +38,17 @@ fn fixture(provider: Option<ProviderInfo>) -> Fixture {
 
 /// Starts a worker over a FakeStore with one unlocked collection `label`, keeping `keep` backups.
 fn fixture_with(provider: Option<ProviderInfo>, label: &str, keep: usize) -> Fixture {
+    fixture_locked(provider, label, keep, false)
+}
+
+/// Starts a worker over a FakeStore with one collection `label` (locked
+/// when `locked`), keeping `keep` backups.
+fn fixture_locked(
+    provider: Option<ProviderInfo>,
+    label: &str,
+    keep: usize,
+    locked: bool,
+) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let keyrings = dir.path().join("keyrings");
     let backups = dir.path().join("backups");
@@ -46,7 +57,7 @@ fn fixture_with(provider: Option<ProviderInfo>, label: &str, keep: usize) -> Fix
         std::fs::create_dir_all(d).unwrap();
     }
     let store = FakeStore::new();
-    let collection = store.add_collection(label, "pw", false);
+    let collection = store.add_collection(label, "pw", locked);
     let config = WorkerConfig {
         backups: BackupManager {
             root: backups.clone(),
@@ -458,12 +469,15 @@ fn backup_failure_aborts_delete() {
     }
 }
 
-/// Deleting a collection backs up first, then removes it.
+/// Deleting a collection holding items backs up first, then removes it.
+/// The item is added right before the delete: the worker decides from a
+/// fresh listing, never from what the UI saw.
 #[test]
 fn delete_collection_creates_backup_first() {
     let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
     write_binary_keyring(&f.keyrings, MAIN);
     f.skip_startup();
+    f.create_item();
     f.send(Command::DeleteCollection {
         collection: f.collection.clone(),
         backup_passphrase: None,
@@ -481,6 +495,55 @@ fn delete_collection_creates_backup_first() {
         "Collection deleted, backup in {}",
         info.dir.display()
     ));
+}
+
+/// Asserts the events of deleting the empty collection `Main` without a
+/// backup: BackupSkipped, the refreshed (empty) list, then Done.
+fn expect_empty_delete(f: &Fixture) {
+    match f.next() {
+        Event::BackupSkipped { reason } => assert_eq!(reason, BACKUP_SKIPPED_EMPTY),
+        other => panic!("expected BackupSkipped, got {other:?}"),
+    }
+    match f.next() {
+        Event::Collections(list) => assert!(list.is_empty()),
+        other => panic!("expected Collections, got {other:?}"),
+    }
+    f.expect_done("Main deleted (empty, no backup needed)");
+    assert!(!f.backups.exists());
+}
+
+/// An empty collection is deleted without a backup, even when the backup
+/// would need a passphrase (a plaintext keyring in the set).
+#[test]
+fn delete_empty_collection_skips_backup() {
+    let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+    write_binary_keyring(&f.keyrings, MAIN);
+    std::fs::write(
+        f.keyrings.join("old.keyring"),
+        "[keyring]\ndisplay-name=x\n",
+    )
+    .unwrap();
+    f.skip_startup();
+    f.send(Command::DeleteCollection {
+        collection: f.collection.clone(),
+        backup_passphrase: None,
+    });
+    expect_empty_delete(&f);
+}
+
+/// A locked empty collection (gnome-keyring reports its item count) is
+/// deleted without a backup too.
+#[test]
+fn delete_locked_empty_collection_skips_backup() {
+    let gk = Some(provider(ProviderKind::GnomeKeyring, true));
+    let f = fixture_locked(gk, MAIN, BACKUP_KEEP, true);
+    write_binary_keyring(&f.keyrings, MAIN);
+    f.skip_startup();
+    f.send(Command::DeleteCollection {
+        collection: f.collection.clone(),
+        backup_passphrase: None,
+    });
+    expect_empty_delete(&f);
 }
 
 /// Resending the delete with a passphrase succeeds after PassphraseNeeded.

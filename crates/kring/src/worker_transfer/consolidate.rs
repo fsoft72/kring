@@ -1,9 +1,9 @@
 //! Consolidation handlers: snapshots, preview, apply with progress and the
-//! batch retire of empty plaintext orphan files.
+//! batch retire of empty plaintext orphan files (no backup needed).
 
 use std::io::Read;
 
-use kring_core::backup::{KEYRING_MAGIC, is_plaintext_keyring, keyring_backup_set};
+use kring_core::backup::{KEYRING_MAGIC, is_plaintext_keyring};
 use kring_core::keyring_file::{
     KeyringFileInfo, KeyringFormat, RetireBatchReport, RetireMode, retire_files_batch, retire_mode,
     scan_dir,
@@ -21,7 +21,8 @@ use super::{
     StepSummary, conflict_view, invalid,
 };
 use crate::worker::{
-    BackupStep, CHANGE_WORDING, Event, WorkerConfig, backup_collections, load_items, refresh,
+    BackupScope, BackupStep, CHANGE_WORDING, Event, WorkerConfig, backup_files, create_backup,
+    load_items, refresh,
 };
 use crate::worker_offline::emit_backup;
 
@@ -80,11 +81,8 @@ where
     } else {
         Vec::new()
     };
-    let summary = summarize(
-        &plan,
-        orphan_files.clone(),
-        backup_needs_passphrase(ctx.config),
-    );
+    let backup_passphrase = backup_needs_passphrase(ctx.config, &plan);
+    let summary = summarize(&plan, orphan_files.clone(), backup_passphrase);
     let plan_id = plans.put(PendingPlan::Consolidation { plan, orphan_files });
     ctx.out
         .emit(Event::ConsolidationPreview { plan_id, summary });
@@ -136,7 +134,8 @@ fn summarize(
 pub(super) struct Passphrases<'a> {
     /// For the backup of the keyring set.
     pub(super) backup: Option<&'a SecretValue>,
-    /// For the encrypted backup of the retired orphan files.
+    /// For the encrypted backup of orphan files that got items since the
+    /// scan (none in practice: the candidates are empty on a fresh scan).
     pub(super) orphan_files: Option<&'a SecretValue>,
 }
 
@@ -145,10 +144,12 @@ pub(super) struct Passphrases<'a> {
 /// echoing the command).
 ///
 /// Order: write gate, choices shape, orphan file candidates (fresh scan,
-/// limited to the previewed names; their passphrase is required when any
-/// remain), ONE backup covering the target, every move source and every
-/// empty collection to delete (fail closed), the core apply with progress
-/// events, then (only when every step completed) the batch retire of the
+/// limited to the previewed names; empty files, so they need no backup nor
+/// passphrase), ONE backup covering the target and every move source (fail
+/// closed; the empty collections to delete hold no secrets and are left
+/// out, and without any move no backup is taken), the core apply with
+/// progress events (it re-checks every empty collection before deleting
+/// it), then (only when every step completed) the batch retire of the
 /// orphan files.
 pub(super) async fn apply_consolidate<S, N>(
     ctx: &Ctx<'_, S, N>,
@@ -183,22 +184,22 @@ where
             .filter(|f| orphan_files.contains(&f.name))
             .collect()
     };
-    if !candidates.is_empty() && passes.orphan_files.is_none() {
-        let backup = passes.backup.is_none() && backup_needs_passphrase(ctx.config);
-        ctx.out.emit(Event::ApplyPassphrasesNeeded {
-            plan_id,
-            backup,
-            orphan_files: true,
-        });
-        return Ok(true);
-    }
-    let mut names = vec![plan.target.clone()];
-    names.extend(plan.moves.iter().map(|m| m.source.clone()));
-    names.extend(plan.delete_empty.iter().map(|(id, _)| id.clone()));
-    let step = backup_collections(
+    let files = match backup_files(
+        ctx.config,
+        &backed_up_collections(plan),
+        BackupScope::NamedOnly,
+        &CHANGE_WORDING,
+    ) {
+        Ok(files) => files,
+        Err(message) => {
+            ctx.out.error(message);
+            return Ok(false);
+        }
+    };
+    let step = create_backup(
         ctx.out,
         ctx.config,
-        &names,
+        &files,
         REASON_CONSOLIDATE,
         passes.backup,
         None,
@@ -220,9 +221,9 @@ where
         ctx.out.emit(Event::ConsolidationProgress { done, total });
     };
     let report = apply_consolidation(ctx.store, plan, choices, &mut progress).await?;
-    let retired = match (report.completed, passes.orphan_files) {
-        (true, Some(pass)) if !candidates.is_empty() => {
-            retire_orphans(ctx, &candidates, pass).await
+    let retired = match report.completed {
+        true if !candidates.is_empty() => {
+            retire_orphans(ctx, &candidates, passes.orphan_files).await
         }
         _ => None,
     };
@@ -239,11 +240,26 @@ where
     Ok(false)
 }
 
-/// Returns true when the keyring backup set holds a plaintext keyring, so a
-/// backup needs a passphrase. Reads only the magic of each file; an
-/// unreadable set or file counts as needing one (the backup reports the error).
-fn backup_needs_passphrase(config: &WorkerConfig) -> bool {
-    let Ok(files) = keyring_backup_set(&config.keyrings_dir) else {
+/// Returns the collections whose keyring files the consolidation backup
+/// holds: the target and every move source, or none without any move (the
+/// empty collections to delete hold no secrets).
+fn backed_up_collections(plan: &ConsolidationPlan) -> Vec<CollectionId> {
+    if plan.moves.is_empty() {
+        return Vec::new();
+    }
+    let mut names = vec![plan.target.clone()];
+    names.extend(plan.moves.iter().map(|m| m.source.clone()));
+    names
+}
+
+/// Returns true when the consolidation backup of `plan` holds a plaintext
+/// keyring, so it needs a passphrase. Reads only the magic of each file; a
+/// set that cannot be built or an unreadable file counts as needing one
+/// (the apply reports the error).
+fn backup_needs_passphrase(config: &WorkerConfig, plan: &ConsolidationPlan) -> bool {
+    let collections = backed_up_collections(plan);
+    let scope = BackupScope::NamedOnly;
+    let Ok(files) = backup_files(config, &collections, scope, &CHANGE_WORDING) else {
         return true;
     };
     files
@@ -259,11 +275,13 @@ fn backup_needs_passphrase(config: &WorkerConfig) -> bool {
         })
 }
 
-/// Retires the orphan files in one encrypted backup; reports a failure as an error.
+/// Retires the orphan files: the empty ones without a backup, any that
+/// got items since the scan into one encrypted backup with `passphrase`
+/// (kept without one); reports a failure as an error.
 async fn retire_orphans<S, N>(
     ctx: &Ctx<'_, S, N>,
     candidates: &[KeyringFileInfo],
-    passphrase: &SecretValue,
+    passphrase: Option<&SecretValue>,
 ) -> Option<RetireBatchReport>
 where
     S: SecretStore,

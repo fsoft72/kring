@@ -5,6 +5,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use super::empty::{is_empty_textual, unlink_if_empty};
 use super::scan::{KeyringFileInfo, KeyringFormat, detect_format};
 use crate::backup::{BackupInfo, BackupManager, io_err};
 use crate::error::{KringError, Result};
@@ -12,6 +13,9 @@ use crate::model::{CollectionId, CollectionInfo, SecretValue, decode_path_segmen
 
 /// Reason recorded on the backup made before a plaintext file is retired.
 const RETIRE_REASON: &str = "retire-plaintext";
+/// Reason a batch keeps a file holding items when no backup passphrase was given.
+pub const MSG_BATCH_NEEDS_PASSPHRASE: &str =
+    "Holds items: kept, a backup passphrase is needed to retire it";
 /// Message for a file that no longer matches the scan.
 const STALE_MESSAGE: &str = "File changed since scan, rescan first";
 /// Extension of keyring files.
@@ -59,7 +63,7 @@ pub fn retire_file(
     live: &[CollectionInfo],
     passphrase: &SecretValue,
 ) -> Result<BackupInfo> {
-    let digest = precheck(info, keyrings_dir, live)?;
+    let (digest, _) = precheck(info, keyrings_dir, live)?;
     let backup = manager.create(
         RETIRE_REASON,
         std::slice::from_ref(&info.path),
@@ -71,7 +75,8 @@ pub fn retire_file(
     Ok(backup)
 }
 
-/// Runs the checks shared by single and batch retire and returns the sha256 of the file.
+/// Runs the checks shared by single and batch retire and returns the sha256
+/// of the file with whether its bytes are an empty textual keyring.
 ///
 /// Order: not live, plaintext flag, location, unchanged since scan, then the
 /// bytes on disk must not be a binary keyring (decided from the bytes).
@@ -79,7 +84,7 @@ fn precheck(
     info: &KeyringFileInfo,
     keyrings_dir: &Path,
     live: &[CollectionInfo],
-) -> Result<String> {
+) -> Result<(String, bool)> {
     if retire_mode(info, live) != RetireMode::DeleteFile {
         return Err(invalid(
             "Keyring is live in the daemon, delete the collection instead",
@@ -94,31 +99,39 @@ fn precheck(
     if detect_format(&bytes) == KeyringFormat::BinaryV0 {
         return Err(invalid("Binary keyring files cannot be retired"));
     }
-    Ok(hex::encode(Sha256::digest(bytes.as_slice())))
+    let digest = hex::encode(Sha256::digest(bytes.as_slice()));
+    Ok((digest, is_empty_textual(&bytes)))
 }
 
 /// Outcome of [`retire_files_batch`].
 #[derive(Clone, Debug)]
 pub struct RetireBatchReport {
-    /// The single backup holding every file that passed the pre-checks.
+    /// The single backup holding every file with items that passed the pre-checks.
     ///
-    /// `None` when no file passed them (no backup is created then).
+    /// `None` when no such file passed them (no backup is created then).
     pub backup: Option<BackupInfo>,
-    /// Names (`KeyringFileInfo::name`) of the files that were backed up and removed.
+    /// Names (`KeyringFileInfo::name`) of the files that were removed, in input order.
     pub removed: Vec<String>,
+    /// Names of the removed files that were empty and removed without a backup
+    /// (a subset of `removed`).
+    pub without_backup: Vec<String>,
     /// Names of the files that were kept, each with the reason.
     pub kept: Vec<(String, String)>,
 }
 
-/// Retires many plaintext keyring files with ONE encrypted backup.
+/// Retires many plaintext keyring files with at most ONE encrypted backup.
 ///
 /// Every file goes through the same pre-checks as [`retire_file`]; a file
-/// failing them is listed in `kept` and excluded. The remaining files are
-/// backed up together, then each is verified in the manifest (encrypted and
-/// sha256) and unlinked after a final unchanged check; a file failing either
-/// step is kept and listed, the others proceed. A backup failure is returned
-/// as an error and nothing is removed. Entries are de-duplicated by path
-/// (the first one wins).
+/// failing them is listed in `kept` and excluded. Files whose bytes are an
+/// empty textual keyring hold no secrets: they are removed without a backup
+/// after their bytes are parsed again right before the unlink (a file that
+/// got items is kept, fail closed). The files holding items are backed up
+/// together (encrypted with `passphrase`; without one they are kept with
+/// [`MSG_BATCH_NEEDS_PASSPHRASE`]), then each is verified in the manifest
+/// (encrypted and sha256) and unlinked after a final unchanged check; a file
+/// failing either step is kept and listed, the others proceed. A backup
+/// failure is returned as an error and nothing is removed. Entries are
+/// de-duplicated by path (the first one wins).
 ///
 /// # Errors
 ///
@@ -128,12 +141,13 @@ pub fn retire_files_batch(
     infos: &[KeyringFileInfo],
     keyrings_dir: &Path,
     live: &[CollectionInfo],
-    passphrase: &SecretValue,
+    passphrase: Option<&SecretValue>,
 ) -> Result<RetireBatchReport> {
     if infos.is_empty() {
         return Err(invalid("No files to retire"));
     }
     let mut kept = Vec::new();
+    let mut empty: Vec<&KeyringFileInfo> = Vec::new();
     let mut accepted: Vec<(&KeyringFileInfo, String)> = Vec::new();
     for (index, info) in infos.iter().enumerate() {
         // The same path listed twice is retired once: the first entry wins.
@@ -144,32 +158,54 @@ pub fn retire_files_batch(
             continue;
         }
         match precheck(info, keyrings_dir, live) {
-            Ok(digest) => accepted.push((info, digest)),
+            Ok((_, true)) => empty.push(info),
+            Ok((_, false)) if passphrase.is_none() => {
+                kept.push((info.name.clone(), MSG_BATCH_NEEDS_PASSPHRASE.to_string()));
+            }
+            Ok((digest, false)) => accepted.push((info, digest)),
             Err(e) => kept.push((info.name.clone(), e.to_string())),
         }
     }
-    if accepted.is_empty() {
-        return Ok(RetireBatchReport {
-            backup: None,
-            removed: Vec::new(),
-            kept,
-        });
-    }
-    let paths: Vec<_> = accepted.iter().map(|(i, _)| i.path.clone()).collect();
-    let backup = manager.create(RETIRE_REASON, &paths, Some(passphrase))?;
-    let mut removed = Vec::new();
-    for (info, digest) in accepted {
-        let outcome = verify_backup(&backup, &info.path, &digest)
-            .and_then(|()| check_unchanged(info))
-            .and_then(|()| std::fs::remove_file(&info.path).map_err(|e| io_err(&info.path, e)));
-        match outcome {
-            Ok(()) => removed.push(info.name.clone()),
+    let backup = match (accepted.is_empty(), passphrase) {
+        (false, Some(pass)) => {
+            let paths: Vec<_> = accepted.iter().map(|(i, _)| i.path.clone()).collect();
+            Some(manager.create(RETIRE_REASON, &paths, Some(pass))?)
+        }
+        _ => None,
+    };
+    let mut removed_paths = Vec::new();
+    let mut without_backup = Vec::new();
+    for info in empty {
+        match unlink_if_empty(info) {
+            Ok(()) => {
+                removed_paths.push(info.path.clone());
+                without_backup.push(info.name.clone());
+            }
             Err(e) => kept.push((info.name.clone(), e.to_string())),
+        }
+    }
+    if let Some(backup) = &backup {
+        for (info, digest) in accepted {
+            let outcome = verify_backup(backup, &info.path, &digest)
+                .and_then(|()| check_unchanged(info))
+                .and_then(|()| std::fs::remove_file(&info.path).map_err(|e| io_err(&info.path, e)));
+            match outcome {
+                Ok(()) => removed_paths.push(info.path.clone()),
+                Err(e) => kept.push((info.name.clone(), e.to_string())),
+            }
+        }
+    }
+    // Reported in input order, whatever path removed the file.
+    let mut removed: Vec<String> = Vec::new();
+    for info in infos {
+        if removed_paths.contains(&info.path) && !removed.contains(&info.name) {
+            removed.push(info.name.clone());
         }
     }
     Ok(RetireBatchReport {
-        backup: Some(backup),
+        backup,
         removed,
+        without_backup,
         kept,
     })
 }
@@ -257,6 +293,9 @@ mod tests {
     use crate::model::encode_path_segment;
 
     const PLAIN: &str = "[keyring]\ndisplay-name=Test\nlock-on-idle=false\nlock-after=false\n";
+    /// Plaintext keyring holding one item (needs a backup in a batch).
+    const WITH_ITEM: &str = "[keyring]\ndisplay-name=Full\n\n[1]\ndisplay-name=a\nsecret=s\n\
+                             item-type=0\nctime=0\nmtime=0\n";
 
     /// Builds a collection info with the given object path.
     fn coll(path: &str) -> CollectionInfo {
@@ -501,16 +540,16 @@ mod tests {
         live: &[CollectionInfo],
     ) -> Result<RetireBatchReport> {
         let dir = infos[0].path.parent().unwrap().to_path_buf();
-        retire_files_batch(mgr, infos, &dir, live, &SecretValue::from_text("pw"))
+        retire_files_batch(mgr, infos, &dir, live, Some(&SecretValue::from_text("pw")))
     }
 
     /// Many files, one backup, all removed.
     #[test]
     fn batch_one_backup_many_files() {
         let (_t, infos, mgr) = batch_fixture(&[
-            ("a.keyring", PLAIN.as_bytes()),
-            ("b.keyring", PLAIN.as_bytes()),
-            ("c.keyring", b"[keyring]\ndisplay-name=C\n"),
+            ("a.keyring", WITH_ITEM.as_bytes()),
+            ("b.keyring", WITH_ITEM.as_bytes()),
+            ("c.keyring", format!("{WITH_ITEM}\n").as_bytes()),
         ]);
         let r = batch(&mgr, &infos, &[]).unwrap();
         let backup = r.backup.unwrap();
@@ -529,8 +568,8 @@ mod tests {
         bin.extend_from_slice(b"payload");
         let (_t, infos, mgr) = batch_fixture(&[
             ("bin.keyring", &bin),
-            ("live.keyring", PLAIN.as_bytes()),
-            ("ok.keyring", PLAIN.as_bytes()),
+            ("live.keyring", WITH_ITEM.as_bytes()),
+            ("ok.keyring", WITH_ITEM.as_bytes()),
         ]);
         let live = [coll("/org/freedesktop/secrets/collection/live")];
         let r = batch(&mgr, &infos, &live).unwrap();
@@ -552,10 +591,10 @@ mod tests {
     #[test]
     fn batch_keeps_changed_file() {
         let (_t, infos, mgr) = batch_fixture(&[
-            ("a.keyring", PLAIN.as_bytes()),
-            ("b.keyring", PLAIN.as_bytes()),
+            ("a.keyring", WITH_ITEM.as_bytes()),
+            ("b.keyring", WITH_ITEM.as_bytes()),
         ]);
-        std::fs::write(&infos[1].path, format!("{PLAIN}extra=1\n")).unwrap();
+        std::fs::write(&infos[1].path, format!("{WITH_ITEM}extra=1\n")).unwrap();
         let r = batch(&mgr, &infos, &[]).unwrap();
         assert_eq!(r.removed, vec!["a"]);
         assert_eq!(r.kept.len(), 1);
@@ -567,7 +606,7 @@ mod tests {
     /// The same file listed twice is retired once (first entry wins).
     #[test]
     fn batch_dedupes_by_path() {
-        let (_t, infos, mgr) = batch_fixture(&[("a.keyring", PLAIN.as_bytes())]);
+        let (_t, infos, mgr) = batch_fixture(&[("a.keyring", WITH_ITEM.as_bytes())]);
         let twice = vec![infos[0].clone(), infos[0].clone()];
         let r = batch(&mgr, &twice, &[]).unwrap();
         assert_eq!(r.removed, vec!["a"]);
@@ -579,8 +618,8 @@ mod tests {
     #[test]
     fn batch_backup_failure_removes_nothing() {
         let (tmp, infos, _m) = batch_fixture(&[
-            ("a.keyring", PLAIN.as_bytes()),
-            ("b.keyring", PLAIN.as_bytes()),
+            ("a.keyring", WITH_ITEM.as_bytes()),
+            ("b.keyring", WITH_ITEM.as_bytes()),
         ]);
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"x").unwrap();
@@ -592,7 +631,70 @@ mod tests {
         assert!(infos.iter().all(|i| i.path.exists()));
 
         let dir = infos[0].path.parent().unwrap().to_path_buf();
-        let r = retire_files_batch(&mgr, &[], &dir, &[], &SecretValue::from_text("pw"));
+        let r = retire_files_batch(&mgr, &[], &dir, &[], Some(&SecretValue::from_text("pw")));
         assert!(matches!(r, Err(KringError::InvalidInput(m)) if m == "No files to retire"));
+    }
+
+    /// Empty files are removed without any backup, even without a passphrase.
+    #[test]
+    fn batch_empty_files_need_no_backup() {
+        let (_t, infos, mgr) = batch_fixture(&[
+            ("a.keyring", PLAIN.as_bytes()),
+            ("b.keyring", PLAIN.as_bytes()),
+        ]);
+        let dir = infos[0].path.parent().unwrap().to_path_buf();
+        let r = retire_files_batch(&mgr, &infos, &dir, &[], None).unwrap();
+        assert!(r.backup.is_none());
+        assert_eq!(r.removed, vec!["a", "b"]);
+        assert_eq!(r.without_backup, vec!["a", "b"]);
+        assert!(r.kept.is_empty(), "{:?}", r.kept);
+        assert!(infos.iter().all(|i| !i.path.exists()));
+        assert!(!mgr.root.exists());
+    }
+
+    /// Only the files holding items go into the backup; empty ones are removed beside it.
+    #[test]
+    fn batch_backs_up_only_files_with_items() {
+        let (_t, infos, mgr) = batch_fixture(&[
+            ("empty.keyring", PLAIN.as_bytes()),
+            ("full.keyring", WITH_ITEM.as_bytes()),
+        ]);
+        let r = batch(&mgr, &infos, &[]).unwrap();
+        let backup = r.backup.unwrap();
+        assert_eq!(backup.files.len(), 1);
+        assert_eq!(backup.files[0].original, infos[1].path);
+        assert_eq!(r.removed, vec!["empty", "full"]);
+        assert_eq!(r.without_backup, vec!["empty"]);
+        assert!(infos.iter().all(|i| !i.path.exists()));
+    }
+
+    /// Without a passphrase a file holding items is kept; the empty ones still go.
+    #[test]
+    fn batch_without_passphrase_keeps_files_with_items() {
+        let (_t, infos, mgr) = batch_fixture(&[
+            ("empty.keyring", PLAIN.as_bytes()),
+            ("full.keyring", WITH_ITEM.as_bytes()),
+        ]);
+        let dir = infos[0].path.parent().unwrap().to_path_buf();
+        let r = retire_files_batch(&mgr, &infos, &dir, &[], None).unwrap();
+        assert!(r.backup.is_none());
+        assert_eq!(r.removed, vec!["empty"]);
+        assert_eq!(r.kept.len(), 1);
+        assert_eq!(r.kept[0].0, "full");
+        assert_eq!(r.kept[0].1, MSG_BATCH_NEEDS_PASSPHRASE);
+        assert!(infos[1].path.exists());
+        assert!(!mgr.root.exists());
+    }
+
+    /// An empty file that got items after the scan is kept, never unlinked unbacked.
+    #[test]
+    fn batch_keeps_empty_file_that_got_items() {
+        let (_t, infos, mgr) = batch_fixture(&[("e.keyring", PLAIN.as_bytes())]);
+        std::fs::write(&infos[0].path, WITH_ITEM).unwrap();
+        let dir = infos[0].path.parent().unwrap().to_path_buf();
+        let r = retire_files_batch(&mgr, &infos, &dir, &[], None).unwrap();
+        assert!(r.removed.is_empty());
+        assert_eq!(r.kept.len(), 1);
+        assert!(infos[0].path.exists());
     }
 }

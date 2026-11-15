@@ -105,26 +105,38 @@ fn delete_live_with_items_without_backup_refused() {
     assert!(!e.backups.exists());
 }
 
-/// An empty live keyring may be deleted without a backup, through the daemon.
-#[test]
-fn delete_empty_live_without_backup() {
-    let e = env(gnome(), &[(BINARY, MAIN)]);
-    e.send(delete(MAIN, false, None));
+/// Asserts the events of deleting the empty live keyring `Main` without a
+/// backup: BackupSkipped, the refreshed list without it, Done, Files.
+fn expect_empty_live_delete(e: &Env) {
+    e.expect_backup_skipped();
     match e.next() {
         Event::Collections(list) => assert!(list.iter().all(|c| c.id != e.main)),
         other => panic!("expected Collections, got {other:?}"),
     }
     match e.next() {
-        Event::Done(m) => assert_eq!(m, "Empty keyring deleted"),
+        Event::Done(m) => assert_eq!(m, "Main deleted (empty, no backup needed)"),
         other => panic!("expected Done, got {other:?}"),
     }
     assert!(matches!(e.next(), Event::Files(_)));
     assert!(!e.backups.exists());
 }
 
-/// A locked live keyring never counts as empty: no backup is refused, nothing deleted.
+/// An empty live keyring is deleted through the daemon without a backup,
+/// whatever the backup choice, and asks no passphrase even with a plaintext
+/// keyring in the backup set.
 #[test]
-fn delete_locked_empty_live_without_backup_refused() {
+fn delete_empty_live_skips_backup() {
+    for backup in [false, true] {
+        let e = env(gnome(), &[(BINARY, MAIN), (TEXTUAL, TEXTUAL)]);
+        e.send(delete(MAIN, backup, None));
+        expect_empty_live_delete(&e);
+    }
+}
+
+/// A locked empty live keyring (gnome-keyring reports its item count) is
+/// deleted without a backup too.
+#[test]
+fn delete_locked_empty_live_skips_backup() {
     let (_dir, keyrings, config) = dirs(&[(BINARY, MAIN)]);
     let store = FakeStore::new();
     let main = store.add_collection(MAIN, "pw", true);
@@ -133,30 +145,41 @@ fn delete_locked_empty_live_without_backup_refused() {
     for _ in 0..3 {
         recv(&h);
     }
-    h.tx.send(delete(MAIN, false, None)).unwrap();
+    h.tx.send(delete(MAIN, true, None)).unwrap();
+    assert!(matches!(recv(&h), Event::BackupSkipped { .. }));
     match recv(&h) {
-        Event::Error(m) => assert!(
-            m.ends_with("Loaded keyrings are always backed up before deletion"),
-            "{m}"
-        ),
-        other => panic!("expected Error, got {other:?}"),
-    }
-    h.tx.send(Command::Refresh).unwrap();
-    match recv(&h) {
-        Event::Collections(list) => {
-            let c = list.iter().find(|c| c.id == main).expect("keyring kept");
-            assert!(c.locked && c.item_count == 0);
-        }
+        Event::Collections(list) => assert!(list.iter().all(|c| c.id != main)),
         other => panic!("expected Collections, got {other:?}"),
     }
+    assert!(matches!(recv(&h), Event::Done(_)));
+    assert!(matches!(recv(&h), Event::Files(_)));
+    // The file of a live collection is never unlinked by kring.
     assert!(keyrings.join("Main.keyring").exists());
     assert!(!backups.exists());
 }
 
-/// A live keyring is deleted through the daemon after a backup of all keyrings.
+/// An empty textual file is removed without a backup or passphrase, even
+/// with the backup checked.
+#[test]
+fn delete_empty_textual_file_skips_backup() {
+    let e = env(gnome(), &[(EMPTY_TEXTUAL, "loose")]);
+    e.send(delete("loose", true, None));
+    e.expect_backup_skipped();
+    match e.next() {
+        Event::Done(m) => assert_eq!(m, "File loose deleted (empty, no backup needed)"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(matches!(e.next(), Event::Files(_)));
+    assert!(!e.keyring("loose").exists());
+    assert!(!e.backups.exists());
+}
+
+/// A live keyring holding items is deleted through the daemon after a
+/// backup of all keyrings.
 #[test]
 fn delete_live_with_backup_uses_delete_collection() {
     let e = env(gnome(), &[(BINARY, MAIN)]);
+    e.add_item(&e.main);
     e.send(delete(MAIN, true, None));
     match e.next() {
         Event::BackupCreated(info) => {
@@ -179,6 +202,7 @@ fn delete_live_with_backup_uses_delete_collection() {
 #[test]
 fn delete_live_asks_passphrase_with_delete_file_echo() {
     let e = env(gnome(), &[(BINARY, MAIN), (TEXTUAL, TEXTUAL)]);
+    e.add_item(&e.main);
     e.send(delete(MAIN, true, None));
     match e.next() {
         Event::PassphraseNeeded(resend) => match *resend {
@@ -215,6 +239,7 @@ fn delete_live_refused_without_writes() {
     assert!(matches!(e.next(), Event::Files(_)));
     e.send(delete(MAIN, false, None));
     assert_eq!(e.expect_error(), "Not supported on this provider");
+    assert!(matches!(e.next(), Event::Files(_)));
     assert!(!e.backups.exists());
     e.send(Command::Refresh);
     match e.next() {

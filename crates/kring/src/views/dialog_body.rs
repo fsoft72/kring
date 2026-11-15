@@ -36,11 +36,13 @@ const MSG_MOVE_NOTE: &str = "Each item is removed from this keyring once it is s
 const MSG_COPY_NOTE: &str = "Items are added to the target; this keyring is not changed. \
      Conflicts are shown for review first.";
 /// Passphrase request of a consolidation backup holding plaintext keyrings.
-const MSG_CONSOLIDATE_BACKUP: &str = "A backup of all keyring files is taken first. It \
-     contains plaintext keyrings, choose a passphrase to encrypt it.";
+const MSG_CONSOLIDATE_BACKUP: &str = "A backup of the target and source keyring files is \
+     taken first. It contains plaintext keyrings, choose a passphrase to encrypt it.";
 /// Passphrase request of the retired orphan files.
 const MSG_CONSOLIDATE_ORPHANS: &str = "The empty plaintext files are retired with one \
      encrypted backup, choose its passphrase.";
+/// Note replacing the backup fields when the keyring is empty.
+pub const MSG_EMPTY_NO_BACKUP: &str = "Empty keyring: no backup needed.";
 /// Warning of a delete without backup.
 const MSG_DELETE_NO_BACKUP: &str = "Permanent deletion: no backup will be made";
 /// Note of the wallet import dialog when the keyring is created first.
@@ -324,7 +326,11 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
             for warning in warnings.iter() {
                 ui.label(RichText::new(*warning).color(theme::TERTIARY));
             }
-            _muted(ui, "A backup of the keyring files is created first.");
+            let note = match item_count {
+                0 => MSG_EMPTY_NO_BACKUP,
+                _ => "A backup of the keyring files is created first.",
+            };
+            _muted(ui, note);
             _danger("Delete")
         }
         DialogKind::NewItem {
@@ -411,13 +417,18 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
             lines,
             passphrase,
             confirm,
+            empty,
         } => {
             _title(ui, &format!("Retire \"{name}.keyring\""));
             for line in lines.iter() {
                 _text(ui, line);
             }
-            _password_field(ui, hide, "Backup passphrase", FIELD_PASSWORD, passphrase);
-            _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            if *empty {
+                _muted(ui, MSG_EMPTY_NO_BACKUP);
+            } else {
+                _password_field(ui, hide, "Backup passphrase", FIELD_PASSWORD, passphrase);
+                _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            }
             _danger("Retire")
         }
         DialogKind::DeleteFile { .. } => {
@@ -598,7 +609,8 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool, retry: bool) -
     }
 }
 
-/// Renders the delete confirmation of a keyring file: the body lines, the
+/// Renders the delete confirmation of a keyring file: the body lines, then
+/// for an empty keyring only the "no backup needed" note; otherwise the
 /// backup checkbox (only when the backup is optional), then either the
 /// backup passphrase (when the backup needs one) or the red warning and the
 /// typed name confirmation (no backup). `hide` leaves out the passphrase fields.
@@ -617,6 +629,13 @@ fn _delete_file(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool) {
     _title(ui, &format!("Delete {name}"));
     for line in spec.lines.iter() {
         _text(ui, line);
+    }
+    if spec.empty {
+        // Sent with the backup on: the worker skips it for an empty keyring
+        // and asks a passphrase when it turns out not empty.
+        *backup = true;
+        _muted(ui, MSG_EMPTY_NO_BACKUP);
+        return;
     }
     if spec.backup_optional {
         ui.checkbox(

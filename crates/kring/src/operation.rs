@@ -184,6 +184,14 @@ impl Operation {
         backup.set(why, StepStatus::Skipped);
     }
 
+    /// Sets the backup step, adding it when the command had none.
+    fn _set_backup(&mut self, text: String, status: StepStatus) {
+        match &mut self.backup {
+            Some(step) => step.set(text, status),
+            None => self.backup = Some(Step::new(text, status)),
+        }
+    }
+
     /// Decides the outcome of the followed command once it finished.
     fn _decide(&mut self) {
         let window = std::mem::take(&mut self.window);
@@ -220,10 +228,10 @@ impl Operation {
         match event {
             Event::BackupCreated(info) => {
                 let text = format!("Backup created in {}", info.dir.display());
-                match &mut self.backup {
-                    Some(step) => step.set(text, StepStatus::Ok),
-                    None => self.backup = Some(Step::new(text, StepStatus::Ok)),
-                }
+                self._set_backup(text, StepStatus::Ok);
+            }
+            Event::BackupSkipped { reason } => {
+                self._set_backup(format!("No backup needed ({reason})"), StepStatus::Skipped);
             }
             Event::PassphraseNeeded(_) | Event::ApplyPassphrasesNeeded { .. } => {
                 self.window.asked = true;
@@ -438,6 +446,30 @@ mod tests {
         );
         assert_eq!(statuses(&op), [StepStatus::Skipped, StepStatus::Ok]);
         assert_eq!(op.steps()[0].text, MSG_BACKUP_NOT_NEEDED);
+    }
+
+    /// A backup skipped by the worker (empty keyring) shows why, muted, on
+    /// the backup step, also when the command had none.
+    #[test]
+    fn backup_skipped_for_empty_keyring() {
+        let skipped = Event::BackupSkipped {
+            reason: crate::worker::BACKUP_SKIPPED_EMPTY.into(),
+        };
+        for backup in [true, false] {
+            let mut op = Operation::start("Deleting \"e\"...", backup, 3);
+            feed(
+                &mut op,
+                3,
+                &[
+                    skipped.clone(),
+                    Event::Done("e deleted (empty, no backup needed)".into()),
+                    Event::CommandFinished(3),
+                ],
+            );
+            assert_eq!(statuses(&op), [StepStatus::Skipped, StepStatus::Ok]);
+            assert_eq!(op.steps()[0].text, "No backup needed (empty keyring)");
+            assert_eq!(op.title(), TITLE_FINISHED);
+        }
     }
 
     /// An error before the backup fails the action; no backup was created.

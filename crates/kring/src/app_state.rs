@@ -395,6 +395,8 @@ impl AppState {
                     self.notices.push(format!("{MSG_PRUNE_FAILED}: {w}"));
                 }
             }
+            // Shown by the progress modal; the Done that follows sets the status.
+            Event::BackupSkipped { .. } => {}
             Event::PassphraseNeeded(cmd) => {
                 if matches!(
                     *cmd,
@@ -1665,6 +1667,7 @@ mod tests {
         let retired = RetireBatchReport {
             backup: None,
             removed: vec!["a".into()],
+            without_backup: vec!["a".into()],
             kept: vec![],
         };
         assert_eq!(

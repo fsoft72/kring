@@ -41,7 +41,8 @@ use crate::worker::{Command, ConsolidationSummary};
 /// Explanation of the start card.
 const MSG_EXPLAIN: &str = "Moves every item of the other readable keyrings into the target \
      and deletes the keyrings left empty. Locked, login and session keyrings are never \
-     touched. One backup of all keyring files is taken before anything changes.";
+     touched. One backup of the target and source keyring files is taken before anything \
+     changes; empty keyrings hold no secrets and need none.";
 /// Hint of the start card: locked keyrings are unlocked from the preview.
 const MSG_UNLOCK_HINT: &str =
     "Locked keyrings are skipped: unlock them from the preview, which then refreshes.";
@@ -119,7 +120,8 @@ pub struct OutcomeRow {
 pub struct PassphraseNeeds {
     /// The backup holds plaintext keyrings: it is encrypted.
     pub backup: bool,
-    /// Orphan files are retired into their own encrypted backup.
+    /// Orphan files are retired into their own encrypted backup (never set
+    /// by [`needs_passphrases`]: the orphan files are empty, retired without one).
     pub orphan_files: bool,
 }
 
@@ -324,13 +326,14 @@ pub fn outcome_rows(
 }
 
 /// Returns the passphrases an apply of `summary` needs: the backup one as
-/// judged by the worker on the files it backs up at plan time, the orphan
-/// files one when files are retired. The worker still asks for any it finds
+/// judged by the worker on the files it backs up at plan time (the target
+/// and the move sources). The orphan files are empty and retired without a
+/// backup, so they never need one. The worker still asks for any it finds
 /// missing at apply time.
 pub fn needs_passphrases(summary: &ConsolidationSummary) -> PassphraseNeeds {
     PassphraseNeeds {
         backup: summary.backup_needs_passphrase,
-        orphan_files: !summary.orphan_files.is_empty(),
+        orphan_files: false,
     }
 }
 
@@ -1158,6 +1161,7 @@ mod tests {
         let retired = RetireBatchReport {
             backup: None,
             removed: vec!["a".into(), "b".into()],
+            without_backup: vec![],
             kept: vec![("c".into(), "not empty".into())],
         };
         let rows = outcome_rows(&report, Some(&retired));
@@ -1200,18 +1204,21 @@ mod tests {
         }
     }
 
-    /// The backup needs a passphrase when the worker said so; the orphan
-    /// files one when files are retired.
+    /// The backup needs a passphrase when the worker said so (its reduced
+    /// backup set holds a plaintext keyring); the retired orphan files are
+    /// empty and never need one.
     #[test]
     fn needs_passphrases_from_plan() {
         let summary = full_summary();
+        assert!(!summary.orphan_files.is_empty());
         assert_eq!(
             needs_passphrases(&summary),
             PassphraseNeeds {
                 backup: false,
-                orphan_files: true
+                orphan_files: false
             }
         );
+        assert_eq!(_passphrase_note(needs_passphrases(&summary)), None);
         let no_orphans = ConsolidationSummary {
             orphan_files: vec![],
             backup_needs_passphrase: true,

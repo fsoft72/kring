@@ -1075,7 +1075,7 @@ mod tests {
             set_default: false,
             conflict_count: 0,
             orphan_files: vec!["o".into()],
-            backup_needs_passphrase: false,
+            backup_needs_passphrase: true,
         };
         for (dialog, opens) in [
             (DIALOG_CONSOLIDATE_NOW, false),
@@ -1106,7 +1106,8 @@ mod tests {
                     &next[..],
                     [Action::Open(DialogKind::ConsolidatePassphrases {
                         plan_id: 7,
-                        ask_orphan_files: true,
+                        ask_backup: true,
+                        ask_orphan_files: false,
                         ..
                     })]
                 ));
@@ -1115,8 +1116,8 @@ mod tests {
                     &next[..],
                     [Action::Send(Command::ApplyConsolidation {
                         plan_id: 7,
-                        backup_passphrase: None,
-                        orphan_files_passphrase: Some(_),
+                        backup_passphrase: Some(_),
+                        orphan_files_passphrase: None,
                         ..
                     })]
                 ));

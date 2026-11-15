@@ -16,8 +16,8 @@ use kring_core::backup::{
 use kring_core::keyring_file::binary::read_binary;
 use kring_core::keyring_file::textual::{OfflineItem, ParseWarning, parse_textual};
 use kring_core::keyring_file::{
-    DeleteBackup, KeyringFileInfo, KeyringFormat, RetireMode, delete_file, retire_file,
-    retire_mode, scan_dir,
+    DeleteBackup, KeyringFileInfo, KeyringFormat, RetireMode, delete_file, remove_empty_file,
+    retire_file, retire_mode, scan_dir, scanned_empty,
 };
 use kring_core::model::{CollectionId, CollectionInfo, SecretValue};
 use kring_core::provider::ProviderInfo;
@@ -26,8 +26,8 @@ use kring_core::{KringError, MasterPasswordStore, Result, SecretStore};
 use zeroize::Zeroizing;
 
 use crate::worker::{
-    Command, Emitter, Event, MSG_NO_PROVIDER, WorkerConfig, gate, passphrase_echo, refresh,
-    run_store_command,
+    BACKUP_SKIPPED_EMPTY, Command, Emitter, Event, MSG_NO_PROVIDER, WorkerConfig, passphrase_echo,
+    run_store_command, skip_backup,
 };
 
 /// Message for a file name that could escape the keyrings directory.
@@ -40,10 +40,10 @@ const MSG_NO_RESTORE_FILES: &str = "No files selected for restore";
 const MSG_NOT_PLAINTEXT: &str = "Only plaintext keyring files can be retired";
 /// Message after a plaintext file was retired.
 const MSG_RETIRED: &str = "Plaintext file retired";
+/// Message after an empty plaintext file was retired without a backup.
+const MSG_RETIRED_EMPTY: &str = "Plaintext file retired (empty, no backup needed)";
 /// Refusal of a delete without backup of a live keyring that holds items.
 const MSG_LIVE_NEEDS_BACKUP: &str = "Loaded keyrings are always backed up before deletion";
-/// Message after an empty live keyring was deleted without a backup.
-const MSG_EMPTY_KEYRING_DELETED: &str = "Empty keyring deleted";
 /// Extension of keyring files.
 const KEYRING_EXTENSION: &str = "keyring";
 
@@ -112,7 +112,10 @@ where
         Command::RetireFile {
             name,
             backup_passphrase,
-        } => retire(out, store, provider, config, name, backup_passphrase).await,
+        } => {
+            let passphrase = backup_passphrase.as_ref();
+            retire(out, store, provider, config, name, passphrase, cmd).await
+        }
         Command::DeleteFile {
             name,
             backup,
@@ -222,8 +225,11 @@ pub(crate) async fn read_file<N: Fn()>(
 /// Retires plaintext keyring file `name`; any other file is refused first.
 ///
 /// When the daemon serves it (a live collection decodes to the name) this is
-/// the `DeleteCollection` flow with its gate and backup; otherwise the
-/// plaintext file is backed up encrypted and removed. If a store exists but
+/// the `DeleteCollection` flow with its gate and backup (skipped when the
+/// collection is empty); otherwise an empty file (fresh scan, re-parsed
+/// right before the unlink) is removed without a backup, and a file holding
+/// items is backed up encrypted and removed (without `passphrase`
+/// [`Event::PassphraseNeeded`] echoes `original`). If a store exists but
 /// cannot list its collections the retire is aborted.
 async fn retire<S, N>(
     out: &Emitter<N>,
@@ -231,7 +237,8 @@ async fn retire<S, N>(
     provider: Option<&ProviderInfo>,
     config: &WorkerConfig,
     name: &str,
-    passphrase: &SecretValue,
+    passphrase: Option<&SecretValue>,
+    original: &Command,
 ) -> Result<()>
 where
     S: SecretStore + MasterPasswordStore,
@@ -252,11 +259,21 @@ where
     {
         let delete = Command::DeleteCollection {
             collection,
-            backup_passphrase: Some(passphrase.clone()),
+            backup_passphrase: passphrase.cloned(),
         };
         run_store_command(out, store, provider, config, delete).await;
         return emit_files(out, config);
     }
+    if scanned_empty(&info) {
+        remove_empty_file(&info, &config.keyrings_dir, &live)?;
+        skip_backup(out, BACKUP_SKIPPED_EMPTY);
+        out.emit(Event::Done(MSG_RETIRED_EMPTY.into()));
+        return emit_files(out, config);
+    }
+    let Some(passphrase) = passphrase else {
+        out.emit(passphrase_echo(original));
+        return Ok(());
+    };
     let backup = retire_file(
         &config.backups,
         &info,
@@ -273,9 +290,11 @@ where
 ///
 /// The live check uses the store's collections; if a store exists but cannot
 /// list them the delete is aborted. A file the daemon serves is deleted as a
-/// collection (see [`delete_live`]); any other file through
-/// [`delete_file`]. A backup needing a passphrase that is missing emits
-/// [`Event::PassphraseNeeded`] with the echo of `original`.
+/// collection (see [`delete_live`]); an empty textual file (fresh scan,
+/// re-parsed right before the unlink) is removed without a backup whatever
+/// `backup` says; any other file through [`delete_file`]. A backup needing
+/// a passphrase that is missing emits [`Event::PassphraseNeeded`] with the
+/// echo of `original`.
 async fn delete<S, N>(
     out: &Emitter<N>,
     store: Option<&S>,
@@ -306,6 +325,15 @@ where
             original,
         };
         return delete_live(out, store, provider, config, request).await;
+    }
+    if scanned_empty(&info) {
+        remove_empty_file(&info, &config.keyrings_dir, &live)?;
+        skip_backup(out, BACKUP_SKIPPED_EMPTY);
+        out.emit(Event::Done(format!(
+            "File {} deleted (empty, no backup needed)",
+            info.name
+        )));
+        return emit_files(out, config);
     }
     let report = match delete_file(&config.backups, &info, &config.keyrings_dir, &live, backup) {
         Ok(report) => report,
@@ -343,10 +371,12 @@ struct LiveDelete<'a> {
 /// Deletes the file of a live collection through the daemon.
 ///
 /// The Plan 1 `DeleteCollection` flow (gate, backup of all keyrings) is used.
-/// Without a backup only an empty collection (no items, freshly listed) is
-/// deleted, still behind the write gate; otherwise the request is refused.
-/// A plaintext keyring in the backup set without a passphrase emits
-/// [`Event::PassphraseNeeded`] with the echo of the `DeleteFile` command.
+/// An empty collection (no items, freshly listed, locked or not) goes
+/// through it whatever the backup choice: that flow lists the collections
+/// again and skips the backup when it is still empty. Without a backup a
+/// collection holding items is refused. A plaintext keyring in the backup
+/// set without a passphrase emits [`Event::PassphraseNeeded`] with the echo
+/// of the `DeleteFile` command.
 async fn delete_live<S, N>(
     out: &Emitter<N>,
     store: &S,
@@ -359,41 +389,13 @@ where
     N: Fn(),
 {
     let collection = request.collection.id.clone();
+    let empty = request.collection.item_count == 0;
     let passphrase = match request.backup {
+        _ if empty => None,
         DeleteBackup::With(passphrase) => passphrase,
-        // Fail closed: a locked keyring never counts as empty.
-        DeleteBackup::Without if !is_empty_unlocked(request.collection) => {
-            return Err(invalid(MSG_LIVE_NEEDS_BACKUP));
-        }
-        DeleteBackup::Without => {
-            // Same write gate as the Plan 1 delete, without its backup.
-            let gated = Command::DeleteCollection {
-                collection: collection.clone(),
-                backup_passphrase: None,
-            };
-            if !gate(out, provider, &gated) {
-                return Ok(());
-            }
-            // TOCTOU: an item could be added between the fresh listing above
-            // and this call; the Secret Service has no conditional delete, so
-            // the window is kept as small as possible but cannot be closed.
-            match store.delete_collection(&collection).await {
-                Ok(()) => {
-                    refresh(out, store).await;
-                    out.emit(Event::Done(MSG_EMPTY_KEYRING_DELETED.into()));
-                }
-                // Reported like `run_store_command`: NotFound re-lists the collections.
-                Err(e) => {
-                    out.error(e.to_string());
-                    if matches!(e, KringError::NotFound(_)) {
-                        refresh(out, store).await;
-                    }
-                }
-            }
-            return emit_files(out, config);
-        }
+        DeleteBackup::Without => return Err(invalid(MSG_LIVE_NEEDS_BACKUP)),
     };
-    if passphrase.is_none() && backup_needs_passphrase(config)? {
+    if !empty && passphrase.is_none() && backup_needs_passphrase(config)? {
         out.emit(passphrase_echo(request.original));
         return Ok(());
     }
@@ -403,12 +405,6 @@ where
     };
     run_store_command(out, store, provider, config, delete).await;
     emit_files(out, config)
-}
-
-/// Returns true for a live keyring that may be deleted without a backup:
-/// unlocked and without items (a locked keyring may hide its items).
-fn is_empty_unlocked(c: &CollectionInfo) -> bool {
-    !c.locked && c.item_count == 0
 }
 
 /// Returns true when the backup of all keyrings holds a plaintext keyring
