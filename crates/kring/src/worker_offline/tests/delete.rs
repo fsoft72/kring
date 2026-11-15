@@ -87,17 +87,109 @@ fn delete_plaintext_asks_for_passphrase() {
     assert!(!e.keyring(TEXTUAL).exists());
 }
 
-/// The file of a live collection is refused with the Secrets hint, nothing written.
+/// A live keyring holding items is never deleted without a backup.
 #[test]
-fn delete_live_file_refused() {
-    let e = env(gnome(), &[(BINARY, MAIN)]);
+fn delete_live_with_items_without_backup_refused() {
+    let e = env(gnome(), &[(BINARY, MAIN), (TEXTUAL, TEXTUAL)]);
+    e.import_textual();
     e.send(delete(MAIN, false, None));
     assert!(
         e.expect_error()
-            .ends_with("Loaded by gnome-keyring: delete this keyring from Secrets")
+            .ends_with("Loaded keyrings are always backed up before deletion")
     );
-    assert!(e.keyring(MAIN).exists());
+    e.send(Command::Refresh);
+    match e.next() {
+        Event::Collections(list) => assert!(list.iter().any(|c| c.id == e.main)),
+        other => panic!("expected Collections, got {other:?}"),
+    }
     assert!(!e.backups.exists());
+}
+
+/// An empty live keyring may be deleted without a backup, through the daemon.
+#[test]
+fn delete_empty_live_without_backup() {
+    let e = env(gnome(), &[(BINARY, MAIN)]);
+    e.send(delete(MAIN, false, None));
+    match e.next() {
+        Event::Collections(list) => assert!(list.iter().all(|c| c.id != e.main)),
+        other => panic!("expected Collections, got {other:?}"),
+    }
+    match e.next() {
+        Event::Done(m) => assert_eq!(m, "Empty keyring deleted"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(matches!(e.next(), Event::Files(_)));
+    assert!(!e.backups.exists());
+}
+
+/// A live keyring is deleted through the daemon after a backup of all keyrings.
+#[test]
+fn delete_live_with_backup_uses_delete_collection() {
+    let e = env(gnome(), &[(BINARY, MAIN)]);
+    e.send(delete(MAIN, true, None));
+    match e.next() {
+        Event::BackupCreated(info) => {
+            assert!(info.files.iter().any(|f| f.original == e.keyring(MAIN)));
+        }
+        other => panic!("expected BackupCreated, got {other:?}"),
+    }
+    match e.next() {
+        Event::Collections(list) => assert!(list.iter().all(|c| c.id != e.main)),
+        other => panic!("expected Collections, got {other:?}"),
+    }
+    match e.next() {
+        Event::Done(m) => assert!(m.starts_with("Collection deleted, backup in"), "{m}"),
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(matches!(e.next(), Event::Files(_)));
+}
+
+/// A plaintext keyring in the backup set asks for a passphrase with the DeleteFile echo.
+#[test]
+fn delete_live_asks_passphrase_with_delete_file_echo() {
+    let e = env(gnome(), &[(BINARY, MAIN), (TEXTUAL, TEXTUAL)]);
+    e.send(delete(MAIN, true, None));
+    match e.next() {
+        Event::PassphraseNeeded(resend) => match *resend {
+            Command::DeleteFile {
+                name,
+                backup,
+                backup_passphrase,
+            } => {
+                assert_eq!(name, MAIN);
+                assert!(backup && backup_passphrase.is_none());
+            }
+            other => panic!("expected DeleteFile, got {other:?}"),
+        },
+        other => panic!("expected PassphraseNeeded, got {other:?}"),
+    }
+    assert!(!e.backups.exists());
+    e.send(delete(MAIN, true, Some(PASSPHRASE)));
+    match e.next() {
+        Event::BackupCreated(info) => assert!(info.files.iter().any(|f| f.encrypted)),
+        other => panic!("expected BackupCreated, got {other:?}"),
+    }
+    assert!(matches!(e.next(), Event::Collections(_)));
+    assert!(matches!(e.next(), Event::Done(_)));
+    assert!(matches!(e.next(), Event::Files(_)));
+}
+
+/// On a provider without writes a live keyring is refused, with or without backup.
+#[test]
+fn delete_live_refused_without_writes() {
+    let e = env(provider(ProviderKind::KWallet), &[(BINARY, MAIN)]);
+    e.send(delete(MAIN, true, None));
+    assert_eq!(e.expect_error(), "Not supported on this provider");
+    // The Plan 1 flow reports its error, then the files are rescanned as after a retire.
+    assert!(matches!(e.next(), Event::Files(_)));
+    e.send(delete(MAIN, false, None));
+    assert_eq!(e.expect_error(), "Not supported on this provider");
+    assert!(!e.backups.exists());
+    e.send(Command::Refresh);
+    match e.next() {
+        Event::Collections(list) => assert!(list.iter().any(|c| c.id == e.main)),
+        other => panic!("expected Collections, got {other:?}"),
+    }
 }
 
 /// Names that could escape the keyrings dir, unknown names and symlinks are refused.

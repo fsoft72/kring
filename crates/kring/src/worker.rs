@@ -625,7 +625,11 @@ fn deleted_message(what: &str, backup: Option<&PathBuf>) -> String {
 }
 
 /// Returns true if the command is allowed on this provider; otherwise emits an error.
-fn gate<N: Fn()>(out: &Emitter<N>, provider: Option<&ProviderInfo>, cmd: &Command) -> bool {
+pub(crate) fn gate<N: Fn()>(
+    out: &Emitter<N>,
+    provider: Option<&ProviderInfo>,
+    cmd: &Command,
+) -> bool {
     let (needs_writes, needs_master) = match cmd {
         Command::DeleteItem { .. }
         | Command::DeleteCollection { .. }
