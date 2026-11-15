@@ -92,15 +92,18 @@ pub struct TextualKeyring {
     pub daemon_readable: bool,
 }
 
-/// A raw (still escaped) value and the line its key was on.
+/// A raw value: the still escaped text after `key=` plus verbatim continuation lines.
 struct RawValue {
-    text: Zeroizing<String>,
+    first: Zeroizing<String>,
+    continuation: Vec<Zeroizing<String>>,
     line: usize,
 }
 
 /// A parsed group: entries by key, plus the last key for continuations.
 #[derive(Default)]
 struct Group {
+    /// Line of the group header.
+    line: usize,
     entries: HashMap<String, RawValue>,
     last_key: Option<String>,
 }
@@ -203,7 +206,13 @@ fn read_groups(
             let pos = match groups.iter().position(|(n, _)| n == name) {
                 Some(pos) => pos,
                 None => {
-                    groups.push((name.to_string(), Group::default()));
+                    groups.push((
+                        name.to_string(),
+                        Group {
+                            line: number,
+                            ..Group::default()
+                        },
+                    ));
                     groups.len() - 1
                 }
             };
@@ -223,7 +232,8 @@ fn read_groups(
                 group.entries.insert(
                     key.to_string(),
                     RawValue {
-                        text: Zeroizing::new(value.to_string()),
+                        first: Zeroizing::new(value.to_string()),
+                        continuation: Vec::new(),
                         line: number,
                     },
                 );
@@ -245,10 +255,9 @@ fn read_groups(
             continue;
         };
         for _ in 0..blanks {
-            entry.text.push('\n');
+            entry.continuation.push(Zeroizing::new(String::new()));
         }
-        entry.text.push('\n');
-        entry.text.push_str(line);
+        entry.continuation.push(Zeroizing::new(line.to_string()));
     }
     Ok(groups)
 }
@@ -260,7 +269,15 @@ fn string_value(
     warnings: &mut Vec<ParseWarning>,
 ) -> Option<Zeroizing<String>> {
     let raw = group.entries.get(key)?;
-    let (text, unknown) = unescape(&raw.text);
+    // Only the first physical line is GLib-escaped; continuation lines stay verbatim.
+    let (first, unknown) = unescape(&raw.first);
+    let extra: usize = raw.continuation.iter().map(|l| l.len() + 1).sum();
+    let mut text = Zeroizing::new(String::with_capacity(first.len() + extra));
+    text.push_str(&first);
+    for line in &raw.continuation {
+        text.push('\n');
+        text.push_str(line);
+    }
     if unknown {
         warnings.push(ParseWarning {
             line: raw.line,
@@ -273,7 +290,7 @@ fn string_value(
 /// Parses an unsigned number field; a present but invalid value warns and yields `None`.
 fn number_value(group: &Group, key: &str, warnings: &mut Vec<ParseWarning>) -> Option<u64> {
     let raw = group.entries.get(key)?;
-    let parsed = raw.text.trim().parse::<u64>().ok();
+    let parsed = raw.first.trim().parse::<u64>().ok();
     if parsed.is_none() {
         warnings.push(ParseWarning {
             line: raw.line,
@@ -284,18 +301,18 @@ fn number_value(group: &Group, key: &str, warnings: &mut Vec<ParseWarning>) -> O
 }
 
 /// Builds the secret of an item from `secret` or `binary-secret`.
-fn read_secret(group: &Group, item_line: usize, warnings: &mut Vec<ParseWarning>) -> SecretValue {
+fn read_secret(group: &Group, warnings: &mut Vec<ParseWarning>) -> SecretValue {
     if let Some(text) = string_value(group, "secret", warnings) {
         return SecretValue::new(text.as_bytes().to_vec(), TEXT_CONTENT_TYPE);
     }
     let Some(raw) = group.entries.get("binary-secret") else {
         warnings.push(ParseWarning {
-            line: item_line,
+            line: group.line,
             kind: WarningKind::MissingSecret,
         });
         return SecretValue::new(Vec::new(), BINARY_CONTENT_TYPE);
     };
-    match hex::decode(raw.text.trim()) {
+    match hex::decode(raw.first.trim()) {
         Ok(bytes) => SecretValue::new(bytes, BINARY_CONTENT_TYPE),
         Err(_) => {
             warnings.push(ParseWarning {
@@ -323,7 +340,7 @@ fn read_attributes(
         let is_uint = attr
             .entries
             .get("type")
-            .is_some_and(|t| t.text.trim() == "uint32");
+            .is_some_and(|t| t.first.trim() == "uint32");
         if is_uint {
             // gnome-keyring reads a u64 and truncates it to u32.
             if let Some(number) = number_value(attr, "value", warnings) {
@@ -367,14 +384,13 @@ pub fn parse_textual(bytes: &[u8]) -> Result<TextualKeyring> {
         .iter()
         .filter(|(name, _)| name != KEYRING_GROUP && !name.contains(':'))
     {
-        let item_line = group.entries.values().map(|v| v.line).min().unwrap_or(0);
         let label = string_value(group, "display-name", &mut warnings)
             .map(|l| (*l).clone())
             .unwrap_or_default();
         items.push(OfflineItem {
             label,
             attributes: read_attributes(id, group, &groups, &mut warnings),
-            secret: read_secret(group, item_line, &mut warnings),
+            secret: read_secret(group, &mut warnings),
             created: number_value(group, "ctime", &mut warnings).unwrap_or(0),
             modified: number_value(group, "mtime", &mut warnings).unwrap_or(0),
         });
@@ -441,6 +457,123 @@ mod tests {
         let text = "[keyring]\n\n[1]\nsecret=a\n\nb c\nitem-type=0\n";
         let kr = parse_textual(text.as_bytes()).unwrap();
         assert_eq!(kr.items[0].secret.as_text(), Some("a\n\nb c"));
+    }
+
+    /// Continuation lines are not unescaped and raise no escape warning.
+    #[test]
+    fn continuation_lines_stay_verbatim() {
+        let text = "[keyring]\n\n[1]\nsecret=a\\sb\n  \"k\": \"q\\\"x\\ny\\\\z\"\nitem-type=0\n";
+        let kr = parse_textual(text.as_bytes()).unwrap();
+        assert_eq!(
+            kr.items[0].secret.as_bytes(),
+            b"a b\n  \"k\": \"q\\\"x\\ny\\\\z\""
+        );
+        assert_eq!(kr.warnings.len(), 1);
+        assert_eq!(kr.warnings[0].kind, WarningKind::ContinuationLine);
+    }
+
+    /// The multiline fixture keeps its JSON `\"` escapes literally.
+    #[test]
+    fn multiline_fixture_keeps_json_quotes() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/keyrings/textual_multiline_secret.keyring");
+        let kr = parse_textual(&std::fs::read(path).unwrap()).unwrap();
+        let text = kr.items[0].secret.as_text().unwrap().to_string();
+        assert!(text.contains("\"quote\": \"say \\\"hi\\\"\""));
+        assert!(
+            kr.warnings
+                .iter()
+                .all(|w| w.kind == WarningKind::ContinuationLine)
+        );
+    }
+
+    /// CRLF line endings are handled, comments ignored, locale keys accepted.
+    #[test]
+    fn crlf_comment_and_locale_key() {
+        let text = "[keyring]\r\ndisplay-name=K\r\n# comment\r\n\r\n[1]\r\ndisplay-name[it]=Ciao\r\nsecret=s\r\n";
+        let kr = parse_textual(text.as_bytes()).unwrap();
+        assert!(kr.daemon_readable);
+        assert!(kr.warnings.is_empty());
+        assert_eq!(kr.display_name.as_deref(), Some("K"));
+        assert_eq!(kr.items[0].secret.as_text(), Some("s"));
+        assert!(kr.items[0].label.is_empty());
+    }
+
+    /// A continuation line before any key of a group is dropped with a warning.
+    #[test]
+    fn continuation_before_any_key_dropped() {
+        let kr = parse_textual(b"[keyring]\nstray line\n\n[1]\nsecret=x\n").unwrap();
+        assert!(!kr.daemon_readable);
+        assert_eq!(
+            kr.warnings,
+            vec![ParseWarning {
+                line: 2,
+                kind: WarningKind::ContinuationLine
+            }]
+        );
+        assert_eq!(kr.items[0].secret.as_text(), Some("x"));
+    }
+
+    /// A line with a space in the key is a continuation line, not an entry.
+    #[test]
+    fn key_with_space_is_continuation() {
+        let kr = parse_textual(b"[keyring]\n\n[1]\nsecret=a\nfoo bar=baz\n").unwrap();
+        assert_eq!(kr.items[0].secret.as_text(), Some("a\nfoo bar=baz"));
+        assert!(!kr.daemon_readable);
+    }
+
+    /// A group without entries warns at its header line.
+    #[test]
+    fn empty_group_missing_secret_points_at_header() {
+        let kr = parse_textual(b"[keyring]\n\n[7]\n").unwrap();
+        assert_eq!(
+            kr.warnings,
+            vec![ParseWarning {
+                line: 3,
+                kind: WarningKind::MissingSecret
+            }]
+        );
+    }
+
+    /// Prefixes of the fixtures, tricky inputs and pseudo-random bytes never panic.
+    #[test]
+    fn never_panics() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keyrings");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            for end in 0..=bytes.len() {
+                let _ = parse_textual(&bytes[..end]);
+            }
+        }
+        let tricky: [&[u8]; 9] = [
+            "[keyring]\n\u{e9}[=\\]\u{20ac}\n".as_bytes(),
+            "[keyring]\n[1]\nsecret=\u{1f600}\\\n".as_bytes(),
+            b"[keyring]\n[1]\nsecret=\\",
+            b"[keyring",
+            b"[keyring]\r\n[1]\r\nsecret=a\r\nb\r\n",
+            b"[keyring]\n[1\n=x\n[]\n[1]]\n",
+            b"[keyring]\n[1:attribute0]\nname=\\\ntype=uint32\nvalue=99999999999999999999999\n",
+            b"[",
+            b"",
+        ];
+        for input in tricky {
+            let _ = parse_textual(input);
+        }
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..256 {
+            let mut buf = b"[keyring]\n[1]\n".to_vec();
+            for _ in 0..(state % 64) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                buf.push((state & 0xff) as u8);
+            }
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let _ = parse_textual(&buf);
+            let _ = parse_textual(&buf[10..]);
+        }
     }
 
     /// GLib escapes are decoded; unknown ones stay literal and warn.

@@ -45,8 +45,10 @@ pub struct KeyringFileInfo {
     pub item_count: Option<usize>,
     /// Whether gnome-keyring can read the file (textual files only).
     pub daemon_readable: Option<bool>,
-    /// True when the file stores secrets in plaintext.
+    /// True when the file is not encrypted on disk (anything without the binary magic).
     pub plaintext: bool,
+    /// Non-secret parse error message, when a textual file could not be parsed.
+    pub error: Option<String>,
 }
 
 /// Detects the format of a keyring file from its content.
@@ -89,11 +91,16 @@ fn file_info(path: &Path) -> KeyringFileInfo {
         item_count: None,
         daemon_readable: None,
         plaintext: false,
+        error: None,
     };
     let Ok(bytes) = std::fs::read(path).map(Zeroizing::new) else {
         return info;
     };
     info.format = detect_format(&bytes);
+    info.plaintext = info.format != KeyringFormat::BinaryV0;
+    if info.format == KeyringFormat::Unknown {
+        info.error = Some("not a recognized keyring file".into());
+    }
     if info.format != KeyringFormat::Textual {
         return info;
     }
@@ -102,9 +109,11 @@ fn file_info(path: &Path) -> KeyringFileInfo {
             info.display_name = parsed.display_name.clone();
             info.item_count = Some(parsed.items.len());
             info.daemon_readable = Some(parsed.daemon_readable);
-            info.plaintext = true;
         }
-        Err(_) => info.format = KeyringFormat::Unknown,
+        Err(e) => {
+            info.format = KeyringFormat::Unknown;
+            info.error = Some(e.to_string());
+        }
     }
     info
 }
@@ -188,7 +197,7 @@ mod tests {
             summary,
             vec![
                 ("empty_textual", Textual, Some(0), Some(true), true),
-                ("garbage", Unknown, None, None, false),
+                ("garbage", Unknown, None, None, true),
                 ("textual_binary_secret", Textual, Some(1), Some(true), true),
                 (
                     "textual_multiline_secret",
@@ -202,6 +211,8 @@ mod tests {
         );
         assert_eq!(infos[3].display_name.as_deref(), Some("Multiline"));
         assert!(infos[0].size > 0);
+        assert!(infos[1].error.is_some());
+        assert!(infos[0].error.is_none());
     }
 
     /// A missing directory is an empty list; non-keyring files are skipped.
