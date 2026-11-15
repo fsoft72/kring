@@ -11,3 +11,4 @@
 - Added `SecretStore`/`MasterPasswordStore` traits and in-memory `FakeStore` (feature `fake`).
 - Added `scripts/it-session.sh` (private dbus session + throwaway gnome-keyring) and the `it_smoke` integration test.
 - Added Secret Service backend (`SecretServiceBackend`, standard API via oo7, encrypted session) with D-Bus error mapping; integration tests guarded by `it_guard` (session script now exports `KRING_IT_RUNTIME`).
+- Added provider detection (`ProviderKind`, `detect`, `classify`) and PAM detection (`pam_status`), with an `it_provider` integration test.
