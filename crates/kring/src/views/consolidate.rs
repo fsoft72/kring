@@ -29,7 +29,7 @@ use crate::ui::widgets::{
     accent_card, card, chip, danger_button, field_label, heading, muted, muted_text,
     primary_button, secondary_button, semibold,
 };
-use crate::views::collection::{display_name, display_names};
+use crate::views::collection::{compact_name, display_name, display_names};
 use crate::views::conflict_row::{MSG_CONFLICTS, RowEvent, conflict_row};
 use crate::views::dialogs::DialogKind;
 use crate::views::locked_list;
@@ -552,9 +552,24 @@ pub fn list_order<'a>(
     out
 }
 
-/// Renders one keyring row of the list (shown as `name`) with its role
-/// chip; the chip keeps its room on the right and the name is truncated.
-fn _list_row(ui: &mut Ui, c: &CollectionInfo, name: &str, role: Option<Role>) {
+/// Returns the subline of a keyring row: `detail`, after the shared label
+/// `prefix` when there is one (e.g. `Default keyring · locked`).
+pub fn list_subline(prefix: Option<&str>, detail: &str) -> String {
+    match prefix {
+        Some(label) => format!("{label} · {detail}"),
+        None => detail.to_string(),
+    }
+}
+
+/// Renders one keyring row of the list titled `title` (see
+/// [`compact_name`]) with its role chip; the chip keeps its room on the
+/// right and only an over-long text is truncated.
+fn _list_row(
+    ui: &mut Ui,
+    c: &CollectionInfo,
+    (title, prefix): (String, Option<String>),
+    role: Option<Role>,
+) {
     let size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     row_background(ui, rect, false, resp.hovered());
@@ -571,13 +586,14 @@ fn _list_row(ui: &mut Ui, c: &CollectionInfo, name: &str, role: Option<Role>) {
             }
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.add_space(4.0);
-                ui.add(egui::Label::new(semibold(name, 14.0)).truncate());
+                ui.add(egui::Label::new(semibold(title, 14.0)).truncate());
                 let detail = if c.locked {
                     "locked".to_string()
                 } else {
                     count_noun(c.item_count, "item")
                 };
-                ui.label(muted_text(detail));
+                let subline = list_subline(prefix.as_deref(), &detail);
+                ui.add(egui::Label::new(muted_text(subline)).truncate());
             });
         },
     );
@@ -596,8 +612,7 @@ pub fn list(ui: &mut Ui, state: &AppState, view: &ConsolidateView) -> Option<Act
             let names = display_names(&state.collections);
             for c in list_order(&state.collections, &names) {
                 let role = keyring_role(summary, view.target.as_ref(), c);
-                let name = names.get(&c.id).map_or("", String::as_str);
-                _list_row(ui, c, name, role);
+                _list_row(ui, c, compact_name(&state.collections, &c.id), role);
             }
         });
     None
@@ -1383,6 +1398,16 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The subline carries the shared label before the detail.
+    #[test]
+    fn list_subline_prefixes_shared_label() {
+        assert_eq!(
+            list_subline(Some("Default keyring"), "locked"),
+            "Default keyring · locked"
+        );
+        assert_eq!(list_subline(None, "3 items"), "3 items");
     }
 
     /// The keyring list is in natural order of the shown names.

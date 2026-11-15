@@ -91,6 +91,27 @@ pub fn display_names(collections: &[CollectionInfo]) -> HashMap<CollectionId, St
         .collect()
 }
 
+/// Returns the title of collection `id` in narrow lists and the label
+/// prefix of its subline: a label shared by several collections becomes
+/// the prefix and the keyring id the title (`("Default_keyring_3",
+/// Some("Default keyring"))`); a unique label stays the title with no
+/// prefix. An unlisted collection is titled by its keyring id.
+pub fn compact_name(collections: &[CollectionInfo], id: &CollectionId) -> (String, Option<String>) {
+    let Some(c) = collections.iter().find(|c| &c.id == id) else {
+        return (collection_key(id), None);
+    };
+    let base = display_name(c);
+    let shared = collections
+        .iter()
+        .filter(|other| display_name(other) == base)
+        .count()
+        > 1;
+    if !shared {
+        return (base, None);
+    }
+    (collection_key(id), Some(base))
+}
+
 /// Returns the shown name of `c` among `collections` (see [`display_names`]).
 pub fn shown_name(collections: &[CollectionInfo], c: &CollectionInfo) -> String {
     display_names(collections)
@@ -324,6 +345,43 @@ mod tests {
             created: 0,
             modified: 0,
         }
+    }
+
+    /// Compact lists title a shared label by its keyring id and move the
+    /// label to the subline; a unique label stays the title.
+    #[test]
+    fn compact_names() {
+        let named = |path: &str, label: &str| CollectionInfo {
+            label: label.into(),
+            ..col(path, &[], false)
+        };
+        let cols = [
+            named("/c/Default_5fkeyring_5f3", "Default keyring"),
+            named("/c/Default_5fkeyring_5f10", "Default keyring"),
+            named("/c/work", "Work"),
+            named("/c/session", ""),
+        ];
+        let id = |p: &str| CollectionId(p.into());
+        assert_eq!(
+            compact_name(&cols, &id("/c/Default_5fkeyring_5f3")),
+            (
+                "Default_keyring_3".to_string(),
+                Some("Default keyring".to_string())
+            )
+        );
+        assert_eq!(
+            compact_name(&cols, &id("/c/work")),
+            ("Work".to_string(), None)
+        );
+        assert_eq!(
+            compact_name(&cols, &id("/c/session")),
+            ("session".to_string(), None)
+        );
+        assert_eq!(
+            compact_name(&cols, &id("/c/gone")),
+            ("gone".to_string(), None),
+            "unlisted: its keyring id"
+        );
     }
 
     /// Badges follow default alias, login and lock state, in that order.

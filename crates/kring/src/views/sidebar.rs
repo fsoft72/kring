@@ -9,7 +9,7 @@ use crate::ui::theme;
 use crate::ui::widgets::{
     chip, chip_width, muted, muted_text, primary_button, search_box, semibold,
 };
-use crate::views::collection::{display_names, is_default};
+use crate::views::collection::{compact_name, display_names, is_default};
 use crate::views::dialogs::DialogKind;
 use crate::views::{Action, Gates};
 
@@ -48,8 +48,30 @@ pub fn row_background(ui: &Ui, rect: egui::Rect, selected: bool, hovered: bool) 
     }
 }
 
-/// Renders one keyring row with its shown `name`; returns true when clicked.
-fn _row(ui: &mut Ui, c: &CollectionInfo, name: &str, selected: bool) -> bool {
+/// Renders the title of a row (truncated in the room `reserved` leaves for
+/// the chips) followed by its chips.
+fn _title_line(ui: &mut Ui, title: &str, chips: &[&str], reserved: f32) {
+    let name = RichText::new(title)
+        .family(theme::medium())
+        .size(14.0)
+        .color(theme::TEXT);
+    ui.scope(|ui| {
+        ui.set_max_width((ui.available_width() - reserved).max(0.0));
+        ui.add(egui::Label::new(name).truncate().selectable(false));
+    });
+    for text in chips {
+        chip(ui, text, theme::SECONDARY);
+    }
+}
+
+/// Renders one keyring row titled `title`, with the shared label `prefix`
+/// as a muted subline (see [`compact_name`]); returns true when clicked.
+fn _row(
+    ui: &mut Ui,
+    c: &CollectionInfo,
+    (title, prefix): (String, Option<String>),
+    selected: bool,
+) -> bool {
     let size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -73,18 +95,18 @@ fn _row(ui: &mut Ui, c: &CollectionInfo, name: &str, selected: bool) -> bool {
             .collect();
         let spacing = ui.spacing().item_spacing.x;
         let reserved: f32 = chips.iter().map(|t| chip_width(ui, t) + spacing).sum();
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            let name = RichText::new(name)
-                .family(theme::medium())
-                .size(14.0)
-                .color(theme::TEXT);
-            ui.scope(|ui| {
-                ui.set_max_width((ui.available_width() - reserved).max(0.0));
-                ui.add(egui::Label::new(name).truncate().selectable(false));
+        let Some(prefix) = prefix else {
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                _title_line(ui, &title, &chips, reserved);
             });
-            for text in chips {
-                chip(ui, text, theme::SECONDARY);
-            }
+            return;
+        };
+        ui.with_layout(Layout::top_down(Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.add_space(4.0);
+            ui.horizontal(|ui| _title_line(ui, &title, &chips, reserved));
+            let subline = egui::Label::new(muted_text(prefix));
+            ui.add(subline.truncate().selectable(false));
         });
     });
     resp.clicked()
@@ -117,7 +139,8 @@ pub fn show(ui: &mut Ui, state: &AppState, filter: &mut String, gates: Gates) ->
                     continue;
                 }
                 let selected = state.selected.as_ref() == Some(&c.id);
-                if _row(ui, c, name, selected) {
+                let shown = compact_name(&state.collections, &c.id);
+                if _row(ui, c, shown, selected) {
                     action = Some(Action::SelectCollection(c.id.clone()));
                 }
             }
