@@ -12,6 +12,7 @@ pub mod pam;
 pub mod paths;
 pub mod provider;
 pub mod secret_service;
+pub mod ssh;
 pub mod store;
 pub mod transfer;
 pub mod validate;

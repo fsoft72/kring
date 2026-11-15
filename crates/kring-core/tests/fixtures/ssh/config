@@ -1,0 +1,4 @@
+# decoy
+Host example
+    HostName example.invalid
+    IdentityFile ~/.ssh/id_ed25519

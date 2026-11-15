@@ -1,0 +1,2 @@
+# decoy: must never be listed as a key
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMNLcyBBym2GYMTZUjFmWCJC0fyvIhGKqNszSXVhUo4g fixture@kring
