@@ -6,6 +6,6 @@ pub mod clipboard;
 pub mod copy_flow;
 pub mod secret_display;
 pub mod startup;
+pub mod ui;
 pub mod views;
-pub mod widgets;
 pub mod worker;

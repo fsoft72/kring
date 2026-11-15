@@ -1,4 +1,4 @@
-//! The main window: wires worker events, views, dialogs and the clipboard.
+//! The main window: wires worker events, views, dialogs, toasts and the clipboard.
 
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
@@ -8,35 +8,43 @@ use eframe::egui;
 use crate::app_state::AppState;
 use crate::clipboard::ArboardClipboard;
 use crate::copy_flow::SecretCopier;
+use crate::ui::theme;
+use crate::ui::toasts::{ToastKind, Toasts, kind_for_status};
 use crate::views::dialogs::{Dialog, DialogKind, Outcome};
 use crate::views::item_detail::AttrEditor;
-use crate::views::{Action, Gates, collection, item_detail, sidebar};
+use crate::views::rail::WorkerActivity;
+use crate::views::{Action, Gates, banners, collection, rail, sidebar};
 use crate::worker::{Command, Event, WorkerHandle};
 
 /// Repaint interval while a copied secret waits to be cleared.
 const CLIPBOARD_REPAINT: Duration = Duration::from_secs(1);
-/// Banner shown when the worker thread is gone.
-const MSG_WORKER_STOPPED: &str = "Background worker stopped, restart kring";
-/// Banner shown when no provider owns the Secret Service name.
-const MSG_NO_PROVIDER: &str = "No Secret Service provider running";
-/// Default width of the sidebar.
-const SIDEBAR_WIDTH: f32 = 200.0;
+/// Width of the nav rail.
+const RAIL_WIDTH: f32 = 64.0;
+/// Default width of the keyring list.
+const LIST_WIDTH: f32 = 340.0;
+/// Minimum width of the keyring list.
+const LIST_MIN_WIDTH: f32 = 280.0;
+/// Maximum width of the keyring list.
+const LIST_MAX_WIDTH: f32 = 520.0;
+/// Reading width cap of the detail pane.
+const DETAIL_MAX_WIDTH: f32 = 860.0;
+/// Horizontal margin of the detail pane.
+const DETAIL_MARGIN_X: i8 = 28;
+/// Vertical margin of the detail pane.
+const DETAIL_MARGIN_Y: i8 = 22;
 
-/// Returns the status bar summary of the collections.
-pub fn status_line(state: &AppState) -> String {
-    let locked = state.collections.iter().filter(|c| c.locked).count();
-    format!("{} collections, {locked} locked", state.collections.len())
-}
-
-/// Returns the worker state shown in the status bar.
-pub fn worker_label(stopped: bool, awaiting_reply: bool) -> &'static str {
-    if stopped {
-        return "worker: stopped";
-    }
-    if awaiting_reply {
-        return "worker: busy";
-    }
-    "worker: idle"
+/// Initial state requested for screenshots, honoured only inside the
+/// isolated dev session (see `main.rs`).
+#[derive(Debug, Default, Clone)]
+pub struct DevPreset {
+    /// Display name of the keyring to select first.
+    pub select: Option<String>,
+    /// Index of the item to expand once items are loaded.
+    pub expand: Option<usize>,
+    /// Reveal the expanded item's secret.
+    pub reveal: bool,
+    /// Dialog to open at start: `new-keyring` or `unlock`.
+    pub dialog: Option<String>,
 }
 
 /// The kring application.
@@ -49,7 +57,12 @@ pub struct KringApp {
     copier: SecretCopier<ArboardClipboard>,
     dialog: Option<Dialog>,
     editor: AttrEditor,
+    /// Item search text.
     filter: String,
+    /// Keyring search text.
+    keyring_filter: String,
+    toasts: Toasts,
+    dev: DevPreset,
 }
 
 impl KringApp {
@@ -64,7 +77,16 @@ impl KringApp {
             dialog: None,
             editor: AttrEditor::default(),
             filter: String::new(),
+            keyring_filter: String::new(),
+            toasts: Toasts::default(),
+            dev: DevPreset::default(),
         }
+    }
+
+    /// Applies a dev preset (screenshots in the isolated dev session only).
+    pub fn with_dev_preset(mut self, dev: DevPreset) -> Self {
+        self.dev = dev;
+        self
     }
 
     /// Applies every pending worker event; marks the worker stopped when disconnected.
@@ -84,6 +106,18 @@ impl KringApp {
                     break;
                 }
             }
+        }
+    }
+
+    /// Moves new status and error messages from the state into toasts.
+    fn _feed_toasts(&mut self) {
+        let now = Instant::now();
+        let (status, errors) = self.state.drain_messages();
+        if let Some(status) = status {
+            self.toasts.push(kind_for_status(&status), status, now);
+        }
+        for e in errors {
+            self.toasts.push(ToastKind::Error, e, now);
         }
     }
 
@@ -109,6 +143,11 @@ impl KringApp {
                 self.state.select_item(id);
                 self.copier.cancel();
             }
+            Action::DeselectItem => {
+                self.state.selected_item = None;
+                self.state.hide_secret();
+                self.copier.cancel();
+            }
             Action::HideSecret => self.state.hide_secret(),
             Action::CopySecret => {
                 if let Some(cmd) = self.copier.request(&mut self.state) {
@@ -130,16 +169,47 @@ impl KringApp {
         }
     }
 
-    /// Selects the first collection when nothing is selected.
+    /// Selects the first collection (or the dev preset one) when nothing is selected.
     fn _auto_select(&mut self) {
         if self.state.selected.is_some() || self.worker_stopped {
             return;
         }
-        let Some(first) = self.state.collections.first() else {
+        let wanted = self.dev.select.as_deref();
+        let preset = self
+            .state
+            .collections
+            .iter()
+            .find(|c| wanted == Some(collection::display_name(c).as_str()));
+        let Some(first) = preset.or(self.state.collections.first()) else {
             return;
         };
         let id = first.id.clone();
         self._handle(Action::SelectCollection(id));
+    }
+
+    /// Applies the dev preset item expansion and dialog once their data exists.
+    fn _apply_dev_preset(&mut self) {
+        if let Some(index) = self.dev.expand
+            && let Some(item) = self.state.items.get(index)
+        {
+            self.dev.expand = None;
+            let id = item.id.clone();
+            self._handle(Action::SelectItem(id.clone()));
+            if self.dev.reveal {
+                self._send(Command::RevealSecret(id));
+            }
+        }
+        let Some(name) = self.dev.dialog.clone() else {
+            return;
+        };
+        let locked = self.state.collections.iter().find(|c| c.locked);
+        let kind = match (name.as_str(), locked) {
+            ("new-keyring", _) => DialogKind::create_collection(),
+            ("unlock", Some(c)) => DialogKind::unlock(c.id.clone(), collection::display_name(c)),
+            _ => return,
+        };
+        self.dev.dialog = None;
+        self.dialog = Some(Dialog::new(kind));
     }
 
     /// Opens the passphrase dialog when the worker asked for one.
@@ -151,63 +221,6 @@ impl KringApp {
             return;
         };
         self.dialog = Some(Dialog::new(DialogKind::passphrase(cmd)));
-    }
-
-    /// Renders the title, search field and banners.
-    fn _top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("kring");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("search"));
-            });
-        });
-        let error = ui.visuals().error_fg_color;
-        let warn = ui.visuals().warn_fg_color;
-        if self.worker_stopped {
-            ui.colored_label(error, MSG_WORKER_STOPPED);
-        }
-        if self.state.provider_unavailable {
-            ui.colored_label(error, MSG_NO_PROVIDER);
-        }
-        let competitors = self.state.provider.as_ref().map(|p| &p.competitors);
-        if let Some(list) = competitors.filter(|l| !l.is_empty()) {
-            let names = list.join(", ");
-            let text = format!("Other services may claim org.freedesktop.secrets: {names}");
-            ui.colored_label(warn, text);
-        }
-    }
-
-    /// Renders the status bar.
-    fn _status_bar(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(format!("status: {}", status_line(&self.state)));
-            ui.weak(&self.state.status);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(worker_label(self.worker_stopped, self.awaiting_reply));
-            });
-        });
-    }
-
-    /// Renders the latest error with a dismiss button.
-    fn _errors(&mut self, ui: &mut egui::Ui) {
-        let Some(last) = self.state.errors.last() else {
-            return;
-        };
-        let count = self.state.errors.len();
-        let text = if count > 1 {
-            format!("{last} (+{} more)", count - 1)
-        } else {
-            last.clone()
-        };
-        let mut dismiss = false;
-        ui.horizontal_wrapped(|ui| {
-            ui.colored_label(ui.visuals().error_fg_color, text);
-            dismiss = ui.small_button("Dismiss").clicked();
-        });
-        if dismiss {
-            self.state.errors.clear();
-        }
-        ui.separator();
     }
 
     /// Shows the open dialog and handles its outcome.
@@ -224,6 +237,50 @@ impl KringApp {
             }
         }
     }
+
+    /// Renders the rail, the keyring list and the detail pane; returns the action.
+    fn _panels(&mut self, ui: &mut egui::Ui, gates: Gates) -> Option<Action> {
+        let mut action = None;
+        let activity = WorkerActivity::from_flags(self.worker_stopped, self.awaiting_reply);
+        egui::Panel::left("kring-rail")
+            .exact_size(RAIL_WIDTH)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::NAVY_DARK)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER))
+                    .inner_margin(egui::Margin::symmetric(8, 10)),
+            )
+            .show(ui, |ui| rail::show(ui, activity));
+        egui::Panel::left("kring-keyrings")
+            .resizable(true)
+            .default_size(LIST_WIDTH)
+            .size_range(LIST_MIN_WIDTH..=LIST_MAX_WIDTH)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::DEEP_DARK)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER))
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ui, |ui| {
+                action = sidebar::show(ui, &self.state, &mut self.keyring_filter, gates);
+            });
+        let frame = egui::Frame::new()
+            .fill(theme::DEEP_DARK)
+            .inner_margin(egui::Margin::symmetric(DETAIL_MARGIN_X, DETAIL_MARGIN_Y));
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            let full = ui.max_rect();
+            let width = full.width().min(DETAIL_MAX_WIDTH);
+            let col = egui::Rect::from_min_size(full.min, egui::vec2(width, full.height()));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(col), |ui| {
+                banners::show(ui, &self.state, self.worker_stopped);
+                let found =
+                    collection::show(ui, &self.state, &mut self.filter, &mut self.editor, gates);
+                action = found.or(action.take());
+            });
+        });
+        action
+    }
 }
 
 impl eframe::App for KringApp {
@@ -234,69 +291,18 @@ impl eframe::App for KringApp {
         self.copier.finish(&mut self.state);
         self._hide_locked_secret();
         self._auto_select();
+        self._apply_dev_preset();
         if self.copier.tick(Instant::now()) {
             ctx.request_repaint_after(CLIPBOARD_REPAINT);
         }
         self._open_passphrase_dialog();
         let gates = Gates::from_provider(self.state.provider.as_ref());
-        let mut action = None;
-        egui::Panel::top("kring-top").show(ui, |ui| self._top_bar(ui));
-        egui::Panel::bottom("kring-status").show(ui, |ui| self._status_bar(ui));
-        egui::Panel::left("kring-sidebar")
-            .resizable(true)
-            .default_size(SIDEBAR_WIDTH)
-            .show(ui, |ui| action = sidebar::show(ui, &self.state, gates));
-        egui::CentralPanel::default().show(ui, |ui| {
-            self._errors(ui);
-            let found = collection::show(ui, &self.state, &self.filter, gates);
-            action = found.or(action.take());
-            ui.separator();
-            let found = item_detail::show(ui, &self.state, &mut self.editor, gates);
-            action = found.or(action.take());
-        });
+        let action = self._panels(ui, gates);
         self._dialog(&ctx);
         if let Some(action) = action {
             self._handle(action);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use kring_core::model::{CollectionId, CollectionInfo};
-
-    /// Builds a collection with the given lock state.
-    fn col(path: &str, locked: bool) -> CollectionInfo {
-        CollectionInfo {
-            id: CollectionId(path.into()),
-            label: path.into(),
-            locked,
-            item_count: 0,
-            aliases: vec![],
-            is_login: false,
-            created: 0,
-            modified: 0,
-        }
-    }
-
-    /// The status line counts collections and locked ones.
-    #[test]
-    fn status_counts_locked() {
-        let mut s = AppState::default();
-        s.apply(Event::Collections(vec![
-            col("/c/a", true),
-            col("/c/b", false),
-            col("/c/c", true),
-        ]));
-        assert_eq!(status_line(&s), "3 collections, 2 locked");
-    }
-
-    /// The worker label prefers stopped over busy over idle.
-    #[test]
-    fn worker_label_states() {
-        assert_eq!(worker_label(true, true), "worker: stopped");
-        assert_eq!(worker_label(false, true), "worker: busy");
-        assert_eq!(worker_label(false, false), "worker: idle");
+        self._feed_toasts();
+        self.toasts.draw(&ctx);
     }
 }

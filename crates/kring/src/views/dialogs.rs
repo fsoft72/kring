@@ -4,15 +4,21 @@ use eframe::egui;
 use kring_core::model::{Attributes, CollectionId, ItemId};
 use zeroize::Zeroizing;
 
+use crate::ui::password_field::{forget_fields, new_buffer};
+use crate::ui::theme;
+use crate::ui::widgets::{danger_button, primary_button, secondary_button};
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_submit::command_for;
-use crate::widgets::password_field::{forget_fields, new_buffer};
 use crate::worker::Command;
 
 /// Id of the (single) open modal.
 const MODAL_ID: &str = "kring-dialog";
-/// Width of dialogs: field width plus room for the field labels.
-const DIALOG_WIDTH: f32 = FIELD_WIDTH + 140.0;
+/// Width of dialog content.
+const DIALOG_WIDTH: f32 = FIELD_WIDTH;
+/// Inner margin of dialogs.
+const DIALOG_MARGIN: i8 = 24;
+/// Opacity of the backdrop behind a dialog.
+const BACKDROP_ALPHA: u8 = 150;
 
 /// The content of a dialog. Password buffers are zeroized when it is dropped.
 pub enum DialogKind {
@@ -169,16 +175,29 @@ impl Dialog {
     pub fn show(&mut self, ctx: &egui::Context) -> Outcome {
         let mut submit = false;
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::unique(MODAL_ID)).show(ctx, |ui| {
+        let frame = egui::Frame::new()
+            .fill(theme::SURFACE)
+            .stroke(egui::Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER))
+            .corner_radius(egui::CornerRadius::same(theme::RADIUS_WINDOW))
+            .shadow(ctx.global_style().visuals.window_shadow)
+            .inner_margin(egui::Margin::same(DIALOG_MARGIN));
+        let modal = egui::Modal::new(egui::Id::unique(MODAL_ID))
+            .frame(frame)
+            .backdrop_color(egui::Color32::from_black_alpha(BACKDROP_ALPHA));
+        let response = modal.show(ctx, |ui| {
             ui.set_width(DIALOG_WIDTH);
-            let primary = body(ui, &mut self.kind);
+            let main = body(ui, &mut self.kind);
             if let Some(err) = &self.error {
-                ui.colored_label(ui.visuals().error_fg_color, err);
+                ui.label(egui::RichText::new(err).color(theme::ERROR));
             }
-            ui.separator();
-            ui.horizontal(|ui| {
-                submit = ui.button(primary).clicked();
-                cancel = ui.button("Cancel").clicked();
+            ui.add_space(8.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                submit = if main.danger {
+                    danger_button(ui, main.text, None)
+                } else {
+                    primary_button(ui, main.text, None)
+                };
+                cancel = secondary_button(ui, "Cancel", None);
             });
         });
         if cancel || response.should_close() {

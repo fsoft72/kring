@@ -1,14 +1,16 @@
 //! Views of the main window and the actions they request.
 
 pub mod attr_diff;
+pub mod banners;
 pub mod collection;
 pub mod dialog_body;
 pub mod dialog_submit;
 pub mod dialogs;
 pub mod item_detail;
+pub mod item_list;
+pub mod rail;
 pub mod sidebar;
 
-use eframe::egui;
 use kring_core::model::{CollectionId, ItemId};
 use kring_core::provider::ProviderInfo;
 
@@ -28,8 +30,10 @@ pub enum Action {
     Send(Command),
     /// Select a collection and load its items.
     SelectCollection(CollectionId),
-    /// Select an item (does not reveal its secret).
+    /// Select (expand) an item; does not reveal its secret.
     SelectItem(ItemId),
+    /// Collapse the expanded item and hide its secret.
+    DeselectItem,
     /// Hide the revealed secret.
     HideSecret,
     /// Copy the secret of the selected item to the clipboard.
@@ -65,15 +69,6 @@ impl Gates {
     /// Gate of actions needing both writes and the master password interface.
     pub fn write_and_master(&self) -> Option<&'static str> {
         self.write.or(self.master)
-    }
-}
-
-/// Adds a button that is disabled with `blocked` as tooltip; returns true when clicked.
-pub fn gated_button(ui: &mut egui::Ui, text: &str, blocked: Option<&str>) -> bool {
-    let response = ui.add_enabled(blocked.is_none(), egui::Button::new(text));
-    match blocked {
-        Some(reason) => response.on_disabled_hover_text(reason).clicked(),
-        None => response.clicked(),
     }
 }
 

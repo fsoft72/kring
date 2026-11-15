@@ -4,20 +4,26 @@ use eframe::egui;
 use kring_core::model::{Attributes, CollectionInfo, ItemInfo, decode_path_segment};
 
 use crate::app_state::AppState;
+use crate::ui::glyphs::Ico;
+use crate::ui::theme;
+use crate::ui::widgets::{chip, glyph_tile, heading, ico_button, muted, note, semibold};
 use crate::views::dialogs::DialogKind;
-use crate::views::{Action, Gates, gated_button};
+use crate::views::item_detail::AttrEditor;
+use crate::views::{Action, Gates, item_list};
 use crate::worker::Command;
 
 /// Alias of the default collection.
 const DEFAULT_ALIAS: &str = "default";
-/// Maximum characters of the attributes summary in the item table.
-const MAX_SUMMARY_CHARS: usize = 40;
-/// Height of the item table.
-const TABLE_HEIGHT: f32 = 220.0;
-/// Tooltip of item actions while the collection is locked.
-const MSG_LOCKED: &str = "Unlock the collection first";
-/// Tooltip of item actions without a selected item.
-const MSG_NO_ITEM: &str = "Select an item first";
+/// Maximum characters of the attributes summary on an item card.
+const MAX_SUMMARY_CHARS: usize = 64;
+/// Chip of the default collection.
+const BADGE_DEFAULT: &str = "DEFAULT";
+/// Chip of the login collection.
+const BADGE_LOGIN: &str = "LOGIN";
+/// Chip of a locked collection.
+const BADGE_LOCKED: &str = "LOCKED";
+/// Tooltip of "Set as default" on the default collection.
+const MSG_ALREADY_DEFAULT: &str = "Already the default keyring";
 /// Warning shown when PAM does not unlock the login keyring.
 const MSG_PAM_MISSING: &str = "PAM does not unlock this keyring at login";
 /// Information always shown on the login keyring.
@@ -29,12 +35,12 @@ const MSG_DELETE_LOGIN: &str = "This is your login keyring, unlocked at login";
 /// Delete warning for the default keyring.
 const MSG_DELETE_DEFAULT: &str = "This is the default keyring";
 
-/// Returns the badges of a collection header.
+/// Returns the chips of a collection header (default, login, locked).
 pub fn badges(c: &CollectionInfo) -> Vec<&'static str> {
     let flags = [
-        (is_default(c), "[default]"),
-        (c.is_login, "[login keyring]"),
-        (c.locked, "[locked]"),
+        (is_default(c), BADGE_DEFAULT),
+        (c.is_login, BADGE_LOGIN),
+        (c.locked, BADGE_LOCKED),
     ];
     flags
         .into_iter()
@@ -104,143 +110,141 @@ pub fn matches_filter(item: &ItemInfo, filter: &str) -> bool {
     hit(&item.label) || item.attributes.iter().any(|(k, v)| hit(k) || hit(v))
 }
 
-/// Renders header, badges and notices of a collection.
-fn _header(ui: &mut egui::Ui, state: &AppState, c: &CollectionInfo) {
-    ui.horizontal_wrapped(|ui| {
-        ui.heading(display_name(c));
-        for badge in badges(c) {
-            ui.label(egui::RichText::new(badge).strong());
-        }
+/// Returns the muted subline of the header, e.g. `3 items - unlocked`.
+pub fn header_subline(c: &CollectionInfo) -> String {
+    let noun = if c.item_count == 1 { "item" } else { "items" };
+    let lock = if c.locked { "locked" } else { "unlocked" };
+    format!("{} {noun} - {lock}", c.item_count)
+}
+
+/// Renders the chips of a collection header.
+fn _chips(ui: &mut egui::Ui, c: &CollectionInfo) {
+    for badge in badges(c) {
+        let color = if badge == BADGE_LOCKED {
+            theme::TERTIARY
+        } else {
+            theme::SECONDARY
+        };
+        chip(ui, badge, color);
+    }
+}
+
+/// Renders the right-aligned icon actions of a collection header.
+fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<Action> {
+    let mut action = None;
+    let delete = Action::Open(DialogKind::DeleteCollection {
+        collection: c.id.clone(),
+        label: display_name(c),
+        item_count: c.item_count,
+        warnings: delete_warnings(c),
     });
+    if ico_button(ui, Ico::Trash, "Delete keyring", gates.write, true) {
+        action = Some(delete);
+    }
+    if ico_button(
+        ui,
+        Ico::Key,
+        "Change password",
+        gates.write_and_master(),
+        false,
+    ) {
+        let kind = DialogKind::change_password(c.id.clone(), display_name(c));
+        action = Some(Action::Open(kind));
+    }
+    if ico_button(ui, Ico::Pencil, "Rename", gates.write, false) {
+        action = Some(Action::Open(DialogKind::Rename {
+            collection: c.id.clone(),
+            label: c.label.clone(),
+        }));
+    }
+    let already = is_default(c).then_some(MSG_ALREADY_DEFAULT);
+    if ico_button(
+        ui,
+        Ico::Star,
+        "Set as default",
+        gates.write.or(already),
+        false,
+    ) {
+        action = Some(Action::Send(Command::SetDefault(c.id.clone())));
+    }
+    if c.locked {
+        if ico_button(ui, Ico::Unlock, "Unlock", gates.master, false) {
+            let kind = DialogKind::unlock(c.id.clone(), display_name(c));
+            action = Some(Action::Open(kind));
+        }
+    } else if ico_button(ui, Ico::Lock, "Lock", None, false) {
+        action = Some(Action::Send(Command::Lock(c.id.clone())));
+    }
+    action
+}
+
+/// Renders title, chips, subline and icon actions of a collection.
+fn _header(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<Action> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.add(egui::Label::new(semibold(display_name(c), 22.0)).truncate());
+        _chips(ui, c);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            action = _collection_actions(ui, c, gates);
+        });
+    });
+    muted(ui, &header_subline(c));
+    action
+}
+
+/// Renders the login keyring notes (PAM warning, password information).
+fn _notes(ui: &mut egui::Ui, state: &AppState, c: &CollectionInfo) {
     if !c.is_login {
         return;
     }
+    ui.add_space(4.0);
     if state.pam.as_ref().is_some_and(|p| !p.configured) {
-        ui.colored_label(ui.visuals().warn_fg_color, MSG_PAM_MISSING);
+        note(ui, theme::TERTIARY, MSG_PAM_MISSING, theme::TERTIARY);
     }
-    ui.weak(MSG_LOGIN_PASSWORD);
+    note(ui, theme::SECONDARY, MSG_LOGIN_PASSWORD, theme::MUTED);
 }
 
-/// Renders the collection action buttons.
-fn _collection_actions(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<Action> {
-    let mut action = None;
-    ui.horizontal_wrapped(|ui| {
-        if c.locked {
-            if gated_button(ui, "Unlock", gates.master) {
-                let kind = DialogKind::unlock(c.id.clone(), display_name(c));
-                action = Some(Action::Open(kind));
-            }
-        } else if ui.button("Lock").clicked() {
-            action = Some(Action::Send(Command::Lock(c.id.clone())));
-        }
-        let already = is_default(c).then_some("Already the default collection");
-        if gated_button(ui, "Set as default", gates.write.or(already)) {
-            action = Some(Action::Send(Command::SetDefault(c.id.clone())));
-        }
-        if gated_button(ui, "Rename", gates.write) {
-            action = Some(Action::Open(DialogKind::Rename {
-                collection: c.id.clone(),
-                label: c.label.clone(),
-            }));
-        }
-        if gated_button(ui, "Change password", gates.write_and_master()) {
-            let kind = DialogKind::change_password(c.id.clone(), display_name(c));
-            action = Some(Action::Open(kind));
-        }
-        if gated_button(ui, "Delete", gates.write) {
-            action = Some(Action::Open(DialogKind::DeleteCollection {
-                collection: c.id.clone(),
-                label: display_name(c),
-                item_count: c.item_count,
-                warnings: delete_warnings(c),
-            }));
-        }
+/// Renders the empty state shown when no keyring is selected.
+pub fn empty_state(ui: &mut egui::Ui, state: &AppState) {
+    ui.add_space(40.0);
+    ui.vertical_centered(|ui| {
+        glyph_tile(ui, Ico::Lock, 64.0);
+        ui.add_space(8.0);
+        heading(ui, "Select a keyring");
+        muted(ui, "Choose a keyring on the left or create a new one.");
+        ui.add_space(12.0);
+        let items: usize = state.collections.iter().map(|c| c.item_count).sum();
+        let locked = state.collections.iter().filter(|c| c.locked).count();
+        let total = state.collections.len();
+        muted(
+            ui,
+            &format!("{total} keyrings - {locked} locked - {items} items"),
+        );
     });
-    action
 }
 
-/// Renders the item table; returns the clicked item action.
-fn _item_table(ui: &mut egui::Ui, state: &AppState, filter: &str) -> Option<Action> {
-    let mut action = None;
-    egui::ScrollArea::vertical()
-        .id_salt("kring-items")
-        .max_height(TABLE_HEIGHT)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            egui::Grid::new("kring-item-grid")
-                .num_columns(3)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Label");
-                    ui.strong("Attributes");
-                    ui.strong("Modified");
-                    ui.end_row();
-                    for item in state.items.iter().filter(|i| matches_filter(i, filter)) {
-                        let selected = state.selected_item.as_ref() == Some(&item.id);
-                        if ui.selectable_label(selected, &item.label).clicked() {
-                            action = Some(Action::SelectItem(item.id.clone()));
-                        }
-                        ui.label(attributes_summary(&item.attributes));
-                        ui.label(format_date(item.modified));
-                        ui.end_row();
-                    }
-                });
-        });
-    action
-}
-
-/// Renders the item action buttons.
-fn _item_actions(
+/// Renders the selected collection with its item cards.
+pub fn show(
     ui: &mut egui::Ui,
     state: &AppState,
-    c: &CollectionInfo,
+    filter: &mut String,
+    editor: &mut AttrEditor,
     gates: Gates,
 ) -> Option<Action> {
-    let locked = c.locked.then_some(MSG_LOCKED);
-    let selected = state
-        .selected_item
-        .as_ref()
-        .and_then(|id| state.items.iter().find(|i| &i.id == id));
-    let no_item = selected.is_none().then_some(MSG_NO_ITEM);
-    let mut action = None;
-    ui.horizontal(|ui| {
-        if gated_button(ui, "New item", gates.write.or(locked)) {
-            action = Some(Action::Open(DialogKind::new_item(c.id.clone())));
-        }
-        let blocked = gates.write.or(locked).or(no_item);
-        if gated_button(ui, "Edit", blocked)
-            && let Some(item) = selected
-        {
-            let kind = DialogKind::edit_item(item.id.clone(), item.label.clone());
-            action = Some(Action::Open(kind));
-        }
-        if gated_button(ui, "Delete item", blocked)
-            && let Some(item) = selected
-        {
-            action = Some(Action::Open(DialogKind::DeleteItem {
-                item: item.id.clone(),
-                label: item.label.clone(),
-            }));
-        }
-    });
-    action
-}
-
-/// Renders the selected collection (without the item detail).
-pub fn show(ui: &mut egui::Ui, state: &AppState, filter: &str, gates: Gates) -> Option<Action> {
     let Some(c) = state
         .selected
         .as_ref()
         .and_then(|id| state.collections.iter().find(|c| &c.id == id))
     else {
-        ui.weak("Select a collection");
+        empty_state(ui, state);
         return None;
     };
-    _header(ui, state, c);
-    let mut action = _collection_actions(ui, c, gates);
-    ui.separator();
-    action = _item_table(ui, state, filter).or(action);
-    action = _item_actions(ui, state, c, gates).or(action);
+    let mut action = _header(ui, c, gates);
+    _notes(ui, state, c);
+    ui.add_space(10.0);
+    action = item_list::show(ui, state, c, filter, editor, gates).or(action);
     action
 }
 
@@ -267,9 +271,9 @@ mod tests {
     #[test]
     fn badges_in_order() {
         let login = col(LOGIN_COLLECTION_PATH, &["default", "login"], true);
-        assert_eq!(badges(&login), ["[default]", "[login keyring]", "[locked]"]);
+        assert_eq!(badges(&login), ["DEFAULT", "LOGIN", "LOCKED"]);
         assert!(badges(&col("/c/w", &[], false)).is_empty());
-        assert_eq!(badges(&col("/c/w", &["default"], false)), ["[default]"]);
+        assert_eq!(badges(&col("/c/w", &["default"], false)), ["DEFAULT"]);
     }
 
     /// Attributes are joined and long summaries are truncated with an ellipsis.
@@ -309,6 +313,16 @@ mod tests {
         assert_eq!(display_name(&escaped), "My_Keys");
         c.label = "Mine".into();
         assert_eq!(display_name(&c), "Mine");
+    }
+
+    /// The subline counts items and states the lock.
+    #[test]
+    fn subline_counts_and_lock() {
+        let mut c = col("/c/w", &[], true);
+        assert_eq!(header_subline(&c), "0 items - locked");
+        c.item_count = 1;
+        c.locked = false;
+        assert_eq!(header_subline(&c), "1 item - unlocked");
     }
 
     /// Dates are shown as YYYY-MM-DD; zero is unknown.

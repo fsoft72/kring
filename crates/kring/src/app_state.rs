@@ -110,6 +110,13 @@ impl AppState {
     pub fn hide_secret(&mut self) {
         self.revealed = None;
     }
+
+    /// Takes the pending status message (if any) and errors, for display as toasts.
+    pub fn drain_messages(&mut self) -> (Option<String>, Vec<String>) {
+        let status = std::mem::take(&mut self.status);
+        let errors = std::mem::take(&mut self.errors);
+        ((!status.is_empty()).then_some(status), errors)
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +217,20 @@ mod tests {
         s.select_collection(CollectionId("/c/a".into()));
         s.apply(Event::Collections(vec![col("/c/b", "b", &[])]));
         assert!(s.selected.is_none());
+    }
+
+    /// Draining returns the status and errors once, then nothing.
+    #[test]
+    fn drain_messages_once() {
+        let mut s = AppState::default();
+        s.apply(Event::Done("renamed".into()));
+        s.apply(Event::Error("e1".into()));
+        s.apply(Event::Error("e2".into()));
+        let (status, errors) = s.drain_messages();
+        assert_eq!(status.as_deref(), Some("renamed"));
+        assert_eq!(errors, ["e1", "e2"]);
+        assert!(s.status.is_empty() && s.errors.is_empty());
+        assert_eq!(s.drain_messages(), (None, vec![]));
     }
 
     /// Errors are capped at the last 20.
