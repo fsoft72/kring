@@ -356,7 +356,13 @@ where
             .build();
         let runtime = match runtime {
             Ok(rt) => rt,
-            Err(e) => return out.error(format!("Cannot start worker runtime: {e}")),
+            Err(e) => {
+                // No runtime to drop the store in: the oo7 Service would panic
+                // in its Drop, so leak it (the app cannot work without the
+                // worker anyway).
+                std::mem::forget(store);
+                return out.error(format!("Cannot start worker runtime: {e}"));
+            }
         };
         let first = startup(&out, store.as_deref(), provider.as_ref(), &config);
         run_guarded(&out, &runtime, first);
