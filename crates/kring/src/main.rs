@@ -23,6 +23,9 @@ fn main() -> eframe::Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size(WINDOW_SIZE),
+        // Return from `run_native` instead of `process::exit`, so `KringApp` is
+        // dropped and its clipboard guard clears a still pending copied secret.
+        run_and_return: true,
         ..Default::default()
     };
     eframe::run_native(

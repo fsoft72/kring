@@ -77,14 +77,9 @@ impl EncryptedSession {
         DBusSecret::new_encrypted(self.session.clone(), to_secret(password), &self.aes_key)
             .map_err(|e| map_dbus(context, e))
     }
-
-    /// Closes the session, mapping a failure to a [`KringError`].
-    async fn close(&self, context: &str) -> Result<()> {
-        self.session.close().await.map_err(|e| map_dbus(context, e))
-    }
 }
 
-/// Closes a session on an error path; the original error takes precedence over a close failure.
+/// Closes a session, ignoring a close failure (the call outcome is what matters).
 async fn close_quietly(session: &Session) {
     let _ = session.close().await;
 }
@@ -180,14 +175,17 @@ impl SecretServiceBackend {
     }
 }
 
-/// Closes the session and returns the call result; a call error wins over a close error.
-async fn finish<T>(session: EncryptedSession, result: Result<T>, context: &str) -> Result<T> {
-    let Ok(value) = result else {
-        close_quietly(&session.session).await;
-        return result;
-    };
-    session.close(context).await?;
-    Ok(value)
+/// Closes the session and returns the call result unchanged.
+///
+/// A close failure is ignored in both cases: after a successful call the change
+/// (collection created, unlocked or re-keyed) has already happened, so reporting
+/// an error would make the UI claim a failure for an applied operation; after a
+/// failed call the call error is the meaningful one. The service also drops the
+/// session when the connection closes. There is no decision left to unit-test
+/// here and a `Session` needs a live bus, so this is covered by `it_master_password`.
+async fn finish<T>(session: EncryptedSession, result: Result<T>) -> Result<T> {
+    close_quietly(&session.session).await;
+    result
 }
 
 #[async_trait::async_trait]
@@ -200,7 +198,7 @@ impl MasterPasswordStore for SecretServiceBackend {
     ) -> Result<CollectionId> {
         let session = EncryptedSession::open(self, CTX_CREATE).await?;
         let result = self.call_create(&session, label, password).await;
-        finish(session, result, CTX_CREATE).await
+        finish(session, result).await
     }
 
     /// Unlocks a collection with its password, without prompting.
@@ -211,7 +209,7 @@ impl MasterPasswordStore for SecretServiceBackend {
     ) -> Result<()> {
         let session = EncryptedSession::open(self, CTX_UNLOCK).await?;
         let result = self.call_unlock(&session, collection, password).await;
-        finish(session, result, CTX_UNLOCK).await
+        finish(session, result).await
     }
 
     /// Changes the password of a collection, without prompting.
@@ -223,6 +221,6 @@ impl MasterPasswordStore for SecretServiceBackend {
     ) -> Result<()> {
         let session = EncryptedSession::open(self, CTX_CHANGE).await?;
         let result = self.call_change(&session, collection, old, new).await;
-        finish(session, result, CTX_CHANGE).await
+        finish(session, result).await
     }
 }

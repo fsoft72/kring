@@ -107,24 +107,30 @@ impl SecretServiceBackend {
     }
 
     /// Reads the properties of one item.
+    ///
+    /// A property refused with `IsLocked` (e.g. a collection loaded from disk and
+    /// not unlocked yet) does not fail the read: the item is returned locked, with
+    /// an empty label, no attributes or zero timestamps for what was unreadable.
     async fn read_item_info(&self, collection: &CollectionId, path: &str) -> Result<ItemInfo> {
         let ctx = "reading an item";
         let i = api::Item::new(&self.connection, path.to_string())
             .await
             .map_err(|e| map_dbus(ctx, e))?;
+        let mut locked = false;
+        let map = |e| map_dbus(ctx, e);
+        let label = tolerate_locked(i.label().await.map_err(map), &mut locked)?;
+        let attributes = tolerate_locked(i.attributes().await.map_err(map), &mut locked)?;
+        let is_locked = tolerate_locked(i.is_locked().await.map_err(map), &mut locked)?;
+        let created = tolerate_locked(i.created().await.map_err(map), &mut locked)?;
+        let modified = tolerate_locked(i.modified().await.map_err(map), &mut locked)?;
         Ok(ItemInfo {
             id: ItemId(path.to_string()),
             collection: collection.clone(),
-            label: i.label().await.map_err(|e| map_dbus(ctx, e))?,
-            attributes: i
-                .attributes()
-                .await
-                .map_err(|e| map_dbus(ctx, e))?
-                .into_iter()
-                .collect(),
-            locked: i.is_locked().await.map_err(|e| map_dbus(ctx, e))?,
-            created: secs(i.created().await.map_err(|e| map_dbus(ctx, e))?),
-            modified: secs(i.modified().await.map_err(|e| map_dbus(ctx, e))?),
+            label: label.unwrap_or_default(),
+            attributes: attributes.unwrap_or_default().into_iter().collect(),
+            locked: locked || is_locked.unwrap_or(true),
+            created: created.map_or(0, secs),
+            modified: modified.map_or(0, secs),
         })
     }
 
@@ -151,6 +157,18 @@ async fn collection_items(collection: &Collection) -> Result<Vec<Item>> {
         .items()
         .await
         .map_err(|e| map_dbus("listing items", e))
+}
+
+/// Turns a `Locked` error into `None` and sets `locked`; other results pass through.
+fn tolerate_locked<T>(result: Result<T>, locked: &mut bool) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(KringError::Locked(_)) => {
+            *locked = true;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Converts a D-Bus duration to unix seconds.
@@ -338,5 +356,37 @@ impl SecretStore for SecretServiceBackend {
             .delete(None)
             .await
             .map_err(|e| map_dbus("deleting a collection", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Locked` error becomes `None` and marks the item locked.
+    #[test]
+    fn locked_property_is_tolerated() {
+        let mut locked = false;
+        let got = tolerate_locked::<String>(Err(KringError::Locked("/i".into())), &mut locked);
+        assert!(matches!(got, Ok(None)));
+        assert!(locked);
+    }
+
+    /// A readable property passes through and leaves the flag alone.
+    #[test]
+    fn readable_property_passes_through() {
+        let mut locked = false;
+        let got = tolerate_locked(Ok(5u64), &mut locked);
+        assert!(matches!(got, Ok(Some(5))));
+        assert!(!locked);
+    }
+
+    /// Other errors still fail the read.
+    #[test]
+    fn other_errors_propagate() {
+        let mut locked = false;
+        let got = tolerate_locked::<u64>(Err(KringError::NotFound("/i".into())), &mut locked);
+        assert!(matches!(got, Err(KringError::NotFound(_))));
+        assert!(!locked);
     }
 }

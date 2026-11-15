@@ -11,6 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use time::format_description::{parse_borrowed, well_known::Rfc3339};
+use zeroize::Zeroizing;
 
 /// Magic header of a binary gnome-keyring file.
 pub const KEYRING_MAGIC: &[u8] = b"GnomeKeyring\n\r\0\n";
@@ -49,6 +50,9 @@ pub struct BackupInfo {
     pub created: String,
     /// Files in the backup.
     pub files: Vec<BackupFile>,
+    /// Set when the backup was written but older backups could not be pruned.
+    #[serde(skip)]
+    pub prune_warning: Option<String>,
 }
 
 /// Creates, lists and prunes backups under a root directory.
@@ -145,6 +149,8 @@ impl BackupManager {
     ///
     /// Nothing is written if a source is missing or a passphrase is needed but absent.
     /// The backup is written to a temporary directory and renamed when complete.
+    /// Pruning old backups is best-effort: a failure is reported in
+    /// [`BackupInfo::prune_warning`] and does not fail the call.
     pub fn create(
         &self,
         reason: &str,
@@ -154,7 +160,7 @@ impl BackupManager {
         // Read everything and validate before touching the filesystem.
         let mut sources = Vec::new();
         for path in files {
-            let bytes = fs::read(path).map_err(|e| io_err(path, e))?;
+            let bytes = Zeroizing::new(fs::read(path).map_err(|e| io_err(path, e))?);
             let is_keyring = path.extension().is_some_and(|e| e == KEYRING_EXT);
             sources.push((path, is_keyring && is_plaintext_keyring(&bytes), bytes));
         }
@@ -187,7 +193,7 @@ impl BackupManager {
         let tmp_dir = PathBuf::from(tmp_name);
 
         let info = self.write_backup(&tmp_dir, &final_dir, &reason, created, &sources, secret);
-        let info = match info {
+        let mut info = match info {
             Ok(info) => info,
             Err(e) => {
                 let _ = fs::remove_dir_all(&tmp_dir);
@@ -198,7 +204,9 @@ impl BackupManager {
             let _ = fs::remove_dir_all(&tmp_dir);
             return Err(io_err(&final_dir, e));
         }
-        self.prune()?;
+        if let Err(e) = self.prune() {
+            info.prune_warning = Some(e.to_string());
+        }
         Ok(info)
     }
 
@@ -209,7 +217,7 @@ impl BackupManager {
         final_dir: &Path,
         reason: &str,
         created: String,
-        sources: &[(&PathBuf, bool, Vec<u8>)],
+        sources: &[(&PathBuf, bool, Zeroizing<Vec<u8>>)],
         secret: Option<SecretString>,
     ) -> Result<BackupInfo> {
         mkdir_private(tmp_dir)?;
@@ -220,15 +228,19 @@ impl BackupManager {
                 .ok_or_else(|| KringError::InvalidInput(format!("bad path {}", path.display())))?
                 .to_string_lossy()
                 .into_owned();
-            let (stored_name, data) = match (encrypt, &secret) {
-                (true, Some(pass)) => (format!("{name}.age"), encrypt_age(bytes, pass, path)?),
-                _ => (name, bytes.clone()),
+            let (stored_name, encrypted) = match (encrypt, &secret) {
+                (true, Some(pass)) => {
+                    (format!("{name}.age"), Some(encrypt_age(bytes, pass, path)?))
+                }
+                _ => (name, None),
             };
-            write_private(&tmp_dir.join(&stored_name), &data)?;
+            // Binary keyrings are written straight from the zeroized source buffer.
+            let data: &[u8] = encrypted.as_deref().unwrap_or(bytes);
+            write_private(&tmp_dir.join(&stored_name), data)?;
             entries.push(BackupFile {
                 original: (*path).clone(),
                 stored: final_dir.join(&stored_name),
-                sha256: hex::encode(Sha256::digest(bytes)),
+                sha256: hex::encode(Sha256::digest(bytes.as_slice())),
                 encrypted: *encrypt,
             });
         }
@@ -237,6 +249,7 @@ impl BackupManager {
             reason: reason.to_string(),
             created,
             files: entries,
+            prune_warning: None,
         };
         let json = serde_json::to_vec_pretty(&info)
             .map_err(|e| io_err(&tmp_dir.join(MANIFEST_NAME), e))?;
@@ -413,6 +426,27 @@ mod tests {
         assert_eq!(listed[0].dir, third.dir);
         assert_eq!(listed[1].dir, second.dir);
         assert!(!first.dir.exists());
+    }
+
+    /// A prune failure keeps the new backup and reports a warning instead of failing.
+    #[test]
+    fn prune_failure_is_a_warning() {
+        let (_t, mgr, src) = setup(1);
+        let f = binary_file(&src, "a.keyring");
+        let first = mgr.create("t", std::slice::from_ref(&f), None).unwrap();
+        assert!(first.prune_warning.is_none());
+        // Files inside a read-only directory cannot be unlinked, so pruning fails.
+        fs::set_permissions(&first.dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let second = mgr.create("t", &[f], None);
+        fs::set_permissions(&first.dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let second = second.unwrap();
+        assert!(second.dir.is_dir());
+        let warning = second.prune_warning.expect("prune warning expected");
+        assert!(
+            warning.contains(&first.dir.display().to_string()),
+            "{warning}"
+        );
+        assert!(first.dir.exists());
     }
 
     /// Dirs without a manifest are ignored and never pruned.

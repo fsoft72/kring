@@ -22,6 +22,12 @@ const PAM_DIR: &str = "/etc/pam.d";
 const MSG_UNSUPPORTED: &str = "Not supported on this provider";
 /// Message used when no provider is running.
 const MSG_NO_PROVIDER: &str = "No Secret Service provider running";
+/// Object path prefix of Secret Service collections.
+const COLLECTION_PATH_PREFIX: &str = "/org/freedesktop/secrets/collection/";
+/// Name of gnome-keyring's in-memory collection (it has no keyring file).
+const SESSION_COLLECTION: &str = "session";
+/// Suffix of refusals to delete without a backup.
+const MSG_NO_BACKUP: &str = "refusing to delete without a backup";
 
 /// A request from the UI to the worker.
 #[derive(Clone, Debug)]
@@ -175,20 +181,28 @@ where
             Ok(rt) => rt,
             Err(e) => return out.error(format!("Cannot start worker runtime: {e}")),
         };
-        runtime.block_on(startup(&out, store.as_deref(), provider.as_ref(), &config));
+        let first = startup(&out, store.as_deref(), provider.as_ref(), &config);
+        run_guarded(&out, &runtime, first);
         while let Ok(cmd) = cmd_rx.recv() {
             let run = handle(&out, store.as_deref(), provider.as_ref(), &config, cmd);
-            // A panic in the store must not kill the worker silently.
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(run)));
-            if let Err(payload) = result {
-                out.error(format!("Worker crashed: {}", panic_message(&*payload)));
-            }
+            run_guarded(&out, &runtime, run);
         }
     });
     WorkerHandle {
         tx: cmd_tx,
         rx: ev_rx,
+    }
+}
+
+/// Runs a future to completion, reporting a panic as an error instead of killing the worker.
+fn run_guarded<N: Fn()>(
+    out: &Emitter<N>,
+    runtime: &tokio::runtime::Runtime,
+    fut: impl std::future::Future<Output = ()>,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(fut)));
+    if let Err(payload) = result {
+        out.error(format!("Worker crashed: {}", panic_message(&*payload)));
     }
 }
 
@@ -242,40 +256,96 @@ fn collection_of(item: &ItemId) -> CollectionId {
     CollectionId(parent.to_string())
 }
 
-/// Creates a backup of all keyrings before a destructive operation.
+/// Returns the keyring file name of a collection (`<name>` of `<name>.keyring`).
 ///
-/// Returns `Ok(true)` to proceed, `Ok(false)` when the command was answered
-/// (passphrase requested or error reported) and must not run.
+/// gnome-keyring names the object path after the file: `.../collection/<name>` is
+/// stored in `<name>.keyring`. The in-memory `session` collection yields `Ok(None)`.
+/// A path that is not a collection path is an error message.
+fn keyring_name(collection: &CollectionId) -> Result<Option<String>, String> {
+    let name = collection.0.strip_prefix(COLLECTION_PATH_PREFIX);
+    let Some(name) = name.filter(|n| !n.is_empty() && !n.contains('/')) else {
+        return Err(format!(
+            "Cannot find the keyring file of {}: {MSG_NO_BACKUP}",
+            collection.0
+        ));
+    };
+    if name == SESSION_COLLECTION {
+        return Ok(None);
+    }
+    Ok(Some(name.to_string()))
+}
+
+/// Result of the backup step before a destructive operation.
+enum BackupStep {
+    /// Go ahead; carries the backup directory (`None` when no backup was needed).
+    Proceed(Option<PathBuf>),
+    /// The command was answered (passphrase requested or error reported) and must not run.
+    Stop,
+}
+
+/// Backs up all keyrings before deleting from `collection`, failing closed.
+///
+/// The collection's own keyring file must be part of the backup, otherwise the
+/// delete is refused; the in-memory `session` collection needs no backup.
 fn backup_before<N: Fn()>(
     out: &Emitter<N>,
     config: &WorkerConfig,
+    collection: &CollectionId,
     reason: &str,
     passphrase: Option<&SecretValue>,
     original: &Command,
-) -> bool {
+) -> BackupStep {
+    let name = match keyring_name(collection) {
+        Ok(Some(name)) => name,
+        Ok(None) => return BackupStep::Proceed(None),
+        Err(message) => {
+            out.error(message);
+            return BackupStep::Stop;
+        }
+    };
     let files = match keyring_backup_set(&config.keyrings_dir) {
         Ok(files) => files,
         Err(e) => {
             out.error(format!("Backup failed, nothing was deleted: {e}"));
-            return false;
+            return BackupStep::Stop;
         }
     };
-    if files.is_empty() {
-        return true;
+    let target = config.keyrings_dir.join(format!("{name}.keyring"));
+    if !files.contains(&target) {
+        let dir = config.keyrings_dir.display();
+        out.error(format!(
+            "No keyring file found for '{name}' in {dir}: {MSG_NO_BACKUP}"
+        ));
+        return BackupStep::Stop;
     }
     match config.backups.create(reason, &files, passphrase) {
         Ok(info) => {
+            let dir = info.dir.clone();
+            let warning = info.prune_warning.clone();
             out.emit(Event::BackupCreated(info));
-            true
+            if let Some(w) = warning {
+                out.error(format!(
+                    "Backup created but old backups could not be pruned: {w}"
+                ));
+            }
+            BackupStep::Proceed(Some(dir))
         }
         Err(KringError::PassphraseRequired) => {
             out.emit(Event::PassphraseNeeded(Box::new(original.clone())));
-            false
+            BackupStep::Stop
         }
         Err(e) => {
             out.error(format!("Backup failed, nothing was deleted: {e}"));
-            false
+            BackupStep::Stop
         }
+    }
+}
+
+/// Builds the success message of a delete, naming the backup when one was made.
+fn deleted_message(what: &str, backup: Option<&PathBuf>) -> String {
+    match backup {
+        Some(dir) => format!("{what} deleted, backup in {}", dir.display()),
+        None => format!("{what} deleted"),
     }
 }
 
@@ -331,8 +401,9 @@ async fn handle<S, N>(
 
 /// Executes a gated command against the store.
 ///
-/// Returns `Ok` also when the command was answered without running (backup
-/// passphrase requested or backup failed).
+/// Successful mutations re-list collections (and the affected items) and end
+/// with an [`Event::Done`]. Returns `Ok` also when the command was answered
+/// without running (backup passphrase requested or backup failed).
 async fn run<S, N>(
     out: &Emitter<N>,
     store: &S,
@@ -345,7 +416,7 @@ where
 {
     // Collection whose items are re-listed after a successful mutation.
     let mut affected: Option<CollectionId> = None;
-    match cmd {
+    let done: String = match cmd {
         Command::Refresh => {
             refresh(out, store).await;
             return Ok(());
@@ -362,25 +433,36 @@ where
         Command::CreateItem { collection, item } => {
             store.create_item(collection, item.clone()).await?;
             affected = Some(collection.clone());
+            "Item created".into()
         }
         Command::UpdateItem { item, update } => {
             store.update_item(item, update.clone()).await?;
             affected = Some(collection_of(item));
+            "Item updated".into()
         }
         Command::DeleteItem {
             item,
             backup_passphrase,
         } => {
-            if !backup_before(out, config, "delete-item", backup_passphrase.as_ref(), cmd) {
+            let parent = collection_of(item);
+            let pass = backup_passphrase.as_ref();
+            let BackupStep::Proceed(backup) =
+                backup_before(out, config, &parent, "delete-item", pass, cmd)
+            else {
                 return Ok(());
-            }
+            };
             store.delete_item(item).await?;
-            affected = Some(collection_of(item));
+            affected = Some(parent);
+            deleted_message("Item", backup.as_ref())
         }
-        Command::SetDefault(id) => store.set_alias("default", id).await?,
+        Command::SetDefault(id) => {
+            store.set_alias("default", id).await?;
+            "Default collection set".into()
+        }
         Command::Lock(id) => {
             store.lock(id).await?;
             affected = Some(id.clone());
+            "Collection locked".into()
         }
         Command::Unlock {
             collection,
@@ -388,13 +470,16 @@ where
         } => {
             store.unlock_with_password(collection, password).await?;
             affected = Some(collection.clone());
+            "Collection unlocked".into()
         }
         Command::CreateCollection { label, password } => {
             store.create_with_password(label, password).await?;
+            "Collection created".into()
         }
         Command::RenameCollection { collection, label } => {
             store.rename_collection(collection, label).await?;
             affected = Some(collection.clone());
+            "Collection renamed".into()
         }
         Command::ChangePassword {
             collection,
@@ -403,22 +488,27 @@ where
         } => {
             store.change_password(collection, old, new).await?;
             affected = Some(collection.clone());
+            "Password changed".into()
         }
         Command::DeleteCollection {
             collection,
             backup_passphrase,
         } => {
             let pass = backup_passphrase.as_ref();
-            if !backup_before(out, config, "delete-collection", pass, cmd) {
+            let BackupStep::Proceed(backup) =
+                backup_before(out, config, collection, "delete-collection", pass, cmd)
+            else {
                 return Ok(());
-            }
+            };
             store.delete_collection(collection).await?;
+            deleted_message("Collection", backup.as_ref())
         }
-    }
+    };
     refresh(out, store).await;
     if let Some(id) = affected {
         load_items(out, store, &id).await;
     }
+    out.emit(Event::Done(done));
     Ok(())
 }
 
@@ -431,6 +521,9 @@ mod tests {
     use kring_core::provider::ProviderKind;
 
     use super::*;
+
+    /// Label (and object path name) of the fixture collection.
+    const MAIN: &str = "Main";
 
     /// Test fixture owning the temp dirs and the worker handle.
     struct Fixture {
@@ -452,8 +545,13 @@ mod tests {
         }
     }
 
-    /// Starts a worker over a FakeStore with one unlocked collection.
+    /// Starts a worker over a FakeStore with one unlocked collection named `Main`.
     fn fixture(provider: Option<ProviderInfo>) -> Fixture {
+        fixture_with(provider, MAIN, BACKUP_KEEP)
+    }
+
+    /// Starts a worker over a FakeStore with one unlocked collection `label`, keeping `keep` backups.
+    fn fixture_with(provider: Option<ProviderInfo>, label: &str, keep: usize) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let keyrings = dir.path().join("keyrings");
         let backups = dir.path().join("backups");
@@ -462,11 +560,11 @@ mod tests {
             std::fs::create_dir_all(d).unwrap();
         }
         let store = FakeStore::new();
-        let collection = store.add_collection("Main", "pw", false);
+        let collection = store.add_collection(label, "pw", false);
         let config = WorkerConfig {
             backups: BackupManager {
                 root: backups.clone(),
-                keep: BACKUP_KEEP,
+                keep,
             },
             keyrings_dir: keyrings.clone(),
             pam_dir: pam,
@@ -502,6 +600,14 @@ mod tests {
             self.handle.tx.send(cmd).unwrap();
         }
 
+        /// Asserts the next event is `Done(message)`.
+        fn expect_done(&self, message: &str) {
+            match self.next() {
+                Event::Done(m) => assert_eq!(m, message),
+                other => panic!("expected Done, got {other:?}"),
+            }
+        }
+
         /// Creates an item and returns its id, consuming the resulting events.
         fn create_item(&self) -> ItemId {
             self.send(Command::CreateItem {
@@ -514,18 +620,22 @@ mod tests {
                 },
             });
             assert!(matches!(self.next(), Event::Collections(_)));
-            match self.next() {
+            let id = match self.next() {
                 Event::Items(_, items) => items[0].id.clone(),
                 other => panic!("expected Items, got {other:?}"),
-            }
+            };
+            self.expect_done("Item created");
+            id
         }
     }
 
-    /// Writes a binary-looking keyring file.
-    fn write_binary_keyring(dir: &std::path::Path) {
+    /// Writes a binary-looking `<name>.keyring` file and returns its path.
+    fn write_binary_keyring(dir: &std::path::Path, name: &str) -> PathBuf {
         let mut bytes = KEYRING_MAGIC.to_vec();
         bytes.extend_from_slice(b"payload");
-        std::fs::write(dir.join("login.keyring"), bytes).unwrap();
+        let path = dir.join(format!("{name}.keyring"));
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 
     /// Startup emits Provider, Pam, Collections in that order.
@@ -567,19 +677,23 @@ mod tests {
     #[test]
     fn delete_creates_backup_first() {
         let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
-        write_binary_keyring(&f.keyrings);
+        write_binary_keyring(&f.keyrings, MAIN);
         f.skip_startup();
         let item = f.create_item();
         f.send(Command::DeleteItem {
             item,
             backup_passphrase: None,
         });
-        assert!(matches!(f.next(), Event::BackupCreated(_)));
+        let dir = match f.next() {
+            Event::BackupCreated(info) => info.dir,
+            other => panic!("expected BackupCreated, got {other:?}"),
+        };
         assert!(matches!(f.next(), Event::Collections(_)));
         match f.next() {
             Event::Items(_, items) => assert!(items.is_empty()),
             other => panic!("expected Items, got {other:?}"),
         }
+        f.expect_done(&format!("Item deleted, backup in {}", dir.display()));
         assert_eq!(std::fs::read_dir(&f.backups).unwrap().count(), 1);
     }
 
@@ -635,6 +749,7 @@ mod tests {
     #[test]
     fn plaintext_keyring_asks_passphrase() {
         let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        write_binary_keyring(&f.keyrings, MAIN);
         std::fs::write(
             f.keyrings.join("old.keyring"),
             "[keyring]\ndisplay-name=x\n",
@@ -657,19 +772,32 @@ mod tests {
         }
     }
 
-    /// Store wrapper whose first `list_items` call panics.
+    /// Store wrapper whose first `list_items` (or `list_collections`) call panics.
     struct PanicStore {
         inner: FakeStore,
         armed: std::sync::atomic::AtomicBool,
+        /// Panic in `list_collections` instead of `list_items`.
+        on_collections: bool,
+    }
+
+    impl PanicStore {
+        /// Returns true (once) when the call named by `collections` must panic.
+        fn fire(&self, collections: bool) -> bool {
+            collections == self.on_collections
+                && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
     impl SecretStore for PanicStore {
         async fn list_collections(&self) -> kring_core::Result<Vec<CollectionInfo>> {
+            if self.fire(true) {
+                panic!("boom");
+            }
             self.inner.list_collections().await
         }
         async fn list_items(&self, c: &CollectionId) -> kring_core::Result<Vec<ItemInfo>> {
-            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            if self.fire(false) {
                 panic!("boom");
             }
             self.inner.list_items(c).await
@@ -729,10 +857,8 @@ mod tests {
         }
     }
 
-    /// A panic in the store is reported and the worker keeps serving commands.
-    #[test]
-    fn store_panic_reports_error_and_worker_survives() {
-        let dir = tempfile::tempdir().unwrap();
+    /// Starts a worker over a PanicStore; returns the handle and the collection id.
+    fn panic_worker(dir: &tempfile::TempDir, on_collections: bool) -> (WorkerHandle, CollectionId) {
         let config = WorkerConfig {
             backups: BackupManager {
                 root: dir.path().join("b"),
@@ -746,9 +872,33 @@ mod tests {
         let store = PanicStore {
             inner,
             armed: std::sync::atomic::AtomicBool::new(true),
+            on_collections,
         };
         let p = provider(ProviderKind::GnomeKeyring, true);
-        let h = spawn(Some(Arc::new(store)), Some(p), config, || {});
+        (spawn(Some(Arc::new(store)), Some(p), config, || {}), id)
+    }
+
+    /// A panic during startup is reported and the worker keeps serving commands.
+    #[test]
+    fn startup_panic_reports_error_and_worker_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _) = panic_worker(&dir, true);
+        let next = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(next(), Event::Provider(_)));
+        assert!(matches!(next(), Event::Pam(_)));
+        match next() {
+            Event::Error(m) => assert_eq!(m, "Worker crashed: boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        h.tx.send(Command::Refresh).unwrap();
+        assert!(matches!(next(), Event::Collections(_)));
+    }
+
+    /// A panic in the store is reported and the worker keeps serving commands.
+    #[test]
+    fn store_panic_reports_error_and_worker_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, id) = panic_worker(&dir, false);
         let next = || h.rx.recv_timeout(Duration::from_secs(5)).unwrap();
         for _ in 0..3 {
             next();
@@ -766,7 +916,7 @@ mod tests {
     #[test]
     fn backup_failure_aborts_delete() {
         let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
-        write_binary_keyring(&f.keyrings);
+        write_binary_keyring(&f.keyrings, MAIN);
         std::fs::write(&f.backups, "not a directory").unwrap();
         f.skip_startup();
         let item = f.create_item();
@@ -786,23 +936,32 @@ mod tests {
     #[test]
     fn delete_collection_creates_backup_first() {
         let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
-        write_binary_keyring(&f.keyrings);
+        write_binary_keyring(&f.keyrings, MAIN);
         f.skip_startup();
         f.send(Command::DeleteCollection {
             collection: f.collection.clone(),
             backup_passphrase: None,
         });
-        assert!(matches!(f.next(), Event::BackupCreated(_)));
+        let info = match f.next() {
+            Event::BackupCreated(info) => info,
+            other => panic!("expected BackupCreated, got {other:?}"),
+        };
+        assert_eq!(info.files[0].original, f.keyrings.join("Main.keyring"));
         match f.next() {
             Event::Collections(list) => assert!(list.is_empty()),
             other => panic!("expected Collections, got {other:?}"),
         }
+        f.expect_done(&format!(
+            "Collection deleted, backup in {}",
+            info.dir.display()
+        ));
     }
 
     /// Resending the delete with a passphrase succeeds after PassphraseNeeded.
     #[test]
     fn delete_with_passphrase_retry_succeeds() {
         let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        write_binary_keyring(&f.keyrings, MAIN);
         std::fs::write(
             f.keyrings.join("old.keyring"),
             "[keyring]\ndisplay-name=x\n",
@@ -827,10 +986,49 @@ mod tests {
         }
     }
 
-    /// With no keyring files there is nothing to back up and the delete proceeds.
+    /// Without the collection's keyring file there is no backup, so nothing is deleted.
     #[test]
-    fn empty_backup_set_skips_backup_and_deletes() {
+    fn missing_keyring_file_refuses_delete() {
         let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        write_binary_keyring(&f.keyrings, "other");
+        f.skip_startup();
+        let item = f.create_item();
+        f.send(Command::DeleteItem {
+            item,
+            backup_passphrase: None,
+        });
+        let expected = format!(
+            "No keyring file found for 'Main' in {}: refusing to delete without a backup",
+            f.keyrings.display()
+        );
+        match f.next() {
+            Event::Error(m) => assert_eq!(m, expected),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        f.send(Command::DeleteCollection {
+            collection: f.collection.clone(),
+            backup_passphrase: None,
+        });
+        match f.next() {
+            Event::Error(m) => assert_eq!(m, expected),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        f.send(Command::LoadItems(f.collection.clone()));
+        match f.next() {
+            Event::Items(_, items) => assert_eq!(items.len(), 1),
+            other => panic!("expected Items, got {other:?}"),
+        }
+        assert!(!f.backups.exists());
+    }
+
+    /// The in-memory `session` collection has no file: it is deleted without a backup.
+    #[test]
+    fn session_collection_delete_skips_backup() {
+        let f = fixture_with(
+            Some(provider(ProviderKind::GnomeKeyring, true)),
+            "session",
+            BACKUP_KEEP,
+        );
         f.skip_startup();
         let item = f.create_item();
         f.send(Command::DeleteItem {
@@ -838,8 +1036,89 @@ mod tests {
             backup_passphrase: None,
         });
         assert!(matches!(f.next(), Event::Collections(_)));
-        assert!(matches!(f.next(), Event::Items(_, _)));
+        match f.next() {
+            Event::Items(_, items) => assert!(items.is_empty()),
+            other => panic!("expected Items, got {other:?}"),
+        }
+        f.expect_done("Item deleted");
         assert!(!f.backups.exists());
+    }
+
+    /// A failed prune is reported, but the backup exists so the delete proceeds.
+    #[test]
+    fn prune_failure_warns_and_deletes() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture_with(Some(provider(ProviderKind::GnomeKeyring, true)), MAIN, 1);
+        let file = write_binary_keyring(&f.keyrings, MAIN);
+        let old_mgr = BackupManager {
+            root: f.backups.clone(),
+            keep: 1,
+        };
+        let created = old_mgr.create("old", &[file], None).unwrap();
+        // Make sure it sorts as the oldest backup, whatever the current second is.
+        let old = f.backups.join("20000101-000000-old");
+        std::fs::rename(&created.dir, &old).unwrap();
+        // Files inside a read-only directory cannot be unlinked, so pruning fails.
+        let set_mode = |m| std::fs::set_permissions(&old, std::fs::Permissions::from_mode(m));
+        set_mode(0o500).unwrap();
+        f.skip_startup();
+        let item = f.create_item();
+        f.send(Command::DeleteItem {
+            item,
+            backup_passphrase: None,
+        });
+        let events: Vec<Event> = (0..5).map(|_| f.next()).collect();
+        set_mode(0o700).unwrap();
+        assert!(matches!(events[0], Event::BackupCreated(_)), "{events:?}");
+        match &events[1] {
+            Event::Error(m) => {
+                assert!(
+                    m.starts_with("Backup created but old backups could not be pruned: "),
+                    "{m}"
+                )
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(matches!(events[2], Event::Collections(_)), "{events:?}");
+        match &events[3] {
+            Event::Items(_, items) => assert!(items.is_empty()),
+            other => panic!("expected Items, got {other:?}"),
+        }
+        assert!(matches!(events[4], Event::Done(_)), "{events:?}");
+    }
+
+    /// Successful mutations end with a Done message for the status bar.
+    #[test]
+    fn mutations_report_done() {
+        let f = fixture(Some(provider(ProviderKind::GnomeKeyring, true)));
+        f.skip_startup();
+        f.send(Command::ChangePassword {
+            collection: f.collection.clone(),
+            old: SecretValue::from_text("pw"),
+            new: SecretValue::from_text("pw2"),
+        });
+        assert!(matches!(f.next(), Event::Collections(_)));
+        assert!(matches!(f.next(), Event::Items(_, _)));
+        f.expect_done("Password changed");
+        f.send(Command::CreateCollection {
+            label: "Other".into(),
+            password: SecretValue::from_text("p"),
+        });
+        assert!(matches!(f.next(), Event::Collections(_)));
+        f.expect_done("Collection created");
+    }
+
+    /// The object path name maps to the keyring file name; `session` has none.
+    #[test]
+    fn keyring_name_from_collection_path() {
+        let id = |p: &str| CollectionId(p.into());
+        let ok = keyring_name(&id("/org/freedesktop/secrets/collection/login"));
+        assert_eq!(ok, Ok(Some("login".to_string())));
+        let session = keyring_name(&id("/org/freedesktop/secrets/collection/session"));
+        assert_eq!(session, Ok(None));
+        assert!(keyring_name(&id("/org/freedesktop/secrets/aliases/default")).is_err());
+        assert!(keyring_name(&id("/org/freedesktop/secrets/collection/")).is_err());
+        assert!(keyring_name(&id("/org/freedesktop/secrets/collection/a/b")).is_err());
     }
 
     /// The collection is the parent object path of the item.

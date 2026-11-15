@@ -14,7 +14,8 @@ use kring_core::error::KringError;
 use kring_core::model::{CollectionId, LOGIN_COLLECTION_PATH, NewItem, SecretValue};
 use kring_core::secret_service::SecretServiceBackend;
 
-/// Reading a secret from a locked collection returns `Locked` without prompting.
+/// Reading a secret from a locked collection returns `Locked` without prompting,
+/// while listing its items still works and reports them locked.
 #[tokio::test]
 #[ignore]
 async fn locked_secret_returns_locked() {
@@ -33,4 +34,8 @@ async fn locked_secret_returns_locked() {
     within(backend.lock(&login)).await.unwrap();
     let err = within(backend.read_secret(&id)).await.unwrap_err();
     assert!(matches!(err, KringError::Locked(_)), "{err:?}");
+    // Listing a locked collection still succeeds and marks every item locked.
+    let items = within(backend.list_items(&login)).await.unwrap();
+    assert!(items.iter().any(|i| i.id == id), "{items:?}");
+    assert!(items.iter().all(|i| i.locked), "{items:?}");
 }

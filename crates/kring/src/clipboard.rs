@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use arboard::SetExtLinux;
 use zeroize::Zeroizing;
 
 /// Delay after which a copied secret is removed from the clipboard.
@@ -43,9 +44,13 @@ impl ArboardClipboard {
 }
 
 impl ClipboardBackend for ArboardClipboard {
-    /// Sets the clipboard text.
+    /// Sets the clipboard text, asking clipboard managers not to keep it in their history.
     fn set_text(&mut self, text: &str) -> Result<(), String> {
-        self._conn()?.set_text(text).map_err(|e| e.to_string())
+        self._conn()?
+            .set()
+            .exclude_from_history()
+            .text(text)
+            .map_err(|e| e.to_string())
     }
 
     /// Reads the clipboard text.
@@ -60,7 +65,9 @@ impl ClipboardBackend for ArboardClipboard {
 }
 
 /// Copies text and clears it after a delay, unless the user copied something else.
-pub struct ClipboardGuard<C> {
+///
+/// Dropping the guard (e.g. when the app exits) clears a still pending copy.
+pub struct ClipboardGuard<C: ClipboardBackend> {
     backend: C,
     pending: Option<(Zeroizing<String>, Instant)>,
 }
@@ -89,6 +96,11 @@ impl<C: ClipboardBackend> ClipboardGuard<C> {
         if now.saturating_duration_since(*copied_at) < CLIPBOARD_CLEAR_AFTER {
             return;
         }
+        self._clear_pending();
+    }
+
+    /// Takes the pending text and clears the clipboard if it still holds it.
+    fn _clear_pending(&mut self) {
         let Some((text, _)) = self.pending.take() else {
             return;
         };
@@ -103,6 +115,13 @@ impl<C: ClipboardBackend> ClipboardGuard<C> {
     /// Returns true while a copied text is waiting to be cleared.
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
+    }
+}
+
+impl<C: ClipboardBackend> Drop for ClipboardGuard<C> {
+    /// Clears a pending copy right away instead of leaving it behind.
+    fn drop(&mut self) {
+        self._clear_pending();
     }
 }
 
@@ -162,6 +181,27 @@ mod tests {
         g.tick(t0 + Duration::from_secs(31));
         assert_eq!(fake.text.borrow().as_deref(), Some("other"));
         assert!(!g.has_pending());
+    }
+
+    /// Dropping the guard clears a pending copy still on the clipboard.
+    #[test]
+    fn drop_clears_pending_copy() {
+        let fake = Fake::default();
+        let mut g = ClipboardGuard::new(fake.clone());
+        g.copy("secret", Instant::now()).unwrap();
+        drop(g);
+        assert_eq!(*fake.text.borrow(), None);
+    }
+
+    /// Dropping the guard leaves text the user copied afterwards alone.
+    #[test]
+    fn drop_keeps_user_text() {
+        let fake = Fake::default();
+        let mut g = ClipboardGuard::new(fake.clone());
+        g.copy("secret", Instant::now()).unwrap();
+        *fake.text.borrow_mut() = Some("other".into());
+        drop(g);
+        assert_eq!(fake.text.borrow().as_deref(), Some("other"));
     }
 
     /// A read failure drops the pending text without clearing.

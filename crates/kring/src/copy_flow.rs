@@ -13,7 +13,7 @@ use crate::worker::{Command, Event};
 const MSG_BINARY: &str = "Binary secrets cannot be copied";
 
 /// Clipboard copies of secrets with automatic clearing.
-pub struct SecretCopier<C> {
+pub struct SecretCopier<C: ClipboardBackend> {
     clipboard: ClipboardGuard<C>,
     /// Item whose secret is copied (and hidden again) as soon as it is revealed.
     pending: Option<ItemId>,
