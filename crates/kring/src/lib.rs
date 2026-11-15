@@ -7,7 +7,9 @@ pub mod copy_flow;
 #[cfg(debug_assertions)]
 pub mod dev_preset;
 pub mod local_time;
+pub mod operation;
 pub mod secret_display;
+pub mod session_secret;
 pub mod startup;
 pub mod ui;
 pub mod views;

@@ -195,7 +195,7 @@ fn _collection_actions(
         item_count: c.item_count,
         warnings: delete_warnings(c),
     });
-    if ico_button(ui, Ico::Trash, "Delete keyring", gates.write, true) {
+    if ico_button(ui, Ico::Trash, "Delete keyring", gates.destructive(), true) {
         action = Some(delete);
     }
     if ico_button(

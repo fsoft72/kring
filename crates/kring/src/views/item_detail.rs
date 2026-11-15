@@ -233,7 +233,7 @@ fn _footer(
                 Err(e) => editor.error = Some(e),
             }
         }
-        if danger_button(ui, "Delete", gates.write) {
+        if danger_button(ui, "Delete", gates.destructive()) {
             action = Some(Action::Open(DialogKind::DeleteItem {
                 item: item.id.clone(),
                 label: item.label.clone(),

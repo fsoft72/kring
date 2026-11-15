@@ -1,10 +1,12 @@
-//! Nav rail (64 px, NAVY_DARK): brand tile, area tiles and the worker dot.
+//! Nav rail (64 px, NAVY_DARK): brand tile, area tiles, the remembered
+//! passphrase indicator and the worker dot.
 
 use eframe::egui::{self, Align2, CornerRadius, FontId, Sense, Ui};
 
+use crate::session_secret::MSG_REMEMBERED_TIP;
 use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
-use crate::views::Area;
+use crate::views::{Action, Area};
 
 /// Side of a rail tile.
 const TILE_SIZE: f32 = 44.0;
@@ -125,9 +127,32 @@ fn _worker_dot(ui: &mut Ui, activity: WorkerActivity) {
     resp.on_hover_text(activity.tooltip());
 }
 
+/// Key tile tinted TERTIARY shown while a passphrase is remembered; returns
+/// true when clicked (ask to forget it).
+fn _remembered_tile(ui: &mut Ui) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(TILE_SIZE, TILE_SIZE), Sense::click());
+    let resp = resp.on_hover_text(MSG_REMEMBERED_TIP);
+    let r = CornerRadius::same(theme::RADIUS_CARD);
+    let fill = if resp.hovered() {
+        theme::TERTIARY.gamma_multiply(theme::ACCENT_ACTIVE_ALPHA)
+    } else {
+        theme::TERTIARY.gamma_multiply(theme::DANGER_HOVER_ALPHA)
+    };
+    ui.painter().rect_filled(rect, r, fill);
+    glyphs::paint(ui.painter(), rect.shrink(6.0), Ico::Key, theme::TERTIARY);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
 /// Renders the rail content (the panel frame is set by the caller); returns
-/// the area whose tile was clicked.
-pub fn show(ui: &mut Ui, activity: WorkerActivity, current: Area) -> Option<Area> {
+/// the area switch, or the forget request of the remembered passphrase
+/// (its tile is shown only when `remembered`).
+pub fn show(
+    ui: &mut Ui,
+    activity: WorkerActivity,
+    current: Area,
+    remembered: bool,
+) -> Option<Action> {
     let mut clicked = None;
     ui.spacing_mut().item_spacing.y = 6.0;
     ui.vertical_centered(|ui| {
@@ -139,12 +164,15 @@ pub fn show(ui: &mut Ui, activity: WorkerActivity, current: Area) -> Option<Area
                 continue;
             };
             if _tile(ui, ico, tip, area == current, true) {
-                clicked = Some(area);
+                clicked = Some(Action::SwitchArea(area));
             }
         }
     });
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
         _worker_dot(ui, activity);
+        if remembered && _remembered_tile(ui) {
+            clicked = Some(Action::AskForgetPassphrase);
+        }
     });
     clicked
 }

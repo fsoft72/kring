@@ -106,8 +106,18 @@ fn _path_field(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) {
     );
 }
 
-/// Adds a field label above a password field with an eye toggle.
-fn _password_field(ui: &mut egui::Ui, label: &str, field: &str, buffer: &mut Zeroizing<String>) {
+/// Adds a field label above a password field with an eye toggle; nothing
+/// when `hide` (the remembered passphrase is used instead).
+fn _password_field(
+    ui: &mut egui::Ui,
+    hide: bool,
+    label: &str,
+    field: &str,
+    buffer: &mut Zeroizing<String>,
+) {
+    if hide {
+        return;
+    }
     field_label(ui, label);
     password_field(ui, field, buffer, "");
 }
@@ -138,14 +148,15 @@ fn _target_combo(ui: &mut egui::Ui, targets: &[ImportTarget], target: &mut Optio
         });
 }
 
-/// Renders the fields of a dialog and returns its main action.
-pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
+/// Renders the fields of a dialog and returns its main action; `hide`
+/// leaves out the passphrase fields (the remembered passphrase is used).
+pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool) -> MainAction {
     match kind {
         DialogKind::Unlock {
             label, password, ..
         } => {
             _title(ui, &format!("Unlock \"{label}\""));
-            _password_field(ui, "Password", FIELD_PASSWORD, password);
+            _password_field(ui, false, "Password", FIELD_PASSWORD, password);
             _primary("Unlock")
         }
         DialogKind::CreateCollection {
@@ -155,8 +166,8 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
         } => {
             _title(ui, "New keyring");
             _text_field(ui, "Name", label);
-            _password_field(ui, "Password", FIELD_PASSWORD, password);
-            _password_field(ui, "Confirm password", FIELD_CONFIRM, confirm);
+            _password_field(ui, false, "Password", FIELD_PASSWORD, password);
+            _password_field(ui, false, "Confirm password", FIELD_CONFIRM, confirm);
             _primary("Create")
         }
         DialogKind::Rename { label, .. } => {
@@ -172,9 +183,9 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             ..
         } => {
             _title(ui, &format!("Change password of \"{label}\""));
-            _password_field(ui, "Current password", FIELD_OLD, old);
-            _password_field(ui, "New password", FIELD_PASSWORD, new);
-            _password_field(ui, "Confirm new password", FIELD_CONFIRM, confirm);
+            _password_field(ui, false, "Current password", FIELD_OLD, old);
+            _password_field(ui, false, "New password", FIELD_PASSWORD, new);
+            _password_field(ui, false, "Confirm new password", FIELD_CONFIRM, confirm);
             _primary("Change password")
         }
         DialogKind::DeleteCollection {
@@ -202,7 +213,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
         } => {
             _title(ui, "New item");
             _text_field(ui, "Label", label);
-            _password_field(ui, "Secret", FIELD_SECRET, secret);
+            _password_field(ui, false, "Secret", FIELD_SECRET, secret);
             field_label(ui, "Attributes");
             attribute_rows(ui, "kring-new-item-attrs", rows);
             _primary("Create")
@@ -210,7 +221,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
         DialogKind::EditItem { label, secret, .. } => {
             _title(ui, "Edit item");
             _text_field(ui, "Label", label);
-            _password_field(ui, "New secret", FIELD_SECRET, secret);
+            _password_field(ui, false, "New secret", FIELD_SECRET, secret);
             _muted(ui, "Leave the secret empty to keep the current one.");
             _primary("Save")
         }
@@ -247,7 +258,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
                 ui,
                 "This keyring file is encrypted. The password is used once and not kept.",
             );
-            _password_field(ui, "Keyring password", FIELD_PASSWORD, password);
+            _password_field(ui, false, "Keyring password", FIELD_PASSWORD, password);
             _primary(verb)
         }
         DialogKind::ImportFile {
@@ -272,13 +283,13 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             for line in lines.iter() {
                 _text(ui, line);
             }
-            _password_field(ui, "Backup passphrase", FIELD_PASSWORD, passphrase);
-            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _password_field(ui, hide, "Backup passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _danger("Retire")
         }
         DialogKind::DeleteFile { .. } => {
             let blocked = delete_dialog_blocked(kind);
-            _delete_file(ui, kind);
+            _delete_file(ui, kind, hide);
             MainAction {
                 blocked,
                 .._danger("Delete")
@@ -311,7 +322,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             match mode {
                 RestorePassphrase::NotNeeded => {}
                 RestorePassphrase::Existing => {
-                    _password_field(ui, "Backup passphrase", FIELD_PASSWORD, passphrase);
+                    _password_field(ui, hide, "Backup passphrase", FIELD_PASSWORD, passphrase);
                     _muted(
                         ui,
                         "Encrypted copies need the passphrase they were backed up with. It \
@@ -320,8 +331,8 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
                 }
                 RestorePassphrase::New => {
                     ui.label(RichText::new(MSG_RESTORE_PLAINTEXT).color(theme::TERTIARY));
-                    _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
-                    _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+                    _password_field(ui, hide, "Passphrase", FIELD_PASSWORD, passphrase);
+                    _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
                 }
             }
             _danger("Restore")
@@ -339,8 +350,8 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
                 "Every item, with its secret, is written to an age-encrypted archive.",
             );
             _path_field(ui, "Archive file", path, MSG_PATH_HINT);
-            _password_field(ui, "Archive passphrase", FIELD_PASSWORD, passphrase);
-            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _password_field(ui, hide, "Archive passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _muted(ui, "An existing file is never overwritten.");
             _primary("Export")
         }
@@ -352,7 +363,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
         } => {
             _title(ui, &format!("Import an archive into \"{label}\""));
             _path_field(ui, "Archive file", path, MSG_PATH_HINT);
-            _password_field(ui, "Archive passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, hide, "Archive passphrase", FIELD_PASSWORD, passphrase);
             _muted(ui, MSG_IMPORT_CONFLICTS);
             _primary("Import")
         }
@@ -386,8 +397,8 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
                 )
                 .color(theme::TERTIARY),
             );
-            _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
-            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _password_field(ui, hide, "Passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _danger("Apply (backup first)")
         }
         DialogKind::ConsolidatePassphrases {
@@ -402,15 +413,28 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _title(ui, "Consolidation passphrases");
             if *ask_backup {
                 ui.label(RichText::new(MSG_CONSOLIDATE_BACKUP).color(theme::TERTIARY));
-                _password_field(ui, "Backup passphrase", FIELD_PASSWORD, backup);
-                _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, backup_confirm);
+                _password_field(ui, hide, "Backup passphrase", FIELD_PASSWORD, backup);
+                _password_field(
+                    ui,
+                    hide,
+                    "Confirm passphrase",
+                    FIELD_CONFIRM,
+                    backup_confirm,
+                );
             }
             if *ask_orphan_files {
                 ui.add_space(4.0);
                 ui.label(RichText::new(MSG_CONSOLIDATE_ORPHANS).color(theme::TERTIARY));
-                _password_field(ui, "Orphan files passphrase", FIELD_SECOND, orphan_files);
                 _password_field(
                     ui,
+                    hide,
+                    "Orphan files passphrase",
+                    FIELD_SECOND,
+                    orphan_files,
+                );
+                _password_field(
+                    ui,
+                    hide,
                     "Confirm passphrase",
                     FIELD_SECOND_CONFIRM,
                     orphan_files_confirm,
@@ -430,8 +454,8 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
                 "Backup contains plaintext keyrings, choose a passphrase"
             };
             ui.label(RichText::new(text).color(theme::TERTIARY));
-            _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
-            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _password_field(ui, hide, "Passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
             _primary("Continue")
         }
     }
@@ -440,8 +464,8 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
 /// Renders the delete confirmation of a keyring file: the body lines, the
 /// backup checkbox (only when the backup is optional), then either the
 /// backup passphrase (when the backup needs one) or the red warning and the
-/// typed name confirmation (no backup).
-fn _delete_file(ui: &mut egui::Ui, kind: &mut DialogKind) {
+/// typed name confirmation (no backup). `hide` leaves out the passphrase fields.
+fn _delete_file(ui: &mut egui::Ui, kind: &mut DialogKind, hide: bool) {
     let DialogKind::DeleteFile {
         name,
         spec,
@@ -468,8 +492,8 @@ fn _delete_file(ui: &mut egui::Ui, kind: &mut DialogKind) {
     if *backup {
         if spec.needs_passphrase {
             ui.label(RichText::new(spec.passphrase_note).color(theme::TERTIARY));
-            _password_field(ui, "Backup passphrase", FIELD_PASSWORD, passphrase);
-            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _password_field(ui, hide, "Backup passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, hide, "Confirm passphrase", FIELD_CONFIRM, confirm);
         }
         return;
     }

@@ -249,7 +249,7 @@ pub fn show(
     let blocked = if state.is_applying_transfer() {
         Some(MSG_APPLYING)
     } else if destructive {
-        gates.write
+        gates.destructive()
     } else {
         None
     };

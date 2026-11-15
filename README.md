@@ -12,6 +12,8 @@ libraries.
 - **Backups and restore**: every destructive action first writes a backup; the Backups area lists them and restores selected files.
 - **Copy, move and consolidate**: move items between keyrings with a conflict preview, or merge all orphan keyrings into `login` in one step (see below).
 - **Encrypted export**: export a keyring to an age passphrase-encrypted `.kring.age` file and import it back.
+- **Progress of destructive actions**: deleting an item, keyring or file, retiring a file, restoring a backup and applying a move (or a "use incoming" choice) open a "Working..." window listing the backup step and the operation, then the result (or the error). It closes only once the operation finished, and every other destructive action stays disabled meanwhile, so the same keyring cannot be deleted twice.
+- **Remember a passphrase for the session**: passphrase dialogs (unlock, backup, restore, retire, export/import archive, consolidation) offer "Remember for this session". The remembered value then answers passphrase requests by itself (once per request; the dialog opens if it is wrong), is tried first when you click Unlock, and fills new-backup passphrases without the confirmation field. A key tile in the rail shows that one is remembered; click it to forget it.
 
 ## Copy / Move and Consolidate
 
@@ -61,3 +63,4 @@ cargo run -p kring-core --example scan_report -- ~/.local/share/keyrings
 - Textual `.keyring` files are **plaintext on disk**: anyone who can read the file can read the secrets. "Retire file" deletes one only after an encrypted backup is verified, and never for a file the daemon has loaded. "Delete file" removes a file the daemon has not loaded only after the backup manifest lists it with the expected checksum (when the backup is chosen); a loaded one goes through the daemon's own delete, after a backup unless the keyring is unlocked and empty.
 - Restoring overwrites files in the keyrings directory (after backing up the current ones). The daemon keeps its own in-memory copy, so restart it afterwards: `systemctl --user restart gnome-keyring-daemon`. kring shows this command and does not run it.
 - Secrets are never logged and are zeroized in memory when dropped.
+- **Remembered passphrase warning**: "Remember for this session" keeps the passphrase in memory only (never on disk, in logs or in debug output) until kring closes or you forget it from the rail. While it is remembered, anyone using your session can unlock keyrings and decrypt or write backups with it without typing it. Use it only on a machine you control, and forget it when you are done.

@@ -13,6 +13,8 @@ use kring_core::transfer::consolidate_apply::{ConsolidationReport, StepOutcome};
 use kring_core::transfer::import::ImportReport;
 use kring_core::transfer::plan::TransferCounts;
 
+use crate::operation::{self, Operation};
+use crate::session_secret::SessionSecret;
 use crate::worker::{Command, ConflictView, ConsolidationSummary, Event};
 use crate::worker_transfer::{MSG_ORPHANS_NOT_RETIRED, invalidates_plan};
 
@@ -211,6 +213,10 @@ pub struct AppState {
     backups_stale: bool,
     /// Notices shown as toasts besides `status` (e.g. pruned backups).
     notices: Vec<String>,
+    /// Passphrase remembered for the session (its `Debug` hides it).
+    pub session: SessionSecret,
+    /// Destructive operation in flight (or finished, until its modal is closed).
+    pub operation: Option<Operation>,
 }
 
 /// Sort key: login first, then default alias, then label (case-insensitive).
@@ -222,6 +228,9 @@ fn _sort_key(c: &CollectionInfo) -> (bool, bool, String) {
 impl AppState {
     /// Applies a worker event to the state.
     pub fn apply(&mut self, event: Event) {
+        if let Some(op) = &mut self.operation {
+            op.observe(&event);
+        }
         match event {
             Event::Provider(p) => {
                 self.provider = Some(p);
@@ -645,6 +654,19 @@ impl AppState {
             }
             _ => {}
         }
+    }
+
+    /// Records a sent command for the progress modal: a destructive one
+    /// starts an operation (or resumes the one waiting for its passphrase).
+    pub fn track_operation(&mut self, cmd: &Command) {
+        let started = operation::describe(cmd, self);
+        operation::track(&mut self.operation, started);
+    }
+
+    /// Returns true while a destructive operation is shown (running or
+    /// finished but not closed): destructive actions are disabled.
+    pub fn operation_open(&self) -> bool {
+        self.operation.is_some()
     }
 
     /// Takes the pending status message (if any) and errors, for display as toasts.
@@ -1661,5 +1683,34 @@ mod tests {
         c.label_incoming = "y".into();
         s.select_file("b".into());
         assert!(s.offline_incoming(&c).is_none(), "another file selected");
+    }
+
+    /// The remembered passphrase never shows in the `Debug` output of the state.
+    #[test]
+    fn debug_hides_remembered_passphrase() {
+        const PASS: &str = "s3ssion-passphrase-xyz";
+        let mut s = AppState::default();
+        s.session.remember(SecretValue::from_text(PASS));
+        let text = format!("{s:?}");
+        assert!(s.session.is_remembered());
+        assert!(!text.contains(PASS));
+        assert!(text.contains("SessionSecret { remembered: true }"));
+    }
+
+    /// A destructive command opens the operation, its events finish it.
+    #[test]
+    fn operation_follows_events() {
+        let mut s = AppState::default();
+        s.track_operation(&Command::Refresh);
+        assert!(!s.operation_open());
+        s.track_operation(&Command::DeleteFile {
+            name: "old".into(),
+            backup: false,
+            backup_passphrase: None,
+        });
+        assert!(s.operation_open());
+        s.apply(Event::Done("File old deleted".into()));
+        let op = s.operation.as_ref().unwrap();
+        assert!(op.is_finished() && !op.is_failed());
     }
 }

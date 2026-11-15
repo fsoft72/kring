@@ -161,8 +161,8 @@ pub fn retire_dialog(state: &AppState, info: &KeyringFileInfo) -> DialogKind {
 /// Returns why Delete is disabled: a live file is deleted through the
 /// daemon, so the provider must allow writes (Plan 1 gate).
 pub fn delete_blocked(live: bool, gates: Gates) -> Option<&'static str> {
-    if !live {
-        return None;
+    if gates.busy.is_some() || !live {
+        return gates.busy;
     }
     gates.write
 }
@@ -233,8 +233,8 @@ pub fn delete_dialog(state: &AppState, info: &KeyringFileInfo) -> DialogKind {
 
 /// Returns why Retire is disabled: a live keyring needs a provider allowing writes.
 fn _retire_blocked(live: bool, gates: Gates) -> Option<&'static str> {
-    if !live {
-        return None;
+    if gates.busy.is_some() || !live {
+        return gates.busy;
     }
     gates.write
 }
@@ -619,19 +619,20 @@ mod tests {
         let gated = Gates {
             write: Some("no writes"),
             master: None,
+            busy: None,
         };
         assert_eq!(delete_blocked(true, gated), Some("no writes"));
         assert_eq!(delete_blocked(false, gated), None);
-        assert_eq!(
-            delete_blocked(
-                true,
-                Gates {
-                    write: None,
-                    master: None
-                }
-            ),
-            None
-        );
+        let open = Gates {
+            write: None,
+            master: None,
+            busy: None,
+        };
+        assert_eq!(delete_blocked(true, open), None);
+        // An open operation blocks every delete, live or not.
+        let busy = open.with_operation(true);
+        assert_eq!(delete_blocked(false, busy), busy.busy);
+        assert_eq!(_retire_blocked(true, busy), busy.busy);
 
         let mut s = AppState::default();
         let f = textual("Default_keyring_3", 1, true);

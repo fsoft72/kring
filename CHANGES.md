@@ -68,3 +68,14 @@
   `Wrong wallet password`; other formats are named in the error. `kwallet-session.sh` now only accepts a
   private bus address.
 - Plan 4 Task 3: `kwallet_file::read_attributes` (flat `"<folder>/<key>"` attributes JSON, tolerant) and `to_incoming` (wallet entries to `Incoming` with `TransferSource::Offline`): app entries keep exact attributes, dates and the daemon's label (`__N_` suffix removed, `<folder>/` prefix except `Secret Service`); native entries and synthesized records use label `<folder>/<key>` with derived `server/user/type` (what the kwalletd6 shim looks up) plus `kwallet-folder/key/type`, synthesized records get `modified` 0 and `xdg:schema=org.kde.KWallet.Entry`; maps become sorted JSON (`application/json`). Task 2 follow-ups: hard-coded known-answer digest for KWallet's SHA-1 and the size bound now excludes the trailing digest.
+- Plan 4 Task UX: session passphrase memory and a progress modal for destructive operations. Passphrase
+  dialogs get "Remember for this session" (TERTIARY warning); the value lives in `SessionSecret`
+  (`AppState.session`, zeroized, `Debug` shows only whether one is remembered) and answers
+  `PassphraseNeeded` / `ApplyPassphrasesNeeded` automatically at most once per request (info toast; a
+  wrong passphrase reopens the dialog), is tried first on Unlock (failure opens the password dialog) and
+  replaces the passphrase fields of user-opened dialogs ("Using the remembered passphrase", "Type
+  another"). Rail key tile forgets it after a confirmation. Deletes, retire, restore and destructive
+  transfer applies open a non-dismissable "Working..." modal (`operation.rs`: backup step, action step,
+  result from the first `Done`/`TransferDone`/`Error`; steps aside for passphrase requests) and disable
+  every destructive action (`Gates::busy`) until closed. Dev preset `KRING_DEV_DIALOG=delete-item-now`
+  and `KRING_DEV_REMEMBER=1`.

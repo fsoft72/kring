@@ -30,7 +30,9 @@ const VAR_SELECT: &str = "KRING_DEV_SELECT";
 const VAR_EXPAND: &str = "KRING_DEV_EXPAND";
 /// Any non-empty value reveals the expanded item's secret.
 const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
-/// Dialog to open: `new-keyring`, `unlock`, `export`, `import-archive` or
+/// Dialog to open: `new-keyring`, `unlock`, `export`, `import-archive`,
+/// `delete-item-now` (deletes the expanded, or first, item of the selected
+/// keyring right away, showing the progress modal) or
 /// `transfer-preview` (checks every item of the selected keyring and plans
 /// copying them into the other keyring of [`TRANSFER_PAIR`]; with
 /// [`VAR_REVEAL`] both sides of the first conflict are revealed); in
@@ -50,6 +52,10 @@ const VAR_AREA: &str = "KRING_DEV_AREA";
 const VAR_FILE: &str = "KRING_DEV_FILE";
 /// Index (newest first) of the backup to select in the backups area.
 const VAR_BACKUP: &str = "KRING_DEV_BACKUP";
+/// Any non-empty value remembers [`DEV_PASSPHRASE`] for the session at start.
+const VAR_REMEMBER: &str = "KRING_DEV_REMEMBER";
+/// Value of [`VAR_DIALOG`] deleting an item right away.
+const DIALOG_DELETE_ITEM_NOW: &str = "delete-item-now";
 /// Value of [`VAR_DIALOG`] opening the transfer preview.
 const DIALOG_TRANSFER_PREVIEW: &str = "transfer-preview";
 /// Seeded keyrings sharing items (display names, compared case-insensitively).
@@ -92,6 +98,8 @@ pub struct DevPreset {
     /// Step after the consolidation preview arrived (`consolidate-apply` or
     /// `consolidate-now`).
     pub consolidate_follow: Option<String>,
+    /// Remember [`DEV_PASSPHRASE`] for the session at start.
+    pub remember: bool,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -116,6 +124,7 @@ pub fn preset_from(
         backup: var(VAR_BACKUP).and_then(|v| v.parse().ok()),
         transfer_reveal: false,
         consolidate_follow: None,
+        remember: var(VAR_REMEMBER).is_some(),
     }
 }
 
@@ -142,6 +151,11 @@ impl DevPreset {
             .iter()
             .find(|c| display_name(c) == wanted)
             .map(|c| c.id.clone())
+    }
+
+    /// Passphrase to remember for the session at start; returned once.
+    pub fn take_remembered(&mut self) -> Option<SecretValue> {
+        std::mem::take(&mut self.remember).then(|| SecretValue::from_text(DEV_PASSPHRASE))
     }
 
     /// Area to switch to at start; returned once.
@@ -381,10 +395,28 @@ impl DevPreset {
             .collect()
     }
 
+    /// Deletes the item at the expand index (or the first one) of the
+    /// selected keyring once its items are listed; fires once.
+    fn _take_delete_item(&mut self, state: &AppState, filter: &str) -> Vec<Action> {
+        let items = displayed_items(state, filter);
+        let Some(item) = items.get(self.expand.unwrap_or(0)) else {
+            return Vec::new();
+        };
+        self.dialog = None;
+        self.expand = None;
+        vec![Action::Send(Command::DeleteItem {
+            item: item.id.clone(),
+            backup_passphrase: None,
+        })]
+    }
+
     /// Actions due now (expand, reveal, dialog); each fires once when its data exists.
     pub fn take_actions(&mut self, state: &AppState, filter: &str) -> Vec<Action> {
         if self.dialog.as_deref() == Some(DIALOG_TRANSFER_PREVIEW) {
             return self._take_transfer_preview(state, filter);
+        }
+        if self.dialog.as_deref() == Some(DIALOG_DELETE_ITEM_NOW) {
+            return self._take_delete_item(state, filter);
         }
         let mut out = Vec::new();
         let card = self.expand.and_then(|i| {
@@ -450,6 +482,7 @@ mod tests {
             VAR_AREA => Some("files".into()),
             VAR_FILE => Some("textual_two_items".into()),
             VAR_BACKUP => Some("1".into()),
+            VAR_REMEMBER => Some("1".into()),
             _ => None,
         }
     }
@@ -470,6 +503,7 @@ mod tests {
                 backup: Some(1),
                 transfer_reveal: false,
                 consolidate_follow: None,
+                remember: true,
             }
         );
     }
@@ -825,6 +859,30 @@ mod tests {
         let actions = p.take_actions(&s, "");
         assert!(matches!(&actions[..], [Action::SelectItem(id)] if id.0 == "/i/z"));
         assert!(p.take_actions(&s, "").is_empty());
+
+        // `delete-item-now` deletes the displayed item at the expand index, once.
+        let mut p = DevPreset {
+            expand: Some(1),
+            dialog: Some(DIALOG_DELETE_ITEM_NOW.into()),
+            ..DevPreset::default()
+        };
+        let actions = p.take_actions(&s, "");
+        assert!(matches!(
+            &actions[..],
+            [Action::Send(Command::DeleteItem { item, backup_passphrase: None })] if item.0 == "/i/z"
+        ));
+        assert!(p.take_actions(&s, "").is_empty());
+    }
+
+    /// The remembered dev passphrase is handed out once.
+    #[test]
+    fn remember_taken_once() {
+        let mut p = DevPreset {
+            remember: true,
+            ..DevPreset::default()
+        };
+        assert_eq!(p.take_remembered().unwrap().as_text(), Some(DEV_PASSPHRASE));
+        assert!(p.take_remembered().is_none());
     }
 
     /// The transfer preset waits for the items of a pair keyring, checks them

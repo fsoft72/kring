@@ -19,10 +19,10 @@ use crate::ui::widgets::{
     accent_card, card, chip, danger_button, glyph_tile, heading, ico_button, muted, muted_text,
     semibold,
 };
-use crate::views::Action;
 use crate::views::dialogs::{DialogKind, RestorePassphrase};
 use crate::views::files_list::format_size;
 use crate::views::sidebar::row_background;
+use crate::views::{Action, MSG_OPERATION_RUNNING};
 use crate::worker::Command;
 
 /// Height of a backup row.
@@ -375,7 +375,8 @@ pub fn detail(
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(semibold(humanize_reason(&info.reason), 22.0)).truncate());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let blocked = checked.is_empty().then_some(MSG_NOTHING_SELECTED);
+            let busy = state.operation_open().then_some(MSG_OPERATION_RUNNING);
+            let blocked = busy.or(checked.is_empty().then_some(MSG_NOTHING_SELECTED));
             if danger_button(ui, "Restore selected", blocked) {
                 let kind = restore_dialog(info, &checked, &state.files, keyrings_dir, path_exists);
                 action = Some(Action::Open(kind));

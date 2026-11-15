@@ -15,6 +15,9 @@ use crate::ui::widgets::{danger_button, primary_button, secondary_button};
 use crate::views::collection::{display_name, display_names};
 use crate::views::consolidate::PassphraseNeeds;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
+use crate::views::dialog_remember::{
+    asks_passphrase, fill_passphrases, passphrase_of, remember_row, remembered_row, uses_remembered,
+};
 use crate::views::dialog_submit::command_for;
 use crate::views::file_detail::default_import_target;
 use crate::views::transfer::transfer_targets;
@@ -474,17 +477,64 @@ pub enum Outcome {
 pub struct Dialog {
     kind: DialogKind,
     error: Option<String>,
+    /// "Remember for this session" is checked.
+    remember: bool,
+    /// Remembered passphrase used instead of the passphrase fields.
+    remembered: Option<SecretValue>,
 }
 
 impl Dialog {
     /// Opens a dialog.
     pub fn new(kind: DialogKind) -> Self {
-        Self { kind, error: None }
+        Self {
+            kind,
+            error: None,
+            remember: false,
+            remembered: None,
+        }
     }
 
-    /// Validates the fields and builds the command to send.
-    pub fn submit(&self) -> Result<Command, String> {
-        command_for(&self.kind)
+    /// Opens a dialog that uses `remembered` instead of its passphrase
+    /// fields, when it has some (see [`uses_remembered`]).
+    pub fn with_remembered(kind: DialogKind, remembered: Option<&SecretValue>) -> Self {
+        let remembered = remembered.filter(|_| uses_remembered(&kind)).cloned();
+        Self {
+            remembered,
+            ..Self::new(kind)
+        }
+    }
+
+    /// Returns the passphrase to remember from the sent command, when
+    /// "Remember for this session" was checked.
+    pub fn to_remember(&self, cmd: &Command) -> Option<SecretValue> {
+        if !self.remember {
+            return None;
+        }
+        passphrase_of(cmd).cloned()
+    }
+
+    /// Returns true while the remembered passphrase replaces the fields.
+    fn _uses_remembered(&self) -> bool {
+        self.remembered.is_some() && uses_remembered(&self.kind)
+    }
+
+    /// Validates the fields and builds the command to send; the remembered
+    /// passphrase (when used) fills the passphrase fields for this check
+    /// only, they are emptied again when it fails.
+    pub fn submit(&mut self) -> Result<Command, String> {
+        let Some(secret) = self
+            .remembered
+            .as_ref()
+            .filter(|_| uses_remembered(&self.kind))
+        else {
+            return command_for(&self.kind);
+        };
+        fill_passphrases(&mut self.kind, secret);
+        let result = command_for(&self.kind);
+        if result.is_err() {
+            fill_passphrases(&mut self.kind, &SecretValue::from_text(""));
+        }
+        result
     }
 
     /// Renders the dialog and reports whether it closed.
@@ -493,7 +543,15 @@ impl Dialog {
         let mut cancel = false;
         let response = styled_modal(ctx, MODAL_ID).show(ctx, |ui| {
             ui.set_width(DIALOG_WIDTH);
-            let main = body(ui, &mut self.kind);
+            let hide = self._uses_remembered();
+            let main = body(ui, &mut self.kind, hide);
+            if hide {
+                if remembered_row(ui) {
+                    self.remembered = None;
+                }
+            } else if asks_passphrase(&self.kind) {
+                remember_row(ui, &mut self.remember);
+            }
             if let Some(err) = &self.error {
                 ui.label(egui::RichText::new(err).color(theme::ERROR));
             }
@@ -617,7 +675,7 @@ mod tests {
     /// An empty secret in the edit dialog keeps the current secret.
     #[test]
     fn edit_item_empty_secret_unchanged() {
-        let d = Dialog::new(DialogKind::edit_item(ItemId("/c/a/1".into()), "new".into()));
+        let mut d = Dialog::new(DialogKind::edit_item(ItemId("/c/a/1".into()), "new".into()));
         match d.submit().unwrap() {
             Command::UpdateItem { update, .. } => {
                 assert_eq!(update.label.as_deref(), Some("new"));
@@ -780,7 +838,7 @@ mod tests {
     /// Confirming attribute changes updates only the attributes.
     #[test]
     fn save_attributes_updates_attributes_only() {
-        let d = Dialog::new(DialogKind::SaveAttributes {
+        let mut d = Dialog::new(DialogKind::SaveAttributes {
             item: ItemId("/c/a/1".into()),
             label: "x".into(),
             attributes: [("k".to_string(), "v".to_string())].into(),
@@ -908,5 +966,66 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// A dialog using the remembered passphrase submits without typed
+    /// fields (no confirmation) and remembers nothing unless checked.
+    #[test]
+    fn remembered_passphrase_fills_dialog() {
+        let secret = SecretValue::from_text("kept");
+        let kind = DialogKind::retire_file("p".into(), vec![]);
+        let mut d = Dialog::with_remembered(kind, Some(&secret));
+        let cmd = d.submit().unwrap();
+        let Command::RetireFile {
+            backup_passphrase, ..
+        } = &cmd
+        else {
+            panic!("expected a retire");
+        };
+        assert_eq!(backup_passphrase.as_text(), Some("kept"));
+        assert!(d.to_remember(&cmd).is_none());
+        d.remember = true;
+        assert_eq!(d.to_remember(&cmd).unwrap().as_text(), Some("kept"));
+    }
+
+    /// The unlock dialog never uses the remembered value (it opens only
+    /// after the remembered one failed).
+    #[test]
+    fn unlock_dialog_not_filled() {
+        let secret = SecretValue::from_text("kept");
+        let kind = DialogKind::unlock(CollectionId("/c/a".into()), "a".into());
+        let mut d = Dialog::with_remembered(kind, Some(&secret));
+        assert!(!d._uses_remembered());
+        let Ok(Command::Unlock { password, .. }) = d.submit() else {
+            panic!("expected an unlock");
+        };
+        assert_eq!(password.as_text(), Some(""));
+    }
+
+    /// A failed submit with the remembered passphrase empties the fields
+    /// again, so "Type another" never shows it.
+    #[test]
+    fn failed_remembered_submit_clears_fields() {
+        let secret = SecretValue::from_text("kept");
+        let c = CollectionInfo {
+            id: CollectionId("/c/a".into()),
+            label: "a".into(),
+            locked: false,
+            item_count: 0,
+            aliases: vec![],
+            is_login: false,
+            created: 0,
+            modified: 0,
+        };
+        let mut kind = DialogKind::import_archive(&c, "a".into());
+        if let DialogKind::ImportArchive { path, .. } = &mut kind {
+            path.clear();
+        }
+        let mut d = Dialog::with_remembered(kind, Some(&secret));
+        assert!(d.submit().is_err(), "empty path rejected");
+        let DialogKind::ImportArchive { passphrase, .. } = &d.kind else {
+            panic!("expected the import dialog");
+        };
+        assert!(passphrase.is_empty());
     }
 }

@@ -5,12 +5,14 @@ use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use kring_core::model::SecretValue;
 
 use crate::app_state::AppState;
 use crate::clipboard::ArboardClipboard;
 use crate::copy_flow::SecretCopier;
 #[cfg(debug_assertions)]
 use crate::dev_preset::DevPreset;
+use crate::session_secret::{FollowUp, MSG_USED_REMEMBERED};
 use crate::ui::theme;
 use crate::ui::toasts::{ToastKind, Toasts, kind_for_status, user_message};
 use crate::views::backups::{self, BackupView};
@@ -18,6 +20,7 @@ use crate::views::consolidate::{self, ConsolidateView, PassphraseNeeds};
 use crate::views::dialogs::{Dialog, DialogKind, Outcome};
 use crate::views::file_items::FileView;
 use crate::views::item_detail::AttrEditor;
+use crate::views::progress;
 use crate::views::rail::WorkerActivity;
 use crate::views::transfer::{self, TransferView};
 use crate::views::{
@@ -37,6 +40,8 @@ const LIST_MIN_WIDTH: f32 = 280.0;
 const LIST_MAX_WIDTH: f32 = 520.0;
 /// Reading width cap of the detail pane.
 const DETAIL_MAX_WIDTH: f32 = 860.0;
+/// Info toast after forgetting the remembered passphrase.
+const MSG_FORGOTTEN: &str = "Forgot the remembered passphrase";
 /// Horizontal margin of the detail pane.
 const DETAIL_MARGIN_X: i8 = 28;
 /// Vertical margin of the detail pane.
@@ -71,6 +76,8 @@ pub struct KringApp {
     /// Keyrings directory, where restores write (same as the worker's).
     keyrings_dir: PathBuf,
     toasts: Toasts,
+    /// The forget confirmation of the remembered passphrase is open.
+    forget_confirm: bool,
     /// Screenshot preset (debug builds, isolated session only).
     #[cfg(debug_assertions)]
     dev: DevPreset,
@@ -97,6 +104,7 @@ impl KringApp {
             consolidate_view: ConsolidateView::default(),
             keyrings_dir: kring_core::paths::keyrings_dir(),
             toasts: Toasts::default(),
+            forget_confirm: false,
             #[cfg(debug_assertions)]
             dev: DevPreset::default(),
         }
@@ -115,6 +123,7 @@ impl KringApp {
             match self.worker.rx.try_recv() {
                 Ok(event) => {
                     self.awaiting_reply = false;
+                    let follow = self.state.session.observe(&event);
                     if matches!(event, Event::Error(_)) {
                         self.copier.cancel();
                     }
@@ -122,6 +131,9 @@ impl KringApp {
                         self.consolidate_view.forget_passphrases();
                     }
                     self.state.apply(event);
+                    if let Some(follow) = follow {
+                        self._follow_up(follow);
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -130,6 +142,45 @@ impl KringApp {
                 }
             }
         }
+    }
+
+    /// Opens the dialog asked after an automatic use of the remembered
+    /// passphrase failed (it is not answered automatically again).
+    fn _follow_up(&mut self, follow: FollowUp) {
+        match follow {
+            FollowUp::Passphrase(echo) => self.state.pending_passphrase = Some(echo),
+            FollowUp::Unlock { collection, label } => {
+                if self.dialog.is_none() {
+                    self.dialog = Some(Dialog::new(DialogKind::unlock(collection, label)));
+                }
+            }
+        }
+    }
+
+    /// Sends `cmd` answered with the remembered passphrase and says so.
+    fn _send_remembered(&mut self, cmd: Command) {
+        self._send(cmd);
+        self.toasts.push(
+            ToastKind::Info,
+            MSG_USED_REMEMBERED.to_string(),
+            Instant::now(),
+        );
+    }
+
+    /// Opens a dialog requested by a view: an unlock is first tried with the
+    /// remembered passphrase; other passphrase dialogs use it instead of
+    /// their fields.
+    fn _open_dialog(&mut self, kind: DialogKind) {
+        let unlock = match &kind {
+            DialogKind::Unlock {
+                collection, label, ..
+            } => self.state.session.unlock(collection, label),
+            _ => None,
+        };
+        if let Some(cmd) = unlock {
+            return self._send(cmd);
+        }
+        self.dialog = Some(Dialog::with_remembered(kind, self.state.session.value()));
     }
 
     /// Moves new status messages, notices and errors from the state into toasts.
@@ -151,6 +202,7 @@ impl KringApp {
     fn _send(&mut self, cmd: Command) {
         self.state.track_file_command(&cmd);
         self.state.track_transfer_command(&cmd);
+        self.state.track_operation(&cmd);
         self.consolidate_view.remember(&cmd);
         if self.worker.tx.send(cmd).is_err() {
             self.worker_stopped = true;
@@ -183,7 +235,8 @@ impl KringApp {
                     self._send(cmd);
                 }
             }
-            Action::Open(kind) => self.dialog = Some(Dialog::new(kind)),
+            Action::Open(kind) => self._open_dialog(kind),
+            Action::AskForgetPassphrase => self.forget_confirm = true,
             Action::SwitchArea(to) => {
                 let cmds = switch_area(&mut self.state, self.area, to);
                 self.area = to;
@@ -282,6 +335,9 @@ impl KringApp {
     /// Runs the dev preset actions whose data has arrived.
     #[cfg(debug_assertions)]
     fn _apply_dev_preset(&mut self) {
+        if let Some(value) = self.dev.take_remembered() {
+            self.state.session.remember(value);
+        }
         if let Some(area) = self.dev.take_area() {
             self._handle(Action::SwitchArea(area));
         }
@@ -318,6 +374,9 @@ impl KringApp {
         let Some(cmd) = self.state.pending_passphrase.take() else {
             return;
         };
+        if let Some(full) = self.state.session.resend(&cmd) {
+            return self._send_remembered(full);
+        }
         self.dialog = Some(Dialog::new(DialogKind::passphrase(cmd)));
     }
 
@@ -337,6 +396,19 @@ impl KringApp {
             self.state.pending_apply_passphrases = None;
             self.consolidate_view.sync(&self.state);
             let (backup, orphan_files) = self.consolidate_view.kept(asked.plan_id);
+            if let Some(secret) = self.state.session.apply_passphrase(asked.plan_id) {
+                let pick = |asked: bool, kept: Option<SecretValue>| match asked {
+                    true => Some(secret.clone()),
+                    false => kept,
+                };
+                let cmd = Command::ApplyConsolidation {
+                    plan_id: asked.plan_id,
+                    choices: self.consolidate_view.choices.clone(),
+                    backup_passphrase: pick(asked.backup, backup),
+                    orphan_files_passphrase: pick(asked.orphan_files, orphan_files),
+                };
+                return self._send_remembered(cmd);
+            }
             let missing = PassphraseNeeds {
                 backup: asked.backup,
                 orphan_files: asked.orphan_files,
@@ -357,6 +429,14 @@ impl KringApp {
         }
         self.state.pending_apply_passphrases = None;
         let choices = self.transfer_view.choices.clone();
+        if let Some(secret) = self.state.session.apply_passphrase(asked.plan_id) {
+            let cmd = Command::ApplyTransfer {
+                plan_id: asked.plan_id,
+                choices,
+                backup_passphrase: Some(secret),
+            };
+            return self._send_remembered(cmd);
+        }
         let kind = DialogKind::apply_passphrase(asked.plan_id, choices);
         self.dialog = Some(Dialog::new(kind));
     }
@@ -390,11 +470,55 @@ impl KringApp {
         };
         match dialog.show(ctx) {
             Outcome::Open => {}
-            Outcome::Cancelled => self.dialog = None,
+            Outcome::Cancelled => {
+                self.dialog = None;
+                // A cancelled passphrase request ends the operation waiting for it.
+                if self
+                    .state
+                    .operation
+                    .as_ref()
+                    .is_some_and(|op| op.is_waiting())
+                {
+                    self.state.operation = None;
+                }
+            }
             Outcome::Submitted(cmd) => {
+                if let Some(value) = dialog.to_remember(&cmd) {
+                    self.state.session.remember(value);
+                }
                 self.dialog = None;
                 self._send(cmd);
             }
+        }
+    }
+
+    /// Shows the progress modal of the destructive operation unless a
+    /// dialog is on top (a passphrase request steps it aside); Close drops it.
+    fn _progress(&mut self, ctx: &egui::Context) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(op) = self.state.operation.as_ref().filter(|op| !op.is_waiting()) else {
+            return;
+        };
+        if progress::show(ctx, op) {
+            self.state.operation = None;
+        }
+    }
+
+    /// Shows the forget confirmation of the remembered passphrase.
+    fn _forget_confirm(&mut self, ctx: &egui::Context) {
+        if !self.forget_confirm {
+            return;
+        }
+        let Some(forget) = progress::confirm_forget(ctx) else {
+            return;
+        };
+        self.forget_confirm = false;
+        if forget {
+            self.state.session.forget();
+            self.toasts
+                .push(ToastKind::Info, MSG_FORGOTTEN.to_string(), Instant::now());
         }
     }
 
@@ -402,6 +526,7 @@ impl KringApp {
     fn _panels(&mut self, ui: &mut egui::Ui, gates: Gates) -> Option<Action> {
         let mut action = None;
         let activity = WorkerActivity::from_flags(self.worker_stopped, self.awaiting_reply);
+        let remembered = self.state.session.is_remembered();
         egui::Panel::left("kring-rail")
             .exact_size(RAIL_WIDTH)
             .resizable(false)
@@ -412,9 +537,7 @@ impl KringApp {
                     .inner_margin(egui::Margin::symmetric(8, 10)),
             )
             .show(ui, |ui| {
-                if let Some(area) = rail::show(ui, activity, self.area) {
-                    action = Some(Action::SwitchArea(area));
-                }
+                action = rail::show(ui, activity, self.area, remembered);
             });
         egui::Panel::left("kring-keyrings")
             .resizable(true)
@@ -482,10 +605,13 @@ impl eframe::App for KringApp {
         self._open_passphrase_dialog();
         self._open_file_password_dialog();
         self._open_apply_passphrase_dialog();
-        let gates = Gates::from_provider(self.state.provider.as_ref());
+        let gates = Gates::from_provider(self.state.provider.as_ref())
+            .with_operation(self.state.operation_open());
         let action = self._panels(ui, gates);
         let preview_action = self._transfer_preview(&ctx, gates);
         self._dialog(&ctx);
+        self._progress(&ctx);
+        self._forget_confirm(&ctx);
         for action in [action, preview_action].into_iter().flatten() {
             self._handle(action);
         }

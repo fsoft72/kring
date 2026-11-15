@@ -867,7 +867,7 @@ fn _preview_footer(
         let blocked = if state.is_applying_consolidation() {
             Some(MSG_APPLYING)
         } else {
-            gates.write
+            gates.destructive()
         };
         if danger_button(ui, APPLY_TEXT, blocked) {
             action = Some(view.apply_action(plan_id, needs));

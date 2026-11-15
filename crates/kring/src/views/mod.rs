@@ -7,6 +7,7 @@ pub mod collection;
 pub mod conflict_row;
 pub mod consolidate;
 pub mod dialog_body;
+pub mod dialog_remember;
 pub mod dialog_submit;
 pub mod dialogs;
 pub mod file_detail;
@@ -14,6 +15,7 @@ pub mod file_items;
 pub mod files_list;
 pub mod item_detail;
 pub mod item_list;
+pub mod progress;
 pub mod rail;
 pub mod sidebar;
 pub mod transfer;
@@ -31,6 +33,8 @@ pub const MSG_READ_ONLY: &str = "Read only: provider is not gnome-keyring";
 pub const MSG_NEEDS_GNOME_KEYRING: &str = "Requires gnome-keyring";
 /// Tooltip of every action while no provider is available.
 pub const MSG_NO_PROVIDER: &str = "No Secret Service provider running";
+/// Tooltip of destructive actions while another destructive operation is shown.
+pub const MSG_OPERATION_RUNNING: &str = "Wait for the current operation to finish";
 
 /// Something a view asks the application to do.
 pub enum Action {
@@ -71,6 +75,8 @@ pub enum Action {
     CloseConsolidationPreview,
     /// Close the result card of the last consolidation.
     DismissConsolidation,
+    /// Ask to forget the passphrase remembered for the session.
+    AskForgetPassphrase,
 }
 
 /// Area of the window selected in the nav rail.
@@ -130,6 +136,8 @@ pub struct Gates {
     pub write: Option<&'static str>,
     /// Blocks master password actions (create, unlock, change password).
     pub master: Option<&'static str>,
+    /// Blocks destructive actions while the progress modal is open.
+    pub busy: Option<&'static str>,
 }
 
 impl Gates {
@@ -139,12 +147,28 @@ impl Gates {
             return Self {
                 write: Some(MSG_NO_PROVIDER),
                 master: Some(MSG_NO_PROVIDER),
+                busy: None,
             };
         };
         Self {
             write: (!p.allows_writes()).then_some(MSG_READ_ONLY),
             master: (!p.has_master_password_iface).then_some(MSG_NEEDS_GNOME_KEYRING),
+            busy: None,
         }
+    }
+
+    /// Blocks destructive actions while a destructive operation is shown.
+    pub fn with_operation(self, open: bool) -> Self {
+        Self {
+            busy: open.then_some(MSG_OPERATION_RUNNING),
+            ..self
+        }
+    }
+
+    /// Gate of destructive actions that need writes: blocked while an
+    /// operation is shown, then by the write gate.
+    pub fn destructive(&self) -> Option<&'static str> {
+        self.busy.or(self.write)
     }
 
     /// Gate of actions needing both writes and the master password interface.
@@ -177,10 +201,23 @@ mod tests {
             g,
             Gates {
                 write: None,
-                master: None
+                master: None,
+                busy: None
             }
         );
         assert_eq!(g.write_and_master(), None);
+    }
+
+    /// An open operation blocks destructive actions before the write gate.
+    #[test]
+    fn operation_blocks_destructive() {
+        let g = Gates::from_provider(Some(&provider(ProviderKind::GnomeKeyring, true)));
+        assert_eq!(g.destructive(), None);
+        let busy = g.with_operation(true);
+        assert_eq!(busy.destructive(), Some(MSG_OPERATION_RUNNING));
+        assert_eq!(busy.write, None, "other writes stay allowed");
+        let ro = Gates::from_provider(None).with_operation(false);
+        assert_eq!(ro.destructive(), Some(MSG_NO_PROVIDER));
     }
 
     /// Other providers are read only and lack master password support.
