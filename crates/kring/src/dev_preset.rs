@@ -9,7 +9,8 @@
 use std::path::Path;
 
 use kring_core::dev_guard::{IT_RUNTIME_VAR, violation_from};
-use kring_core::model::CollectionId;
+use kring_core::model::{CollectionId, CollectionInfo, ItemId};
+use kring_core::transfer::apply::TransferMode;
 
 use crate::app_state::AppState;
 use crate::views::backups::{BackupView, path_exists, restore_dialog};
@@ -27,7 +28,10 @@ const VAR_SELECT: &str = "KRING_DEV_SELECT";
 const VAR_EXPAND: &str = "KRING_DEV_EXPAND";
 /// Any non-empty value reveals the expanded item's secret.
 const VAR_REVEAL: &str = "KRING_DEV_REVEAL";
-/// Dialog to open: `new-keyring`, `unlock`, `export` or `import-archive`; in
+/// Dialog to open: `new-keyring`, `unlock`, `export`, `import-archive` or
+/// `transfer-preview` (checks every item of the selected keyring and plans
+/// copying them into the other keyring of [`TRANSFER_PAIR`]; with
+/// [`VAR_REVEAL`] both sides of the first conflict are revealed); in
 /// the files area `import`, `retire` or `open` (password of a binary file);
 /// in the backups area `restore` (confirmation) or `restore-now` (restores
 /// every file of the selected backup without a passphrase).
@@ -38,6 +42,10 @@ const VAR_AREA: &str = "KRING_DEV_AREA";
 const VAR_FILE: &str = "KRING_DEV_FILE";
 /// Index (newest first) of the backup to select in the backups area.
 const VAR_BACKUP: &str = "KRING_DEV_BACKUP";
+/// Value of [`VAR_DIALOG`] opening the transfer preview.
+const DIALOG_TRANSFER_PREVIEW: &str = "transfer-preview";
+/// Seeded keyrings sharing items (display names, compared case-insensitively).
+const TRANSFER_PAIR: [&str; 2] = ["login", "work"];
 /// Value of [`VAR_AREA`] selecting the Offline files area.
 const AREA_FILES: &str = "files";
 /// Value of [`VAR_AREA`] selecting the Backups area.
@@ -61,6 +69,8 @@ pub struct DevPreset {
     pub file: Option<String>,
     /// Backup (index, newest first) to select in the backups area.
     pub backup: Option<usize>,
+    /// Reveal both sides of the first conflict once the transfer preview is open.
+    pub transfer_reveal: bool,
 }
 
 /// Builds the preset from the given environment values; empty unless they
@@ -83,6 +93,7 @@ pub fn preset_from(
         area: var(VAR_AREA),
         file: var(VAR_FILE),
         backup: var(VAR_BACKUP).and_then(|v| v.parse().ok()),
+        transfer_reveal: false,
     }
 }
 
@@ -211,8 +222,70 @@ impl DevPreset {
         Some((index, self.reveal))
     }
 
+    /// Transfer preview actions due now: once the selected keyring of
+    /// [`TRANSFER_PAIR`] listed its items, checks them all and plans copying
+    /// them into the other keyring of the pair; fires once.
+    fn _take_transfer_preview(&mut self, state: &AppState, filter: &str) -> Vec<Action> {
+        let in_pair = |c: &&CollectionInfo| {
+            let name = display_name(c).to_lowercase();
+            TRANSFER_PAIR.contains(&name.as_str())
+        };
+        let Some(current) = state.selected.as_ref() else {
+            return Vec::new();
+        };
+        let pair: Vec<&CollectionInfo> = state.collections.iter().filter(in_pair).collect();
+        let source = pair.iter().find(|c| &c.id == current);
+        let target = pair.iter().find(|c| &c.id != current && !c.locked);
+        let items: Vec<ItemId> = displayed_items(state, filter)
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        let (Some(_), Some(target)) = (source, target) else {
+            return Vec::new();
+        };
+        if items.is_empty() {
+            return Vec::new();
+        }
+        self.dialog = None;
+        self.transfer_reveal = self.reveal;
+        let mut out: Vec<Action> = items
+            .iter()
+            .filter(|id| !state.selection.contains(id))
+            .map(|id| Action::ToggleSelect(id.clone()))
+            .collect();
+        out.push(Action::Send(Command::PlanTransfer {
+            items,
+            target: target.id.clone(),
+            mode: TransferMode::Copy,
+        }));
+        out
+    }
+
+    /// Reveals both sides of the first conflict of the open transfer preview; fires once.
+    pub fn take_transfer_reveal(&mut self, state: &AppState) -> Vec<Action> {
+        if !self.transfer_reveal {
+            return Vec::new();
+        }
+        let Some(first) = state
+            .transfer_preview
+            .as_ref()
+            .and_then(|p| p.conflicts.first())
+        else {
+            return Vec::new();
+        };
+        self.transfer_reveal = false;
+        [&first.existing_item, &first.incoming_item]
+            .into_iter()
+            .flatten()
+            .map(|id| Action::Send(Command::RevealSecret(id.clone())))
+            .collect()
+    }
+
     /// Actions due now (expand, reveal, dialog); each fires once when its data exists.
     pub fn take_actions(&mut self, state: &AppState, filter: &str) -> Vec<Action> {
+        if self.dialog.as_deref() == Some(DIALOG_TRANSFER_PREVIEW) {
+            return self._take_transfer_preview(state, filter);
+        }
         let mut out = Vec::new();
         let card = self.expand.and_then(|i| {
             displayed_items(state, filter)
@@ -250,7 +323,7 @@ impl DevPreset {
 mod tests {
     use super::*;
     use crate::worker::Event;
-    use kring_core::model::{CollectionInfo, ItemId, ItemInfo};
+    use kring_core::model::ItemInfo;
 
     /// Private runtime dir of the isolated session.
     const RUN: &str = "/tmp/kring-dev.abc/run";
@@ -287,6 +360,7 @@ mod tests {
                 area: Some("files".into()),
                 file: Some("textual_two_items".into()),
                 backup: Some(1),
+                transfer_reveal: false,
             }
         );
     }
@@ -452,5 +526,78 @@ mod tests {
         let actions = p.take_actions(&s, "");
         assert!(matches!(&actions[..], [Action::SelectItem(id)] if id.0 == "/i/z"));
         assert!(p.take_actions(&s, "").is_empty());
+    }
+
+    /// The transfer preset waits for the items of a pair keyring, checks them
+    /// and plans a copy into the other unlocked one; the reveal follows the preview.
+    #[test]
+    fn transfer_preview_preset() {
+        use crate::worker::ConflictView;
+        use kring_core::transfer::plan::{Choice, TransferCounts};
+        let col = |path: &str, label: &str, locked: bool| CollectionInfo {
+            id: CollectionId(path.into()),
+            label: label.into(),
+            locked,
+            item_count: 1,
+            aliases: vec![],
+            is_login: false,
+            created: 0,
+            modified: 0,
+        };
+        let login = CollectionId("/c/login".into());
+        let mut s = AppState::default();
+        s.apply(Event::Collections(vec![
+            col("/c/login", "Login", false),
+            col("/c/work", "Work", false),
+            col("/c/d1", "Default_1", false),
+        ]));
+        s.select_collection(login.clone());
+        let mut p = DevPreset {
+            dialog: Some(DIALOG_TRANSFER_PREVIEW.into()),
+            reveal: true,
+            ..DevPreset::default()
+        };
+        assert!(p.take_actions(&s, "").is_empty(), "items not loaded yet");
+        let item = ItemInfo {
+            id: ItemId("/c/login/1".into()),
+            collection: login.clone(),
+            label: "a".into(),
+            attributes: Default::default(),
+            locked: false,
+            created: 0,
+            modified: 0,
+        };
+        s.apply(Event::Items(login, vec![item]));
+        let actions = p.take_actions(&s, "");
+        assert!(matches!(
+            &actions[..],
+            [
+                Action::ToggleSelect(id),
+                Action::Send(Command::PlanTransfer { target, mode: TransferMode::Copy, .. }),
+            ] if id.0 == "/c/login/1" && target.0 == "/c/work"
+        ));
+        assert!(p.take_actions(&s, "").is_empty());
+        assert!(p.take_transfer_reveal(&s).is_empty(), "no preview yet");
+        s.apply(Event::TransferPreview {
+            plan_id: 1,
+            target: CollectionId("/c/work".into()),
+            mode: TransferMode::Copy,
+            counts: TransferCounts::default(),
+            conflicts: vec![ConflictView {
+                label_incoming: "a".into(),
+                label_existing: "a".into(),
+                modified_incoming: 0,
+                modified_existing: 0,
+                default_choice: Choice::KeepTarget,
+                incoming_item: Some(ItemId("/c/login/1".into())),
+                incoming_revealable: true,
+                existing_item: Some(ItemId("/c/work/1".into())),
+                existing_planned: false,
+                offline_index: None,
+            }],
+        });
+        let reveal = p.take_transfer_reveal(&s);
+        assert_eq!(reveal.len(), 2);
+        assert!(p.take_transfer_reveal(&s).is_empty());
     }
 }

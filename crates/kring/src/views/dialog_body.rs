@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, RichText};
 use kring_core::model::CollectionId;
+use kring_core::transfer::apply::TransferMode;
 use zeroize::Zeroizing;
 
 use crate::app_state::FileAction;
@@ -22,6 +23,15 @@ const MSG_RESTORE_PLAINTEXT: &str =
     "A plaintext keyring will be overwritten: its backup is encrypted, choose a passphrase";
 /// Hint of the archive path fields.
 const MSG_PATH_HINT: &str = "Full path, e.g. ~/kring-export.kring.age";
+/// Note of the import dialogs about conflicts.
+const MSG_IMPORT_CONFLICTS: &str = "Identical items are skipped. Items whose attributes exist \
+     with another secret are shown for review before anything changes.";
+/// Note of the move target picker.
+const MSG_MOVE_NOTE: &str = "Each item is removed from this keyring once it is safely in the \
+     target. A backup of both keyrings is taken first.";
+/// Note of the copy target picker.
+const MSG_COPY_NOTE: &str = "Items are added to the target; this keyring is not changed. \
+     Conflicts are shown for review first.";
 /// Size of dialog titles.
 const TITLE_SIZE: f32 = 18.0;
 
@@ -232,11 +242,7 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _text(ui, "Copy the items of this file into a keyring.");
             field_label(ui, "Target keyring");
             _target_combo(ui, targets, target);
-            _muted(
-                ui,
-                "Identical items are skipped. Items whose attributes exist with another \
-                 secret are listed as conflicts and never overwritten.",
-            );
+            _muted(ui, MSG_IMPORT_CONFLICTS);
             _primary("Import")
         }
         DialogKind::RetireFile {
@@ -322,12 +328,42 @@ pub fn body(ui: &mut egui::Ui, kind: &mut DialogKind) -> MainAction {
             _title(ui, &format!("Import an archive into \"{label}\""));
             _path_field(ui, "Archive file", path, MSG_PATH_HINT);
             _password_field(ui, "Archive passphrase", FIELD_PASSWORD, passphrase);
-            _muted(
-                ui,
-                "Identical items are skipped. Items whose attributes exist with another \
-                 secret are listed as conflicts and never overwritten.",
-            );
+            _muted(ui, MSG_IMPORT_CONFLICTS);
             _primary("Import")
+        }
+        DialogKind::TransferTarget {
+            items,
+            mode,
+            targets,
+            target,
+        } => {
+            let noun = if items.len() == 1 { "item" } else { "items" };
+            let (verb, note) = match mode {
+                TransferMode::Copy => ("Copy", MSG_COPY_NOTE),
+                TransferMode::Move => ("Move", MSG_MOVE_NOTE),
+            };
+            _title(ui, &format!("{verb} {} {noun} to...", items.len()));
+            field_label(ui, "Target keyring");
+            _target_combo(ui, targets, target);
+            _muted(ui, note);
+            _primary("Preview")
+        }
+        DialogKind::ApplyPassphrase {
+            passphrase,
+            confirm,
+            ..
+        } => {
+            _title(ui, "Backup passphrase");
+            ui.label(
+                RichText::new(
+                    "A backup is taken before applying. It contains plaintext keyrings, \
+                     choose a passphrase to encrypt it.",
+                )
+                .color(theme::TERTIARY),
+            );
+            _password_field(ui, "Passphrase", FIELD_PASSWORD, passphrase);
+            _password_field(ui, "Confirm passphrase", FIELD_CONFIRM, confirm);
+            _danger("Apply (backup first)")
         }
         DialogKind::Passphrase {
             command,

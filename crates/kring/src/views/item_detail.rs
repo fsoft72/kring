@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, RichText};
 use kring_core::model::{CollectionInfo, ItemId, ItemInfo};
+use kring_core::transfer::apply::TransferMode;
 use kring_core::validate;
 
 use crate::app_state::AppState;
@@ -14,6 +15,7 @@ use crate::ui::widgets::{
 use crate::views::attr_diff::attribute_diff;
 use crate::views::collection::display_name;
 use crate::views::dialogs::DialogKind;
+use crate::views::transfer::copy_blocked;
 use crate::views::{Action, Gates};
 use crate::worker::Command;
 
@@ -175,9 +177,39 @@ fn _locked_body(ui: &mut egui::Ui, c: &CollectionInfo, gates: Gates) -> Option<A
     action
 }
 
-/// Renders Edit, Delete and Save, right-aligned.
+/// Renders "Copy to..." and "Move to..." for this one item.
+fn _transfer_buttons(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    c: &CollectionInfo,
+    item: &ItemInfo,
+    gates: Gates,
+) -> Option<Action> {
+    let copy = copy_blocked(state, &c.id);
+    let picker = |mode| {
+        let items = vec![item.id.clone()];
+        Action::Open(DialogKind::transfer_target(
+            items,
+            mode,
+            &state.collections,
+            &c.id,
+        ))
+    };
+    let mut action = None;
+    if secondary_button(ui, "Copy to...", copy) {
+        action = Some(picker(TransferMode::Copy));
+    }
+    if secondary_button(ui, "Move to...", gates.write.or(copy)) {
+        action = Some(picker(TransferMode::Move));
+    }
+    action
+}
+
+/// Renders Copy to / Move to on the left and Edit, Delete and Save on the right.
 fn _footer(
     ui: &mut egui::Ui,
+    state: &AppState,
+    c: &CollectionInfo,
     item: &ItemInfo,
     editor: &mut AttrEditor,
     gates: Gates,
@@ -206,6 +238,10 @@ fn _footer(
             let kind = DialogKind::edit_item(item.id.clone(), item.label.clone());
             action = Some(Action::Open(kind));
         }
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            let found = _transfer_buttons(ui, state, c, item, gates);
+            action = found.or(action.take());
+        });
     });
     action
 }
@@ -234,7 +270,7 @@ pub fn show(
         ui.label(RichText::new(err).color(theme::ERROR));
     }
     ui.add_space(4.0);
-    action = _footer(ui, item, editor, gates).or(action);
+    action = _footer(ui, state, c, item, editor, gates).or(action);
     action
 }
 

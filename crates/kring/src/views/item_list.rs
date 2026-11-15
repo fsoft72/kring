@@ -5,14 +5,18 @@ use eframe::egui::{
     text::{LayoutJob, TextFormat, TextWrapping},
 };
 use kring_core::model::{Attributes, CollectionInfo, ItemInfo};
+use kring_core::transfer::apply::TransferMode;
 
 use crate::app_state::AppState;
 use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
-use crate::ui::widgets::{card_frame, muted, primary_button, search_box, secondary_button};
+use crate::ui::widgets::{
+    card_frame, muted, primary_button, search_box, secondary_button, semibold,
+};
 use crate::views::collection::{MSG_UNLOCK_FIRST, attributes_summary, format_date, matches_filter};
 use crate::views::dialogs::DialogKind;
 use crate::views::item_detail::{self, AttrEditor};
+use crate::views::transfer::copy_blocked;
 use crate::views::{Action, Gates};
 
 /// Height of the clickable header row of a card.
@@ -26,16 +30,60 @@ const GLYPH_BOX: f32 = 20.0;
 /// Width of the item search box.
 const SEARCH_WIDTH: f32 = 260.0;
 
-/// Renders "+ New item", "Import archive" and the item search box.
-fn _toolbar(ui: &mut Ui, c: &CollectionInfo, filter: &mut String, gates: Gates) -> Option<Action> {
+/// Returns the selection count of the toolbar, e.g. `2 selected`.
+pub fn selection_label(n: usize) -> String {
+    format!("{n} selected")
+}
+
+/// Returns the Copy to / Move to target picker for the checked items of `c`.
+pub fn transfer_dialog(state: &AppState, c: &CollectionInfo, mode: TransferMode) -> DialogKind {
+    let items = state.selection.clone();
+    DialogKind::transfer_target(items, mode, &state.collections, &c.id)
+}
+
+/// Renders the selection actions: count, "Copy to...", "Move to..." and "Clear".
+fn _selection_actions(
+    ui: &mut Ui,
+    state: &AppState,
+    c: &CollectionInfo,
+    gates: Gates,
+) -> Option<Action> {
+    let mut action = None;
+    ui.label(semibold(selection_label(state.selection.len()), 14.0));
+    let copy = copy_blocked(state, &c.id);
+    if primary_button(ui, "Copy to...", copy) {
+        action = Some(Action::Open(transfer_dialog(state, c, TransferMode::Copy)));
+    }
+    if secondary_button(ui, "Move to...", gates.write.or(copy)) {
+        action = Some(Action::Open(transfer_dialog(state, c, TransferMode::Move)));
+    }
+    if secondary_button(ui, "Clear", None) {
+        action = Some(Action::ClearSelection);
+    }
+    action
+}
+
+/// Renders "+ New item" and "Import archive" (or the selection actions while
+/// items are checked) and the item search box.
+fn _toolbar(
+    ui: &mut Ui,
+    state: &AppState,
+    c: &CollectionInfo,
+    filter: &mut String,
+    gates: Gates,
+) -> Option<Action> {
     let mut action = None;
     ui.horizontal(|ui| {
-        let blocked = gates.write.or(c.locked.then_some(MSG_UNLOCK_FIRST));
-        if primary_button(ui, "+  New item", blocked) {
-            action = Some(Action::Open(DialogKind::new_item(c.id.clone())));
-        }
-        if secondary_button(ui, "Import archive", blocked) {
-            action = Some(Action::Open(DialogKind::import_archive(c)));
+        if !state.selection.is_empty() {
+            action = _selection_actions(ui, state, c, gates);
+        } else {
+            let blocked = gates.write.or(c.locked.then_some(MSG_UNLOCK_FIRST));
+            if primary_button(ui, "+  New item", blocked) {
+                action = Some(Action::Open(DialogKind::new_item(c.id.clone())));
+            }
+            if secondary_button(ui, "Import archive", blocked) {
+                action = Some(Action::Open(DialogKind::import_archive(c)));
+            }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.set_max_width(SEARCH_WIDTH);
@@ -166,14 +214,27 @@ fn _card(
     let frame = card_frame().inner_margin(egui::Margin::symmetric(16, 10));
     let resp = frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
-        if card_header(
-            ui,
-            &item.label,
-            &item.attributes,
-            item.modified,
-            item.locked,
-            expanded,
-        ) {
+        let mut clicked = false;
+        ui.horizontal(|ui| {
+            let mut checked = state.selection.contains(&item.id);
+            let can_check = !c.locked && !item.locked;
+            let check = ui.add_enabled(can_check, egui::Checkbox::without_text(&mut checked));
+            if check
+                .on_hover_text("Select for Copy to / Move to")
+                .changed()
+            {
+                action = Some(Action::ToggleSelect(item.id.clone()));
+            }
+            clicked = card_header(
+                ui,
+                &item.label,
+                &item.attributes,
+                item.modified,
+                item.locked,
+                expanded,
+            );
+        });
+        if clicked {
             action = Some(if expanded {
                 Action::DeselectItem
             } else {
@@ -226,7 +287,7 @@ pub fn show(
     editor: &mut AttrEditor,
     gates: Gates,
 ) -> Option<Action> {
-    let mut action = _toolbar(ui, c, filter, gates);
+    let mut action = _toolbar(ui, state, c, filter, gates);
     ui.add_space(4.0);
     let items = displayed_items(state, filter);
     if items.is_empty() {

@@ -177,6 +177,16 @@ pub struct AppState {
     pub pending_apply_passphrases: Option<ApplyPassphrases>,
     /// Outcome of the last consolidation, with the orphan file retire report.
     pub last_consolidation: Option<(ConsolidationReport, Option<RetireBatchReport>)>,
+    /// Checked items of the selected collection; cleared on collection change,
+    /// after a transfer and pruned when the items reload without them.
+    pub selection: Vec<ItemId>,
+    /// Secrets revealed in the transfer preview; dropped when it closes.
+    transfer_revealed: Vec<(ItemId, SecretValue)>,
+    /// True from sending `ApplyTransfer` until the worker answers it.
+    transfer_applying: bool,
+    /// Keyring file of the last file import sent: its items in `file_items`
+    /// back the offline side of the preview conflicts.
+    import_file: Option<String>,
     /// Set when a backup was created or restored since the last listing.
     backups_stale: bool,
     /// Notices shown as toasts besides `status` (e.g. pruned backups).
@@ -205,6 +215,9 @@ impl AppState {
                     return;
                 }
                 self.items = v;
+                let items = &self.items;
+                let usable = |id: &ItemId| items.iter().any(|i| &i.id == id && !i.locked);
+                self.selection.retain(usable);
                 let gone = self
                     .selected_item
                     .as_ref()
@@ -215,6 +228,11 @@ impl AppState {
                 }
             }
             Event::Secret(id, s) => {
+                if self._in_preview(&id) {
+                    self.transfer_revealed.retain(|(r, _)| r != &id);
+                    self.transfer_revealed.push((id, s));
+                    return;
+                }
                 if self.selected_item.as_ref() == Some(&id) {
                     self.revealed = Some((id, s));
                 }
@@ -266,6 +284,7 @@ impl AppState {
                 counts,
                 conflicts,
             } => {
+                self.close_transfer_preview();
                 self.transfer_preview = Some(TransferPreview {
                     plan_id,
                     target,
@@ -280,15 +299,14 @@ impl AppState {
             Event::TransferDone(report) => {
                 self.status = transfer_summary(&report);
                 self.last_transfer = Some(report);
-                self.transfer_preview = None;
-                self.pending_apply_passphrases = None;
+                self.close_transfer_preview();
+                self.selection.clear();
             }
             Event::ConsolidationPreview { plan_id, summary } => {
                 self.consolidation_preview = Some((plan_id, summary));
                 self.consolidation_progress = None;
                 self.last_consolidation = None;
-                self.transfer_preview = None;
-                self.pending_apply_passphrases = None;
+                self.close_transfer_preview();
             }
             Event::ConsolidationProgress { done, total } => {
                 self.consolidation_progress = Some((done, total));
@@ -305,6 +323,7 @@ impl AppState {
                 backup,
                 orphan_files,
             } => {
+                self.transfer_applying = false;
                 self.pending_apply_passphrases = Some(ApplyPassphrases {
                     plan_id,
                     backup,
@@ -315,9 +334,13 @@ impl AppState {
             Event::Error(msg) => {
                 self.consolidation_progress = None;
                 if msg.starts_with(STALE_PLAN_PREFIX) {
-                    self.transfer_preview = None;
+                    self.close_transfer_preview();
                     self.consolidation_preview = None;
                     self.pending_apply_passphrases = None;
+                }
+                // A failed apply consumed the plan: its preview is useless now.
+                if self.transfer_applying {
+                    self.close_transfer_preview();
                 }
                 // The pending file command survives unrelated errors; it is
                 // dropped on file change, on its items or when its dialog is taken.
@@ -338,6 +361,7 @@ impl AppState {
             .is_some_and(|s| self.collections.iter().any(|c| &c.id == s));
         if !exists && self.selected.is_some() {
             self.selected = None;
+            self.selection.clear();
             self.items.clear();
             self.selected_item = None;
             self.revealed = None;
@@ -427,6 +451,7 @@ impl AppState {
     /// report of an earlier import.
     pub fn select_collection(&mut self, id: CollectionId) {
         self.selected = Some(id);
+        self.selection.clear();
         self.last_import = None;
         self.items.clear();
         self.selected_item = None;
@@ -442,6 +467,75 @@ impl AppState {
     /// Hides the revealed secret.
     pub fn hide_secret(&mut self) {
         self.revealed = None;
+    }
+
+    /// Closes the transfer preview, dropping its revealed secrets and its
+    /// passphrase request.
+    pub fn close_transfer_preview(&mut self) {
+        let Some(preview) = self.transfer_preview.take() else {
+            self.transfer_revealed.clear();
+            self.transfer_applying = false;
+            return;
+        };
+        let asked = self.pending_apply_passphrases.map(|p| p.plan_id);
+        if asked == Some(preview.plan_id) {
+            self.pending_apply_passphrases = None;
+        }
+        self.transfer_revealed.clear();
+        self.transfer_applying = false;
+    }
+
+    /// Returns true when `id` is a revealable live item of the open preview.
+    fn _in_preview(&self, id: &ItemId) -> bool {
+        let Some(preview) = &self.transfer_preview else {
+            return false;
+        };
+        preview
+            .conflicts
+            .iter()
+            .any(|c| c.existing_item.as_ref() == Some(id) || c.incoming_item.as_ref() == Some(id))
+    }
+
+    /// Returns true from sending `ApplyTransfer` until the worker answers it.
+    pub fn is_applying_transfer(&self) -> bool {
+        self.transfer_applying
+    }
+
+    /// Returns the secret of `id` revealed in the transfer preview.
+    pub fn transfer_secret(&self, id: &ItemId) -> Option<&SecretValue> {
+        self.transfer_revealed
+            .iter()
+            .find(|(r, _)| r == id)
+            .map(|(_, s)| s)
+    }
+
+    /// Hides the secret of `id` revealed in the transfer preview.
+    pub fn hide_transfer_secret(&mut self, id: &ItemId) {
+        self.transfer_revealed.retain(|(r, _)| r != id);
+    }
+
+    /// Returns the offline item of the imported file backing conflict `c`,
+    /// only while that file is still the selected one and the label matches.
+    pub fn offline_incoming(&self, c: &ConflictView) -> Option<&OfflineItem> {
+        let index = c.offline_index?;
+        if self.import_file.is_none() || self.import_file != self.selected_file {
+            return None;
+        }
+        self.file_items
+            .get(index)
+            .filter(|i| i.label == c.label_incoming)
+    }
+
+    /// Records what a sent command means for the transfer preview: an apply
+    /// in flight, or the keyring file being imported.
+    pub fn track_transfer_command(&mut self, cmd: &Command) {
+        match cmd {
+            Command::ApplyTransfer { .. } => self.transfer_applying = true,
+            Command::ImportFile { name, .. } | Command::PlanFileImport { name, .. } => {
+                self.import_file = Some(name.clone());
+            }
+            _ => {}
+        }
     }
 
     /// Takes the pending status message (if any) and errors, for display as toasts.
@@ -1075,5 +1169,191 @@ mod tests {
         };
         s.apply(Event::ConsolidationDone(done, None));
         assert!(s.consolidation_progress.is_none());
+    }
+
+    /// Builds a conflict view between live items `existing` and `incoming`.
+    fn live_conflict(existing: &str, incoming: &str) -> ConflictView {
+        ConflictView {
+            label_incoming: "x".into(),
+            label_existing: "x".into(),
+            modified_incoming: 0,
+            modified_existing: 0,
+            default_choice: kring_core::transfer::plan::Choice::KeepTarget,
+            incoming_item: Some(ItemId(incoming.into())),
+            incoming_revealable: true,
+            existing_item: Some(ItemId(existing.into())),
+            existing_planned: false,
+            offline_index: None,
+        }
+    }
+
+    /// Builds a preview event with the given conflicts.
+    fn preview_with(plan_id: u64, conflicts: Vec<ConflictView>) -> Event {
+        Event::TransferPreview {
+            plan_id,
+            target: CollectionId("/c/t".into()),
+            mode: TransferMode::Copy,
+            counts: TransferCounts::default(),
+            conflicts,
+        }
+    }
+
+    /// The selection is cleared on collection change and after a transfer,
+    /// and pruned when the items reload without some of its ids.
+    #[test]
+    fn selection_follows_collection_and_items() {
+        let a = CollectionId("/c/a".into());
+        let mut s = AppState::default();
+        s.apply(Event::Collections(vec![col("/c/a", "a", &[])]));
+        s.select_collection(a.clone());
+        s.apply(Event::Items(
+            a.clone(),
+            vec![item("/c/a/1", "/c/a"), item("/c/a/2", "/c/a")],
+        ));
+        s.selection = vec![ItemId("/c/a/1".into()), ItemId("/c/a/2".into())];
+        s.apply(Event::Items(a.clone(), vec![item("/c/a/2", "/c/a")]));
+        assert_eq!(s.selection, [ItemId("/c/a/2".into())]);
+        let mut locked = item("/c/a/2", "/c/a");
+        locked.locked = true;
+        s.apply(Event::Items(a.clone(), vec![locked]));
+        assert!(s.selection.is_empty(), "locked items cannot be transferred");
+        s.selection = vec![ItemId("/c/a/2".into())];
+        s.apply(Event::TransferDone(TransferReport::default()));
+        assert!(s.selection.is_empty());
+        s.selection = vec![ItemId("/c/a/2".into())];
+        s.select_collection(a);
+        assert!(s.selection.is_empty());
+    }
+
+    /// Secrets of preview items stay in the preview (not the item card) and
+    /// are dropped when it closes; other secrets keep the card behavior.
+    #[test]
+    fn preview_secrets_scoped_to_dialog() {
+        let mut s = AppState {
+            selected_item: Some(ItemId("/c/s/1".into())),
+            ..AppState::default()
+        };
+        s.apply(preview_with(1, vec![live_conflict("/c/t/1", "/c/s/1")]));
+        s.apply(Event::Secret(
+            ItemId("/c/t/1".into()),
+            SecretValue::from_text("old"),
+        ));
+        s.apply(Event::Secret(
+            ItemId("/c/s/1".into()),
+            SecretValue::from_text("new"),
+        ));
+        s.apply(Event::Secret(
+            ItemId("/c/x/9".into()),
+            SecretValue::from_text("other"),
+        ));
+        let shown = |s: &AppState, id: &str| {
+            s.transfer_secret(&ItemId(id.into()))
+                .and_then(|v| v.as_text().map(str::to_string))
+        };
+        assert_eq!(shown(&s, "/c/t/1").as_deref(), Some("old"));
+        assert_eq!(shown(&s, "/c/s/1").as_deref(), Some("new"));
+        assert!(shown(&s, "/c/x/9").is_none());
+        assert!(
+            s.revealed.is_none(),
+            "the card under the dialog stays masked"
+        );
+        s.hide_transfer_secret(&ItemId("/c/t/1".into()));
+        assert!(shown(&s, "/c/t/1").is_none());
+        s.apply(Event::ApplyPassphrasesNeeded {
+            plan_id: 1,
+            backup: true,
+            orphan_files: false,
+        });
+        s.close_transfer_preview();
+        assert!(s.transfer_preview.is_none() && s.pending_apply_passphrases.is_none());
+        assert!(shown(&s, "/c/s/1").is_none());
+        s.apply(Event::Secret(
+            ItemId("/c/s/1".into()),
+            SecretValue::from_text("new"),
+        ));
+        assert!(s.revealed.is_some(), "without a preview the card gets it");
+    }
+
+    /// A new preview or the end of the transfer drops revealed secrets.
+    #[test]
+    fn preview_secrets_dropped_on_replace_and_done() {
+        let mut s = AppState::default();
+        let conflicts = vec![live_conflict("/c/t/1", "/c/s/1")];
+        s.apply(preview_with(1, conflicts.clone()));
+        s.apply(Event::Secret(
+            ItemId("/c/t/1".into()),
+            SecretValue::from_text("old"),
+        ));
+        s.apply(preview_with(2, conflicts.clone()));
+        assert!(s.transfer_secret(&ItemId("/c/t/1".into())).is_none());
+        s.apply(Event::Secret(
+            ItemId("/c/t/1".into()),
+            SecretValue::from_text("old"),
+        ));
+        s.apply(Event::TransferDone(TransferReport::default()));
+        assert!(s.transfer_preview.is_none());
+        s.apply(preview_with(3, conflicts));
+        assert!(s.transfer_secret(&ItemId("/c/t/1".into())).is_none());
+    }
+
+    /// An error answering an apply drops the (consumed) plan's preview; a
+    /// passphrase request keeps it; errors without an apply in flight too.
+    #[test]
+    fn apply_error_drops_preview() {
+        let apply = Command::ApplyTransfer {
+            plan_id: 1,
+            choices: vec![],
+            backup_passphrase: None,
+        };
+        let mut s = AppState::default();
+        s.apply(preview_with(1, vec![]));
+        s.apply(Event::Error("clipboard failed".into()));
+        assert!(s.transfer_preview.is_some());
+        s.track_transfer_command(&apply);
+        s.apply(Event::ApplyPassphrasesNeeded {
+            plan_id: 1,
+            backup: true,
+            orphan_files: false,
+        });
+        s.apply(Event::Error("unrelated".into()));
+        assert!(
+            s.transfer_preview.is_some(),
+            "the plan waits for a passphrase"
+        );
+        s.track_transfer_command(&apply);
+        s.apply(Event::Error(
+            "Items changed since the preview, preview again".into(),
+        ));
+        assert!(s.transfer_preview.is_none());
+    }
+
+    /// The offline side of a conflict comes from the imported file only while
+    /// it is still selected and the label matches.
+    #[test]
+    fn offline_incoming_needs_imported_file() {
+        let mut s = AppState::default();
+        s.apply(Event::Files(vec![file("a"), file("b")]));
+        s.select_file("a".into());
+        s.apply(Event::FileItems {
+            name: "a".into(),
+            items: vec![offline("x"), offline("y")],
+            warnings: vec![],
+        });
+        let mut c = live_conflict("/c/t/1", "/unused");
+        c.incoming_item = None;
+        c.offline_index = Some(1);
+        c.label_incoming = "y".into();
+        assert!(s.offline_incoming(&c).is_none(), "no import sent yet");
+        s.track_transfer_command(&Command::ImportFile {
+            name: "a".into(),
+            password: None,
+            target: CollectionId("/c/t".into()),
+        });
+        assert_eq!(s.offline_incoming(&c).map(|i| i.label.as_str()), Some("y"));
+        c.label_incoming = "x".into();
+        assert!(s.offline_incoming(&c).is_none(), "label mismatch");
+        c.label_incoming = "y".into();
+        s.select_file("b".into());
+        assert!(s.offline_incoming(&c).is_none(), "another file selected");
     }
 }

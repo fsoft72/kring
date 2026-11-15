@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use kring_core::model::{Attributes, CollectionId, CollectionInfo, ItemId};
+use kring_core::transfer::apply::TransferMode;
+use kring_core::transfer::plan::Choice;
 use zeroize::Zeroizing;
 
 use crate::app_state::FileAction;
@@ -14,6 +16,7 @@ use crate::views::collection::display_name;
 use crate::views::dialog_body::{FIELD_WIDTH, body};
 use crate::views::dialog_submit::command_for;
 use crate::views::file_detail::default_import_target;
+use crate::views::transfer::transfer_targets;
 use crate::worker::Command;
 
 /// Id of the (single) open modal.
@@ -154,6 +157,22 @@ pub enum DialogKind {
         path: String,
         passphrase: Zeroizing<String>,
     },
+    /// Choose the keyring receiving copied or moved items.
+    TransferTarget {
+        items: Vec<ItemId>,
+        mode: TransferMode,
+        /// Every keyring but the current one; locked ones cannot be chosen.
+        targets: Vec<ImportTarget>,
+        target: Option<CollectionId>,
+    },
+    /// Passphrase of the backup taken before applying transfer plan `plan_id`;
+    /// resends the apply with the choices kept from the preview.
+    ApplyPassphrase {
+        plan_id: u64,
+        choices: Vec<Choice>,
+        passphrase: Zeroizing<String>,
+        confirm: Zeroizing<String>,
+    },
     /// Choose a passphrase for a backup containing plaintext keyrings.
     Passphrase {
         command: Box<Command>,
@@ -286,6 +305,34 @@ impl DialogKind {
         }
     }
 
+    /// Copy or move target picker for `items` of keyring `current`; the first
+    /// unlocked other keyring is preselected.
+    pub fn transfer_target(
+        items: Vec<ItemId>,
+        mode: TransferMode,
+        collections: &[CollectionInfo],
+        current: &CollectionId,
+    ) -> Self {
+        let targets = transfer_targets(collections, Some(current));
+        let target = targets.iter().find(|t| !t.locked).map(|t| t.id.clone());
+        Self::TransferTarget {
+            items,
+            mode,
+            targets,
+            target,
+        }
+    }
+
+    /// Backup passphrase dialog of transfer plan `plan_id`, keeping `choices`.
+    pub fn apply_passphrase(plan_id: u64, choices: Vec<Choice>) -> Self {
+        Self::ApplyPassphrase {
+            plan_id,
+            choices,
+            passphrase: new_buffer(),
+            confirm: new_buffer(),
+        }
+    }
+
     /// Passphrase dialog that resends `command` with the chosen passphrase.
     pub fn passphrase(command: Command) -> Self {
         Self::Passphrase {
@@ -312,6 +359,19 @@ pub fn default_export_path(home: &Path, name: &str, date: &str) -> String {
     home.join(format!("kring-{safe}-{date}.kring.age"))
         .display()
         .to_string()
+}
+
+/// Builds an Obsidian modal (SURFACE card over a dimmed backdrop) named `id`.
+pub fn styled_modal(ctx: &egui::Context, id: &str) -> egui::Modal {
+    let frame = egui::Frame::new()
+        .fill(theme::SURFACE)
+        .stroke(egui::Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER))
+        .corner_radius(egui::CornerRadius::same(theme::RADIUS_WINDOW))
+        .shadow(ctx.global_style().visuals.window_shadow)
+        .inner_margin(egui::Margin::same(DIALOG_MARGIN));
+    egui::Modal::new(egui::Id::unique(id))
+        .frame(frame)
+        .backdrop_color(egui::Color32::from_black_alpha(BACKDROP_ALPHA))
 }
 
 /// What happened to a dialog this frame.
@@ -345,16 +405,7 @@ impl Dialog {
     pub fn show(&mut self, ctx: &egui::Context) -> Outcome {
         let mut submit = false;
         let mut cancel = false;
-        let frame = egui::Frame::new()
-            .fill(theme::SURFACE)
-            .stroke(egui::Stroke::new(1.0_f32, theme::FIELD_ROW_BORDER))
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS_WINDOW))
-            .shadow(ctx.global_style().visuals.window_shadow)
-            .inner_margin(egui::Margin::same(DIALOG_MARGIN));
-        let modal = egui::Modal::new(egui::Id::unique(MODAL_ID))
-            .frame(frame)
-            .backdrop_color(egui::Color32::from_black_alpha(BACKDROP_ALPHA));
-        let response = modal.show(ctx, |ui| {
+        let response = styled_modal(ctx, MODAL_ID).show(ctx, |ui| {
             ui.set_width(DIALOG_WIDTH);
             let main = body(ui, &mut self.kind);
             if let Some(err) = &self.error {
@@ -678,5 +729,98 @@ mod tests {
         ));
         let cmd = with_backup_passphrase(Command::Refresh, SecretValue::from_text("x"));
         assert!(matches!(cmd, Command::Refresh));
+    }
+
+    /// The target picker plans the transfer; locked or missing targets are refused.
+    #[test]
+    fn transfer_target_plans_transfer() {
+        use kring_core::transfer::apply::TransferMode;
+        let col = |path: &str, label: &str, locked: bool| CollectionInfo {
+            id: CollectionId(path.into()),
+            label: label.into(),
+            locked,
+            item_count: 0,
+            aliases: vec![],
+            is_login: false,
+            created: 0,
+            modified: 0,
+        };
+        let cols = [
+            col("/c/a", "A", false),
+            col("/c/w", "Work", true),
+            col("/c/b", "B", false),
+        ];
+        let items = vec![ItemId("/c/a/1".into())];
+        let current = CollectionId("/c/a".into());
+        let mut d = Dialog::new(DialogKind::transfer_target(
+            items.clone(),
+            TransferMode::Move,
+            &cols,
+            &current,
+        ));
+        let DialogKind::TransferTarget {
+            targets, target, ..
+        } = &mut d.kind
+        else {
+            panic!("expected TransferTarget");
+        };
+        assert_eq!(targets.len(), 2, "the current keyring is not offered");
+        assert_eq!(target.as_ref().map(|t| t.0.as_str()), Some("/c/b"));
+        *target = Some(CollectionId("/c/w".into()));
+        assert!(d.submit().is_err(), "locked target rejected");
+        if let DialogKind::TransferTarget { target, .. } = &mut d.kind {
+            *target = None;
+        }
+        assert!(d.submit().is_err(), "missing target rejected");
+        if let DialogKind::TransferTarget { target, .. } = &mut d.kind {
+            *target = Some(CollectionId("/c/b".into()));
+        }
+        match d.submit().unwrap() {
+            Command::PlanTransfer {
+                items: sent,
+                target,
+                mode,
+            } => {
+                assert_eq!(sent, items);
+                assert_eq!(target.0, "/c/b");
+                assert_eq!(mode, TransferMode::Move);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The apply passphrase dialog resends the plan with the kept choices
+    /// and a confirmed passphrase.
+    #[test]
+    fn apply_passphrase_resends_plan() {
+        use kring_core::transfer::plan::Choice;
+        let choices = vec![Choice::UseIncoming, Choice::KeepTarget];
+        let mut d = Dialog::new(DialogKind::apply_passphrase(4, choices.clone()));
+        assert!(d.submit().is_err(), "empty passphrase rejected");
+        if let DialogKind::ApplyPassphrase {
+            passphrase,
+            confirm,
+            ..
+        } = &mut d.kind
+        {
+            *passphrase = buf("pp");
+            *confirm = buf("pq");
+        }
+        assert!(d.submit().is_err(), "mismatch rejected");
+        if let DialogKind::ApplyPassphrase { confirm, .. } = &mut d.kind {
+            *confirm = buf("pp");
+        }
+        match d.submit().unwrap() {
+            Command::ApplyTransfer {
+                plan_id,
+                choices: sent,
+                backup_passphrase,
+            } => {
+                assert_eq!(plan_id, 4);
+                assert_eq!(sent, choices);
+                assert_eq!(backup_passphrase.unwrap().as_text(), Some("pp"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

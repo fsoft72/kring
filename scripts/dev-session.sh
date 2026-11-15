@@ -7,7 +7,11 @@
 # in a temp dir, gnome-keyring unlocked with password `test`. The display
 # variables are kept so the window can open. The keyring is seeded with:
 #   login      3 items (default alias), password `test`
-#   Work       2 items, locked, password `work`
+#   Work       4 items, locked, password `work`; it shares "GitHub token"
+#              (newer, other secret: a conflict) and "Mail account" (same
+#              secret: a duplicate) with login. With
+#              KRING_DEV_DIALOG=transfer-preview it stays unlocked and the app
+#              previews copying the login items into it.
 #   Default_1  empty, password `d1`
 # and, before the daemon starts, the synthetic fixtures of
 # crates/kring-core/tests/fixtures/keyrings are copied into the TEMP keyrings

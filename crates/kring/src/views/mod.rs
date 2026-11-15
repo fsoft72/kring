@@ -14,6 +14,7 @@ pub mod item_detail;
 pub mod item_list;
 pub mod rail;
 pub mod sidebar;
+pub mod transfer;
 
 use kring_core::model::{CollectionId, ItemId};
 use kring_core::provider::ProviderInfo;
@@ -51,6 +52,16 @@ pub enum Action {
     SelectFile(String),
     /// Copy the secret of `state.file_items[index]` to the clipboard.
     CopyFileSecret(usize),
+    /// Check or uncheck an item of the selected collection.
+    ToggleSelect(ItemId),
+    /// Uncheck every item.
+    ClearSelection,
+    /// Close the transfer preview and drop its plan.
+    CloseTransferPreview,
+    /// Apply the transfer preview with the choices of the dialog.
+    ApplyTransfer,
+    /// Hide a secret revealed in the transfer preview.
+    HideTransferSecret(ItemId),
 }
 
 /// Area of the window selected in the nav rail.

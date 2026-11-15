@@ -11,8 +11,8 @@ use crate::views::dialogs::DialogKind;
 use crate::views::dialogs::RestorePassphrase;
 use crate::worker::Command;
 
-/// Error of an import without a target keyring.
-const MSG_NO_TARGET: &str = "Choose a keyring to import into";
+/// Error of an import or transfer without a target keyring.
+const MSG_NO_TARGET: &str = "Choose a target keyring";
 /// Error of an import into a locked keyring.
 const MSG_TARGET_LOCKED: &str = "The chosen keyring is locked, unlock it first";
 /// Error of an empty file password.
@@ -286,6 +286,36 @@ pub fn command_for(kind: &DialogKind) -> Result<Command, String> {
             path: _user_path(path)?,
             passphrase: _required(passphrase, MSG_NO_ARCHIVE_PASSPHRASE)?,
             target: target.clone(),
+        },
+        DialogKind::TransferTarget {
+            items,
+            mode,
+            targets,
+            target,
+        } => {
+            let Some(target) = target else {
+                return Err(MSG_NO_TARGET.into());
+            };
+            let usable = targets.iter().any(|t| &t.id == target && !t.locked);
+            if !usable {
+                return Err(MSG_TARGET_LOCKED.into());
+            }
+            Command::PlanTransfer {
+                items: items.clone(),
+                target: target.clone(),
+                mode: *mode,
+            }
+        }
+        DialogKind::ApplyPassphrase {
+            plan_id,
+            choices,
+            passphrase,
+            confirm,
+        } => Command::ApplyTransfer {
+            plan_id: *plan_id,
+            choices: choices.clone(),
+            // It encrypts a new backup: a new passphrase, typed twice.
+            backup_passphrase: Some(_new_password(passphrase, confirm)?),
         },
         DialogKind::Passphrase {
             command,

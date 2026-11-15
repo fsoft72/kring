@@ -18,6 +18,7 @@ use crate::views::dialogs::{Dialog, DialogKind, Outcome};
 use crate::views::file_items::FileView;
 use crate::views::item_detail::AttrEditor;
 use crate::views::rail::WorkerActivity;
+use crate::views::transfer::{self, TransferView};
 use crate::views::{
     Action, Area, Gates, banners, collection, file_detail, files_list, rail, sidebar, switch_area,
 };
@@ -62,6 +63,8 @@ pub struct KringApp {
     file_view: FileView,
     /// Selected backup and the files checked for a restore.
     backup_view: BackupView,
+    /// Choices and shown offline secrets of the transfer preview.
+    transfer_view: TransferView,
     /// Keyrings directory, where restores write (same as the worker's).
     keyrings_dir: PathBuf,
     toasts: Toasts,
@@ -87,6 +90,7 @@ impl KringApp {
             files_filter: String::new(),
             file_view: FileView::default(),
             backup_view: BackupView::default(),
+            transfer_view: TransferView::default(),
             keyrings_dir: kring_core::paths::keyrings_dir(),
             toasts: Toasts::default(),
             #[cfg(debug_assertions)]
@@ -139,6 +143,7 @@ impl KringApp {
     /// Sends a command to the worker.
     fn _send(&mut self, cmd: Command) {
         self.state.track_file_command(&cmd);
+        self.state.track_transfer_command(&cmd);
         if self.worker.tx.send(cmd).is_err() {
             self.worker_stopped = true;
             return;
@@ -194,6 +199,24 @@ impl KringApp {
                 };
                 self.copier.copy_value(&secret, &mut self.state);
             }
+            Action::ToggleSelect(id) => transfer::selection_toggle(&mut self.state.selection, &id),
+            Action::ClearSelection => self.state.selection.clear(),
+            Action::CloseTransferPreview => {
+                self.state.close_transfer_preview();
+                self.transfer_view.sync(None);
+                self._send(Command::DiscardPlan);
+            }
+            Action::ApplyTransfer => {
+                let Some(plan_id) = self.state.transfer_preview.as_ref().map(|p| p.plan_id) else {
+                    return;
+                };
+                self._send(Command::ApplyTransfer {
+                    plan_id,
+                    choices: self.transfer_view.choices.clone(),
+                    backup_passphrase: None,
+                });
+            }
+            Action::HideTransferSecret(id) => self.state.hide_transfer_secret(&id),
         }
     }
 
@@ -248,7 +271,8 @@ impl KringApp {
                     .take_backup_actions(&self.state, &mut self.backup_view, &self.keyrings_dir)
             }
         };
-        for action in actions {
+        let reveal = self.dev.take_transfer_reveal(&self.state);
+        for action in actions.into_iter().chain(reveal) {
             self._handle(action);
         }
         if self.area != Area::Files {
@@ -272,6 +296,38 @@ impl KringApp {
             return;
         };
         self.dialog = Some(Dialog::new(DialogKind::passphrase(cmd)));
+    }
+
+    /// Opens the backup passphrase dialog when the pending transfer plan
+    /// asked for one, keeping the choices of the preview.
+    ///
+    /// Requests of a consolidation plan are left for its own area.
+    fn _open_apply_passphrase_dialog(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let Some(asked) = self.state.pending_apply_passphrases else {
+            return;
+        };
+        let preview = self.state.transfer_preview.as_ref().map(|p| p.plan_id);
+        if preview != Some(asked.plan_id) || !asked.backup {
+            return;
+        }
+        self.state.pending_apply_passphrases = None;
+        let choices = self.transfer_view.choices.clone();
+        let kind = DialogKind::apply_passphrase(asked.plan_id, choices);
+        self.dialog = Some(Dialog::new(kind));
+    }
+
+    /// Shows the transfer preview unless another dialog is on top (a
+    /// passphrase request keeps the preview behind it); returns its action.
+    fn _transfer_preview(&mut self, ctx: &egui::Context, gates: Gates) -> Option<Action> {
+        self.transfer_view
+            .sync(self.state.transfer_preview.as_ref());
+        if self.dialog.is_some() {
+            return None;
+        }
+        transfer::show(ctx, &self.state, &mut self.transfer_view, gates)
     }
 
     /// Opens the password dialog when the selected binary file asked for one.
@@ -379,10 +435,12 @@ impl eframe::App for KringApp {
         }
         self._open_passphrase_dialog();
         self._open_file_password_dialog();
+        self._open_apply_passphrase_dialog();
         let gates = Gates::from_provider(self.state.provider.as_ref());
         let action = self._panels(ui, gates);
+        let preview_action = self._transfer_preview(&ctx, gates);
         self._dialog(&ctx);
-        if let Some(action) = action {
+        for action in [action, preview_action].into_iter().flatten() {
             self._handle(action);
         }
         self._feed_toasts();

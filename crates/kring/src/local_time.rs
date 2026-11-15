@@ -41,6 +41,28 @@ pub fn format_rfc3339(value: &str, offset: UtcOffset) -> String {
     )
 }
 
+/// Formats unix seconds as `YYYY-MM-DD HH:MM` at `offset`; `-` when zero
+/// (unknown) or out of range.
+pub fn format_unix(secs: u64, offset: UtcOffset) -> String {
+    if secs == 0 {
+        return "-".to_string();
+    }
+    let parsed = i64::try_from(secs)
+        .ok()
+        .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok());
+    let Some(t) = parsed.map(|t| t.to_offset(offset)) else {
+        return "-".to_string();
+    };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute()
+    )
+}
+
 /// Returns today's date at `offset` as `YYYYmmdd`.
 pub fn today_compact(offset: UtcOffset) -> String {
     let d = OffsetDateTime::now_utc().to_offset(offset).date();
@@ -59,6 +81,15 @@ mod tests {
         let cet = UtcOffset::from_hms(1, 0, 0).unwrap();
         assert_eq!(format_rfc3339(utc, cet), "2026-11-16 00:30");
         assert_eq!(format_rfc3339("yesterday", cet), "yesterday");
+    }
+
+    /// Unix seconds are shown at the offset; zero and out of range are unknown.
+    #[test]
+    fn formats_unix_seconds() {
+        let cet = UtcOffset::from_hms(1, 0, 0).unwrap();
+        assert_eq!(format_unix(1_759_363_200, cet), "2025-10-02 01:00");
+        assert_eq!(format_unix(0, cet), "-");
+        assert_eq!(format_unix(u64::MAX, cet), "-");
     }
 
     /// Today's date has eight digits.

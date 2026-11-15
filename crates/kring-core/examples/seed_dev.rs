@@ -27,6 +27,17 @@ const BINARY_FIXTURE: &str = "binary_two_items.keyring";
 const TEXTUAL_FIXTURE: &str = "textual_two_items.keyring";
 /// Content type of the binary sample secret.
 const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
+/// Preset variable of the app; with [`DIALOG_TRANSFER_PREVIEW`] `Work` stays unlocked.
+const VAR_DIALOG: &str = "KRING_DEV_DIALOG";
+/// Preset value that previews a transfer between `login` and `Work`.
+const DIALOG_TRANSFER_PREVIEW: &str = "transfer-preview";
+/// Attributes of the item `login` and `Work` share with different secrets.
+const GITHUB_ATTRS: [(&str, &str); 2] = [("service", "gh"), ("user", "dev")];
+/// Attributes of the item `login` and `Work` share with the same secret.
+const MAIL_ATTRS: [(&str, &str); 2] = [("service", "imap"), ("user", "dev@example.com")];
+/// Pause before the shared `Work` items, so their modification time is
+/// newer (gnome-keyring stores whole seconds).
+const NEWER_PAUSE: std::time::Duration = std::time::Duration::from_millis(1100);
 
 /// Builds attributes from key/value pairs.
 fn _attrs(pairs: &[(&str, &str)]) -> Attributes {
@@ -46,21 +57,14 @@ fn _item(label: &str, pairs: &[(&str, &str)], secret: &str) -> NewItem {
     }
 }
 
-/// Creates the sample collections and items, then locks `Work`.
+/// Creates the sample collections and items, then locks `Work` (unless the
+/// transfer preview preset needs it unlocked).
 async fn _seed() -> kring_core::Result<()> {
     let backend = SecretServiceBackend::connect().await?;
     let login = CollectionId(LOGIN_COLLECTION_PATH.into());
     let login_items = [
-        _item(
-            "GitHub token",
-            &[("service", "gh"), ("user", "dev")],
-            "ghp_sample",
-        ),
-        _item(
-            "Mail account",
-            &[("service", "imap"), ("user", "dev@example.com")],
-            "mail-pw",
-        ),
+        _item("GitHub token", &GITHUB_ATTRS, "ghp_sample"),
+        _item("Mail account", &MAIL_ATTRS, "mail-pw"),
         NewItem {
             label: "Binary blob".into(),
             attributes: _attrs(&[("kind", "binary")]),
@@ -83,11 +87,28 @@ async fn _seed() -> kring_core::Result<()> {
             _item("Jira API", &[("service", "jira")], "jira-token"),
         )
         .await?;
+    // Same identity as in login: a newer, different secret (conflict) and
+    // an identical copy (duplicate) for the Copy / Move preview.
+    std::thread::sleep(NEWER_PAUSE);
+    backend
+        .create_item(&work, _item("GitHub token", &GITHUB_ATTRS, "ghp_rotated"))
+        .await?;
+    backend
+        .create_item(&work, _item("Mail account", &MAIL_ATTRS, "mail-pw"))
+        .await?;
     backend
         .create_with_password(DEFAULT_1.0, &SecretValue::from_text(DEFAULT_1.1))
         .await?;
-    backend.lock(&work).await?;
+    if !_keep_work_unlocked() {
+        backend.lock(&work).await?;
+    }
     Ok(())
+}
+
+/// Returns true when the app preset previews a transfer into `Work`, which
+/// needs it unlocked.
+fn _keep_work_unlocked() -> bool {
+    std::env::var(VAR_DIALOG).is_ok_and(|v| v == DIALOG_TRANSFER_PREVIEW)
 }
 
 /// Creates the sample backups: an older binary one (reason
@@ -128,8 +149,17 @@ async fn main() -> ExitCode {
     match _seed().await {
         Ok(()) => {
             println!(
-                "seed_dev: seeded login (3 items), {} (2 items, locked, password {:?}), {} (empty, password {:?}), 2 backups (passphrase {:?})",
-                WORK.0, WORK.1, DEFAULT_1.0, DEFAULT_1.1, BACKUP_PASSPHRASE
+                "seed_dev: seeded login (3 items), {} (4 items, 2 shared with login, {}, password {:?}), {} (empty, password {:?}), 2 backups (passphrase {:?})",
+                WORK.0,
+                if _keep_work_unlocked() {
+                    "unlocked"
+                } else {
+                    "locked"
+                },
+                WORK.1,
+                DEFAULT_1.0,
+                DEFAULT_1.1,
+                BACKUP_PASSPHRASE
             );
             ExitCode::SUCCESS
         }
