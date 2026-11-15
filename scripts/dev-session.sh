@@ -17,6 +17,8 @@
 #              unlocked so the consolidation preview shows a conflict)
 #   Default_2  1 item duplicating login's "Mail account", password `d2`
 #   Default_3  empty, password `d3`
+# With KRING_DEV_SHARED_LABELS=1 Default_1 and Default_3 are both labelled
+# "Default" (like real gnome-keyring orphans), to show the disambiguated names.
 # and, before the daemon starts, the synthetic fixtures of
 # crates/kring-core/tests/fixtures/keyrings are copied into the TEMP keyrings
 # dir (never from the real one), so the Offline files area has binary,

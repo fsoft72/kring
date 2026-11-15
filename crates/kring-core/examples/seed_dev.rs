@@ -38,6 +38,11 @@ const DIALOG_TRANSFER_PREVIEW: &str = "transfer-preview";
 /// Preset value that previews a consolidation into `login`: `Work` stays
 /// unlocked (a conflict) and `Default_1` is locked (a skipped keyring).
 const DIALOG_CONSOLIDATE_PREVIEW: &str = "consolidate-preview";
+/// Any non-empty value relabels `Default_1` and `Default_3` as [`SHARED_LABEL`],
+/// like the orphans gnome-keyring creates (same label, different ids).
+const VAR_SHARED_LABELS: &str = "KRING_DEV_SHARED_LABELS";
+/// Label given to the orphans by [`VAR_SHARED_LABELS`].
+const SHARED_LABEL: &str = "Default";
 /// Attributes of the item `login` and `Work` share with different secrets.
 const GITHUB_ATTRS: [(&str, &str); 2] = [("service", "gh"), ("user", "dev")];
 /// Attributes of the item `login` and `Work` share with the same secret.
@@ -115,9 +120,14 @@ async fn _seed() -> kring_core::Result<()> {
     backend
         .create_item(&default_2, _item("Mail account", &MAIL_ATTRS, "mail-pw"))
         .await?;
-    backend
+    let default_3 = backend
         .create_with_password(DEFAULT_3.0, &SecretValue::from_text(DEFAULT_3.1))
         .await?;
+    if _shared_labels() {
+        for orphan in [&default_1, &default_3] {
+            backend.rename_collection(orphan, SHARED_LABEL).await?;
+        }
+    }
     if !_keep_work_unlocked() {
         backend.lock(&work).await?;
     }
@@ -125,6 +135,11 @@ async fn _seed() -> kring_core::Result<()> {
         backend.lock(&default_1).await?;
     }
     Ok(())
+}
+
+/// Returns true when the orphans must share one label (see [`VAR_SHARED_LABELS`]).
+fn _shared_labels() -> bool {
+    std::env::var_os(VAR_SHARED_LABELS).is_some_and(|v| !v.is_empty())
 }
 
 /// Returns true when the app preset variable equals `value`.
