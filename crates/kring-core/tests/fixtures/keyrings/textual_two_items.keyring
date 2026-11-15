@@ -1,0 +1,30 @@
+[keyring]
+display-name=Two Items
+ctime=1700000000
+mtime=1700000100
+lock-on-idle=false
+lock-after=false
+
+[1]
+display-name=First item
+secret=fixture-secret-1
+item-type=0
+ctime=1700000001
+mtime=1700000002
+
+[1:attribute0]
+name=user
+type=string
+value=alice
+
+[2]
+display-name=Second item
+secret=fixture-secret-2
+item-type=2
+ctime=1700000003
+mtime=1700000004
+
+[2:attribute0]
+name=port
+type=uint32
+value=8080

@@ -25,3 +25,4 @@
 - Restyle review fixes: screenshot presets moved to `dev_preset.rs`, compiled only in debug builds and honoured only when `kring_core::dev_guard::violation_from` accepts the environment (`violation_from` is now always compiled; the env reader stays behind the `dev` feature); `KRING_DEV_EXPAND` indexes cards in displayed order; danger button tints lowered (hover 0.14, pressed 0.20) with composited button states in the contrast test; buttons split into `ui/buttons.rs`; rustdoc on public fields and variants.
 - Added implementation plan 2 (offline keyring files, recovery, backups UI, encrypted export).
 - Added the tolerant textual keyring parser (`keyring_file::textual`): recovers multi-line `secret=` values that GLib and oo7 reject, reports `ParseWarning`s and a `daemon_readable` flag.
+- Added `keyring_file::scan` (`detect_format`, `scan_dir`, `KeyringFileInfo`) and synthetic textual keyring fixtures under `crates/kring-core/tests/fixtures/keyrings/`.
