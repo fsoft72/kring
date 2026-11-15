@@ -98,7 +98,7 @@ fn decrypt(blob: &[u8], passphrase: Option<&SecretValue>) -> Result<Zeroizing<Ve
         .ok_or_else(|| KringError::InvalidInput("passphrase is not valid UTF-8".into()))?;
     let bad = || KringError::InvalidInput(WRONG_PASSPHRASE.into());
     let decryptor = age::Decryptor::new(blob).map_err(|_| bad())?;
-    let identity = age::scrypt::Identity::new(SecretString::from(text.to_string()));
+    let identity = super::create::age_identity(SecretString::from(text.to_string()));
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .map_err(|_| bad())?;

@@ -53,3 +53,4 @@
 - Added the `it_consolidate` integration test (empty, duplicate, conflicting and locked orphans consolidated into `login` on a throwaway gnome-keyring; checks items, deleted collections and their files, default alias) and the README Copy/Move and Consolidate sections with the recommended cleanup order. `snapshot_collections` moved from the worker into `kring_core::transfer::consolidate` (no behavior change).
 - Fixed a panic on app exit: the worker now drops the Secret Service backend inside its Tokio runtime (oo7 spawns a task on drop).
 - Switched eframe to the glow renderer (like Paranoid) and optimized dependencies in debug builds: window resizing no longer lags or leaves artifacts.
+- Fixed intermittent "wrong passphrase" on age-encrypted backups and archives: kring now uses a fixed scrypt work factor (18) and accepts up to 22 when decrypting, instead of age's per-machine calibration.

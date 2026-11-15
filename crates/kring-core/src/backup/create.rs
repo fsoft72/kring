@@ -133,9 +133,33 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     f.write_all(bytes).map_err(|e| io_err(path, e))
 }
 
-/// Encrypts `plain` with an age scrypt passphrase.
+/// scrypt work factor (log2 N) used for every age file kring writes.
+///
+/// Fixed instead of age's per-machine calibration: calibration measured under
+/// load (or on a slower machine) could pick a lower limit at decryption than
+/// the factor used at encryption, and age then refuses the file.
+pub(crate) const SCRYPT_WORK_FACTOR: u8 = 18;
+
+/// Highest scrypt work factor accepted when decrypting (age's usual ceiling),
+/// so files written by kring or by age elsewhere always decrypt.
+pub(crate) const SCRYPT_MAX_WORK_FACTOR: u8 = 22;
+const _: () = assert!(SCRYPT_MAX_WORK_FACTOR >= SCRYPT_WORK_FACTOR);
+
+/// Builds the age scrypt identity used to decrypt kring files, with a fixed
+/// maximum work factor instead of one calibrated on the current machine load.
+pub(crate) fn age_identity(passphrase: SecretString) -> age::scrypt::Identity {
+    let mut identity = age::scrypt::Identity::new(passphrase);
+    identity.set_max_work_factor(SCRYPT_MAX_WORK_FACTOR);
+    identity
+}
+
+/// Encrypts `plain` with an age scrypt passphrase at [`SCRYPT_WORK_FACTOR`].
 pub(crate) fn encrypt_age(plain: &[u8], passphrase: &SecretString, path: &Path) -> Result<Vec<u8>> {
-    let encryptor = age::Encryptor::with_user_passphrase(passphrase.clone());
+    let mut recipient = age::scrypt::Recipient::new(passphrase.clone());
+    recipient.set_work_factor(SCRYPT_WORK_FACTOR);
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|e| io_err(path, e))?;
     let mut out = Vec::new();
     let mut w = encryptor
         .wrap_output(&mut out)
@@ -461,7 +485,7 @@ mod tests {
 
         let enc = fs::read(&file.stored).unwrap();
         let dec = age::Decryptor::new(&enc[..]).unwrap();
-        let id = age::scrypt::Identity::new(SecretString::from("hunter2".to_string()));
+        let id = age_identity(SecretString::from("hunter2".to_string()));
         let mut r = dec.decrypt(std::iter::once(&id as _)).unwrap();
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
@@ -690,5 +714,21 @@ mod tests {
     fn plaintext_detection() {
         assert!(!is_plaintext_keyring(KEYRING_MAGIC));
         assert!(is_plaintext_keyring(b"[keyring]"));
+    }
+    /// Every age file uses the fixed work factor, so decryption never depends
+    /// on how fast or loaded the machine is.
+    #[test]
+    fn age_files_use_fixed_work_factor() {
+        let pass = SecretString::from("hunter2".to_string());
+        let enc = encrypt_age(b"plain", &pass, Path::new("x")).unwrap();
+        let header = String::from_utf8_lossy(&enc[..enc.len().min(200)]).to_string();
+        let stanza = header
+            .lines()
+            .find(|l| l.starts_with("-> scrypt "))
+            .unwrap();
+        assert_eq!(
+            stanza.split(' ').nth(3),
+            Some(SCRYPT_WORK_FACTOR.to_string().as_str())
+        );
     }
 }

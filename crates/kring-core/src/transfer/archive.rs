@@ -234,7 +234,7 @@ fn decrypt_archive(path: &Path, secret: SecretString) -> Result<Zeroizing<Vec<u8
     let bytes = fs::read(path).map_err(|e| io_err(path, e))?;
     let bad = || KringError::InvalidInput(DECRYPT_FAILED.into());
     let decryptor = age::Decryptor::new(&bytes[..]).map_err(|_| bad())?;
-    let identity = age::scrypt::Identity::new(secret);
+    let identity = crate::backup::age_identity(secret);
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .map_err(|_| bad())?;
