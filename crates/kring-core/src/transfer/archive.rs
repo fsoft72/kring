@@ -11,7 +11,8 @@
 
 use std::borrow::Cow;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use age::secrecy::SecretString;
@@ -20,7 +21,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::backup::{encrypt_age, io_err, write_private};
+use crate::backup::{encrypt_age, io_err};
 use crate::error::{KringError, Result};
 use crate::keyring_file::textual::OfflineItem;
 use crate::model::{Attributes, SecretValue};
@@ -171,17 +172,61 @@ pub fn write_archive(path: &Path, items: &[ExportedItem], passphrase: &SecretVal
     }
     let json = serialize_items(items)?;
     let encrypted = encrypt_age(&json, &secret, path)?;
+    publish_file(path, &encrypted, |from, to| fs::hard_link(from, to))
+}
+
+/// Writes `bytes` to `path` without ever overwriting an existing file.
+///
+/// The data goes to a temporary sibling first and is hard linked into place.
+/// If the link fails for a reason other than the destination existing (vfat,
+/// exFAT, FUSE or network mounts), the bytes are written straight to `path`
+/// with `create_new`. `link` is injectable for tests.
+fn publish_file(
+    path: &Path,
+    bytes: &[u8],
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let exists = || KringError::InvalidInput(format!("{} already exists", path.display()));
     let tmp = temp_path(path);
-    write_private(&tmp, &encrypted)?;
-    // hard_link fails if the destination appeared meanwhile, so it never overwrites.
-    let linked = fs::hard_link(&tmp, path);
-    let _ = fs::remove_file(&tmp);
-    linked.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            return KringError::InvalidInput(format!("{} already exists", path.display()));
+    match create_private(&tmp, bytes) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(KringError::InvalidInput(format!(
+                "A previous export left {}; remove it and retry",
+                tmp.display()
+            )));
         }
-        io_err(path, e)
-    })
+        Err(e) => return Err(io_err(&tmp, e)),
+    }
+    let linked = link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+        Err(_) => match create_private(path, bytes) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists()),
+            Err(e) => Err(io_err(path, e)),
+        },
+    }
+}
+
+/// Creates `path` (mode 0600, must not exist) and writes `bytes`.
+///
+/// If the write fails after the file was created by this call, the file is
+/// removed again. An already existing file is never touched.
+fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Decrypts the archive file into a zeroizing buffer.
@@ -209,14 +254,19 @@ pub fn read_archive(path: &Path, passphrase: &SecretValue) -> Result<Vec<Exporte
     if header.format != EXPORT_FORMAT {
         return Err(not_archive());
     }
-    if header.version > EXPORT_VERSION {
+    if header.version != EXPORT_VERSION {
         return Err(KringError::InvalidInput(format!(
             "Unsupported archive version {}",
             header.version
         )));
     }
-    let doc: ArchiveIn = serde_json::from_slice(&plain)
-        .map_err(|e| KringError::InvalidInput(format!("Invalid archive: {e}")))?;
+    let doc: ArchiveIn = serde_json::from_slice(&plain).map_err(|e| {
+        KringError::InvalidInput(format!(
+            "Invalid archive contents (line {}, column {})",
+            e.line(),
+            e.column()
+        ))
+    })?;
     doc.items
         .into_iter()
         .map(|it| {
@@ -387,6 +437,54 @@ mod tests {
             matches!(&err, KringError::InvalidInput(m) if m == "Unsupported archive version 2"),
             "{err}"
         );
+    }
+
+    /// Version 0 is rejected too.
+    #[test]
+    fn version_zero_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x");
+        write_raw(&path, br#"{"format":"kring-items","version":0,"items":[]}"#);
+        let err = read_archive(&path, &pw("pw")).unwrap_err();
+        assert!(
+            matches!(&err, KringError::InvalidInput(m) if m == "Unsupported archive version 0"),
+            "{err}"
+        );
+    }
+
+    /// When hard links are unsupported the archive is still written, privately.
+    #[test]
+    fn link_failure_falls_back_to_direct_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.kring-items");
+        let eperm = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(1));
+        publish_file(&path, b"data", eperm).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"data");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        // The fallback never overwrites either.
+        let again = publish_file(&path, b"new", eperm);
+        assert!(matches!(again, Err(KringError::InvalidInput(_))));
+        assert_eq!(fs::read(&path).unwrap(), b"data");
+    }
+
+    /// A leftover temp file is reported and left untouched.
+    #[test]
+    fn stale_temp_file_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.kring-items");
+        let tmp = temp_path(&path);
+        fs::write(&tmp, b"stale").unwrap();
+        let err = write_archive(&path, &[], &pw("pw")).unwrap_err();
+        assert!(
+            matches!(&err, KringError::InvalidInput(m) if m.contains("A previous export left")),
+            "{err}"
+        );
+        assert_eq!(fs::read(&tmp).unwrap(), b"stale");
+        assert!(!path.exists());
     }
 
     /// An existing destination is never overwritten.
