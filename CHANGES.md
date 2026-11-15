@@ -15,3 +15,4 @@
 - Added gnome-keyring master password support (`MasterPasswordStore` for `SecretServiceBackend`: create, unlock and change password via the private interface over a dedicated encrypted session, no prompts) with the `it_master_password` integration test.
 - Added backups (`BackupManager`, age-encrypted plaintext keyrings, manifest with sha256, pruning) and `paths` helpers.
 - Added the `kring` app library with `worker` (background thread, command/event channels, provider gating, backup before deletes, NotFound refresh).
+- Added `app_state` (event reducer with sorted collections), `clipboard` (30 s auto-clear guard over arboard) and `secret_display` (text vs hex view).

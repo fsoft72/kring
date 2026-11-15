@@ -8,6 +8,7 @@ kring-core = { path = "../kring-core" }
 eframe = "0.37"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 arboard = "3.7"
+zeroize = "1.9"
 
 [dev-dependencies]
 kring-core = { path = "../kring-core", features = ["fake"] }
