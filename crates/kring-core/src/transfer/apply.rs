@@ -2,14 +2,17 @@
 //!
 //! Copy creates or updates items in the target. Move does the same and then
 //! deletes a source item only when its content is verifiably present in the
-//! target afterwards (see [`source_safe_to_delete`]). Only
+//! target afterwards or, for a conflict kept as the target, only when the
+//! target is at least as new (see [`source_safe_to_delete`]; in that case the
+//! incoming secret is discarded and survives only in the pre-apply backup).
+//! Move into the collection a source already lives in is refused. Only
 //! [`TransferSource::Live`] sources are ever deleted; offline sources are
 //! left alone (their files are retired separately). Per-item failures are
 //! recorded and the run continues; a failed item never loses its source.
 //! Reports carry labels and counts only, never secrets.
 
 use crate::error::{KringError, Result};
-use crate::model::{Attributes, CollectionId, ItemUpdate, NewItem, SecretValue};
+use crate::model::{Attributes, CollectionId, ItemId, ItemUpdate, NewItem, SecretValue};
 use crate::store::SecretStore;
 use crate::transfer::plan::{Action, Choice, Incoming, TransferPlan, TransferSource, identity};
 
@@ -35,7 +38,8 @@ pub struct TransferReport {
     pub kept_target: usize,
     /// Items skipped because the source had no secret.
     pub no_secret: usize,
-    /// Items skipped because of an earlier incoming item.
+    /// Items skipped because of an earlier incoming item (counts both
+    /// `SkipSameBatch` and `ConflictSameBatch`).
     pub same_batch_skipped: usize,
     /// Live source items deleted (move only).
     pub source_deleted: usize,
@@ -55,14 +59,23 @@ pub struct TransferReport {
 /// - `Duplicate`: always (identical content already in the target).
 /// - `Conflict` with `UseIncoming`: only when `outcome_ok`.
 /// - `Conflict` with `KeepTarget`: only when the target is at least as new.
+///   The incoming secret is NOT in the target in that case; it survives only
+///   in the pre-apply backup that callers must have taken.
 /// - `NoSecret`, `ConflictSameBatch`: never.
+///
+/// `self_match` is true when the matched target item is the source item
+/// itself (a move into its own collection); it is never safe to delete then.
 pub fn source_safe_to_delete(
     action: &Action,
     choice: Option<Choice>,
     outcome_ok: bool,
     modified_incoming: u64,
     modified_existing: u64,
+    self_match: bool,
 ) -> bool {
+    if self_match {
+        return false;
+    }
     match action {
         Action::Create | Action::SkipSameBatch => outcome_ok,
         Action::Duplicate { .. } => true,
@@ -75,7 +88,41 @@ pub fn source_safe_to_delete(
     }
 }
 
+/// Returns the collection path of an item path (everything before the last `/`).
+fn parent_collection(item: &ItemId) -> &str {
+    item.0.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// Returns true when a Move would touch a source inside the target itself.
+fn moves_into_own_collection(
+    target: &CollectionId,
+    incoming: &[Incoming],
+    plan: &TransferPlan,
+) -> bool {
+    incoming.iter().zip(&plan.actions).any(|(item, action)| {
+        let TransferSource::Live(source) = &item.source else {
+            return false;
+        };
+        parent_collection(source) == target.0 || matched_existing(action, plan) == Some(source)
+    })
+}
+
+/// Returns the target item an action matched, when it has one.
+fn matched_existing<'a>(action: &'a Action, plan: &'a TransferPlan) -> Option<&'a ItemId> {
+    match action {
+        Action::Duplicate { existing } => Some(existing),
+        Action::Conflict(index) => plan.conflicts.get(*index).map(|c| &c.existing),
+        _ => None,
+    }
+}
+
 /// Applies `plan` to `target`, one `choices` entry per conflict.
+///
+/// # Preconditions
+///
+/// - Callers MUST back up the source collection(s) before a Move.
+/// - Callers MUST back up the target before any `UseIncoming` choice.
+/// - Per the plan Global Constraints, the worker does this (Plan 3 Task 6).
 ///
 /// Fails before any change when the choice or action counts do not match,
 /// or when the target is missing or locked. Item failures go to
@@ -98,6 +145,20 @@ pub async fn apply_transfer<S: SecretStore + ?Sized>(
     if plan.actions.len() != incoming.len() {
         return Err(KringError::InvalidInput(
             "plan does not match the incoming items".into(),
+        ));
+    }
+    let bad_index = plan
+        .actions
+        .iter()
+        .any(|a| matches!(a, Action::Conflict(i) if *i >= plan.conflicts.len()));
+    if bad_index {
+        return Err(KringError::InvalidInput(
+            "plan references a missing conflict".into(),
+        ));
+    }
+    if mode == TransferMode::Move && moves_into_own_collection(target, incoming, plan) {
+        return Err(KringError::InvalidInput(
+            "Cannot move items into the collection they are in".into(),
         ));
     }
     let collections = store.list_collections().await?;
@@ -126,8 +187,13 @@ pub async fn apply_transfer<S: SecretStore + ?Sized>(
             },
             Action::Duplicate { .. } => report.duplicates += 1,
             Action::Conflict(index) => {
-                let conflict = &plan.conflicts[*index];
-                let picked = choices[*index];
+                let (Some(conflict), Some(picked)) =
+                    (plan.conflicts.get(*index), choices.get(*index).copied())
+                else {
+                    return Err(KringError::InvalidInput(
+                        "plan references a missing conflict".into(),
+                    ));
+                };
                 choice = Some(picked);
                 m_in = conflict.modified_incoming;
                 m_ex = conflict.modified_existing;
@@ -165,7 +231,8 @@ pub async fn apply_transfer<S: SecretStore + ?Sized>(
         let TransferSource::Live(source) = &item.source else {
             continue;
         };
-        if !source_safe_to_delete(action, choice, outcome_ok, m_in, m_ex) {
+        let self_match = matched_existing(action, plan) == Some(source);
+        if !source_safe_to_delete(action, choice, outcome_ok, m_in, m_ex, self_match) {
             report.source_kept.push(item.label.clone());
             continue;
         }
@@ -201,7 +268,7 @@ mod tests {
     use crate::model::{CollectionInfo, ItemId, ItemInfo};
     use crate::transfer::plan::{Existing, plan_transfer};
 
-    /// Store wrapper whose `create_item` fails for one label.
+    /// Store wrapper whose `create_item` and `update_item` fail for one label.
     struct FailingStore(FakeStore, &'static str);
 
     impl FailingStore {
@@ -229,6 +296,9 @@ mod tests {
             self.0.create_item(c, item).await
         }
         async fn update_item(&self, i: &ItemId, u: ItemUpdate) -> Result<()> {
+            if u.label.as_deref() == Some(self.1) {
+                return Err(KringError::NotFound("injected failure".into()));
+            }
             self.0.update_item(i, u).await
         }
         async fn delete_item(&self, i: &ItemId) -> Result<()> {
@@ -534,6 +604,105 @@ mod tests {
         assert_eq!(labels(&store.0, &dst).await, ["good"]);
     }
 
+    /// A move into the collection the sources live in is refused untouched.
+    #[tokio::test]
+    async fn move_into_same_collection_rejected() {
+        let store = FakeStore::new();
+        let col = store.add_collection("col", "p", false);
+        put(&store, &col, "a", &[("a", "1")], "x").await;
+        let incoming = live_incoming(&store, &col, 1).await;
+        let plan = plan_transfer(&incoming, &existing_of(&store, &col).await);
+        let err = apply_transfer(&store, &col, &incoming, &plan, &[], TransferMode::Move)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KringError::InvalidInput(_)));
+        assert_eq!(labels(&store, &col).await, ["a"]);
+        // The parent check alone also catches it (no matched existing item).
+        let plan = plan_transfer(&incoming, &[]);
+        let err = apply_transfer(&store, &col, &incoming, &plan, &[], TransferMode::Move)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KringError::InvalidInput(_)));
+        assert_eq!(labels(&store, &col).await, ["a"]);
+    }
+
+    /// A duplicate or conflict that is the source itself is never deleted.
+    #[test]
+    fn self_duplicate_never_deleted() {
+        let dup = Action::Duplicate {
+            existing: ItemId("/x".into()),
+        };
+        assert!(source_safe_to_delete(&dup, None, true, 1, 1, false));
+        assert!(!source_safe_to_delete(&dup, None, true, 1, 1, true));
+        let c = Action::Conflict(0);
+        let ku = Some(Choice::UseIncoming);
+        assert!(!source_safe_to_delete(&c, ku, true, 1, 1, true));
+        assert!(!source_safe_to_delete(
+            &c,
+            Some(Choice::KeepTarget),
+            true,
+            1,
+            9,
+            true
+        ));
+    }
+
+    /// The parent of an item path is its collection path.
+    #[test]
+    fn parent_collection_strips_last_segment() {
+        let id = ItemId("/org/freedesktop/secrets/collection/login/12".into());
+        assert_eq!(
+            parent_collection(&id),
+            "/org/freedesktop/secrets/collection/login"
+        );
+        assert_eq!(parent_collection(&ItemId("nosep".into())), "");
+    }
+
+    /// A failed UseIncoming update keeps the source and is reported.
+    #[tokio::test]
+    async fn failed_update_keeps_source() {
+        let store = FailingStore::new("bad");
+        let src = store.0.add_collection("src", "p", false);
+        let dst = store.0.add_collection("dst", "p", false);
+        put(&store.0, &src, "bad", &[("a", "1")], "new").await;
+        put(&store.0, &dst, "old", &[("a", "1")], "old").await;
+        let incoming = live_incoming(&store.0, &src, 9).await;
+        let plan = plan_transfer(&incoming, &existing_of(&store.0, &dst).await);
+        let report = apply_transfer(
+            &store,
+            &dst,
+            &incoming,
+            &plan,
+            &[Choice::UseIncoming],
+            TransferMode::Move,
+        )
+        .await
+        .unwrap();
+        assert_eq!((report.replaced, report.source_deleted), (0, 0));
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.source_kept, ["bad"]);
+        assert_eq!(labels(&store.0, &src).await, ["bad"]);
+    }
+
+    /// A plan pointing at a missing conflict fails closed.
+    #[tokio::test]
+    async fn malformed_plan_index_rejected() {
+        let store = FakeStore::new();
+        let src = store.add_collection("src", "p", false);
+        let dst = store.add_collection("dst", "p", false);
+        put(&store, &src, "a", &[("a", "1")], "x").await;
+        let incoming = live_incoming(&store, &src, 1).await;
+        let plan = TransferPlan {
+            actions: vec![Action::Conflict(3)],
+            conflicts: vec![],
+        };
+        let err = apply_transfer(&store, &dst, &incoming, &plan, &[], TransferMode::Move)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KringError::InvalidInput(_)));
+        assert_eq!(labels(&store, &src).await, ["a"]);
+    }
+
     /// Every branch of the deletion decision.
     #[test]
     fn source_safe_to_delete_branches() {
@@ -542,36 +711,60 @@ mod tests {
         };
         let conflict = Action::Conflict(0);
         let (ki, ku) = (Some(Choice::KeepTarget), Some(Choice::UseIncoming));
-        assert!(source_safe_to_delete(&Action::Create, None, true, 1, 1));
-        assert!(!source_safe_to_delete(&Action::Create, None, false, 1, 1));
-        assert!(source_safe_to_delete(&dup, None, false, 1, 1));
+        assert!(source_safe_to_delete(
+            &Action::Create,
+            None,
+            true,
+            1,
+            1,
+            false
+        ));
+        assert!(!source_safe_to_delete(
+            &Action::Create,
+            None,
+            false,
+            1,
+            1,
+            false
+        ));
+        assert!(source_safe_to_delete(&dup, None, false, 1, 1, false));
         assert!(source_safe_to_delete(
             &Action::SkipSameBatch,
             None,
             true,
             1,
-            1
+            1,
+            false
         ));
         assert!(!source_safe_to_delete(
             &Action::SkipSameBatch,
             None,
             false,
             1,
-            1
+            1,
+            false
         ));
-        assert!(source_safe_to_delete(&conflict, ku, true, 1, 9));
-        assert!(!source_safe_to_delete(&conflict, ku, false, 1, 9));
-        assert!(source_safe_to_delete(&conflict, ki, false, 5, 5));
-        assert!(source_safe_to_delete(&conflict, ki, false, 5, 6));
-        assert!(!source_safe_to_delete(&conflict, ki, true, 6, 5));
-        assert!(!source_safe_to_delete(&conflict, None, true, 1, 9));
-        assert!(!source_safe_to_delete(&Action::NoSecret, None, true, 1, 9));
+        assert!(source_safe_to_delete(&conflict, ku, true, 1, 9, false));
+        assert!(!source_safe_to_delete(&conflict, ku, false, 1, 9, false));
+        assert!(source_safe_to_delete(&conflict, ki, false, 5, 5, false));
+        assert!(source_safe_to_delete(&conflict, ki, false, 5, 6, false));
+        assert!(!source_safe_to_delete(&conflict, ki, true, 6, 5, false));
+        assert!(!source_safe_to_delete(&conflict, None, true, 1, 9, false));
+        assert!(!source_safe_to_delete(
+            &Action::NoSecret,
+            None,
+            true,
+            1,
+            9,
+            false
+        ));
         assert!(!source_safe_to_delete(
             &Action::ConflictSameBatch,
             None,
             true,
             1,
-            9
+            9,
+            false
         ));
     }
 
