@@ -10,18 +10,27 @@
 //!   `FdoUniqueLabel::fromEntryLocation`): the key without its `__N_` suffix
 //!   (`FdoUniqueLabel::makeName`, regex `(^.*)__(\d+)_$`), prefixed with
 //!   `<folder>/` unless the folder is `Secret Service`.
-//! * Native entries (no record, or only a synthesized one): label
-//!   `<folder>/<key>` and the attributes `kwallet-folder`, `kwallet-key`,
-//!   `kwallet-type` and `xdg:schema=org.kde.KWallet.Entry`.
+//! * Native entries (no record, a synthesized one, or a record without
+//!   attributes): label `<folder>/<key>` (so a native entry in the
+//!   `Secret Service` folder is labelled `Secret Service/<key>`, as KWallet's
+//!   own migration does) and the attributes `server=<folder>`, `user=<key>`,
+//!   `type=plaintext|map|binary`, plus `kwallet-folder`, `kwallet-key`,
+//!   `kwallet-type` and `xdg:schema=org.kde.KWallet.Entry`. The first three
+//!   are what the kwalletd6 shim searches for native entries
+//!   (`SecretServiceClient::retrieveItem`, secretserviceclient.cpp, schema
+//!   `org.qt.keychain` with DONT_MATCH_NAME, so `xdg:schema` does not take
+//!   part); `migrateWallet` writes the same ones and `ksecretd` synthesizes
+//!   them (`KWalletFreedesktopCollection::onWalletChangeState`), so apps
+//!   using the KWallet API keep finding their secrets.
 //!
-//! Synthesized records (`KWalletFreedesktopCollection::onWalletChangeState`)
-//! are `{server: <folder>, user: <key>, type: plaintext|map|binary}` and no
-//! mime type. The daemon invents them only to expose a native entry over
-//! Secret Service; no app stored them, so they are NOT kept as attributes
-//! (the native mapping is used, which also keeps the identity of an entry
-//! stable whether or not such a record exists). Their dates are still used.
-//! A record with no attributes is treated like a native entry too, since an
-//! empty identity would clash with every other such item.
+//! Native attributes are always derived from the entry itself, never copied
+//! from a synthesized record, so the identity of an entry is stable whether or
+//! not such a record exists. A record is "synthesized" when it is exactly
+//! `{server: <folder>, user: <key>, type}`: that only decides between an app
+//! record and a native entry. Its date is the creation time of the compat
+//! collection, not the entry's, so the item gets `modified = 0`. A record
+//! with no attributes is treated as native too (an empty identity would clash
+//! with every other such item).
 //!
 //! Values: Password -> text secret, Map -> JSON object text
 //! (`application/json`, keys sorted), Stream -> bytes
@@ -39,6 +48,12 @@ use crate::transfer::plan::{Incoming, TransferSource};
 const SECRET_SERVICE_FOLDER: &str = "Secret Service";
 /// Schema of native KWallet entries.
 const KWALLET_ENTRY_SCHEMA: &str = "org.kde.KWallet.Entry";
+/// Shim lookup attribute: wallet folder.
+const ATTR_SERVER: &str = "server";
+/// Shim lookup attribute: wallet key.
+const ATTR_USER: &str = "user";
+/// Shim lookup attribute: `plaintext`, `map` or `binary`.
+const ATTR_SHIM_TYPE: &str = "type";
 /// Attribute with the wallet folder of a native entry.
 const ATTR_FOLDER: &str = "kwallet-folder";
 /// Attribute with the wallet key of a native entry.
@@ -47,6 +62,34 @@ const ATTR_KEY: &str = "kwallet-key";
 const ATTR_TYPE: &str = "kwallet-type";
 /// Content type of a map serialized as JSON.
 const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// Kind of a native entry, with its two attribute spellings.
+#[derive(Clone, Copy)]
+enum Kind {
+    Password,
+    Map,
+    Stream,
+}
+
+impl Kind {
+    /// Value of `kwallet-type`.
+    fn kwallet_name(self) -> &'static str {
+        match self {
+            Kind::Password => "password",
+            Kind::Map => "map",
+            Kind::Stream => "stream",
+        }
+    }
+
+    /// Value of the shim's `type` attribute (`SecretServiceClient::retrieveItem`).
+    fn shim_name(self) -> &'static str {
+        match self {
+            Kind::Password => "plaintext",
+            Kind::Map => "map",
+            Kind::Stream => "binary",
+        }
+    }
+}
 
 /// Maps wallet entries to transfer items with `TransferSource::Offline(index)`.
 ///
@@ -61,14 +104,18 @@ pub fn to_incoming(
             continue;
         };
         let record = meta.get(&(entry.folder.clone(), entry.key.clone()));
-        let app_attributes = record
-            .filter(|m| !m.attributes.is_empty() && !_is_synthesized(entry, m))
-            .map(|m| m.attributes.clone());
-        let (label, attributes) = match app_attributes {
-            Some(attributes) => (_compat_label(&entry.folder, &entry.key), attributes),
+        let app_attributes =
+            record.filter(|m| !m.attributes.is_empty() && !_is_synthesized(entry, m));
+        let (label, attributes, modified) = match app_attributes {
+            Some(m) => (
+                _compat_label(&entry.folder, &entry.key),
+                m.attributes.clone(),
+                m.modified,
+            ),
             None => (
                 format!("{}/{}", entry.folder, entry.key),
                 _native_attributes(entry, kind),
+                0,
             ),
         };
         out.push(Incoming {
@@ -77,18 +124,18 @@ pub fn to_incoming(
             attributes,
             secret,
             secret_missing: false,
-            modified: record.map_or(0, |m| m.modified),
+            modified,
         });
     }
     out
 }
 
-/// Returns the transfer secret and the `kwallet-type` name of a value, `None` for unknown types.
-fn _secret(value: &EntryValue) -> Option<(SecretValue, &'static str)> {
+/// Returns the transfer secret and the entry kind of a value, `None` for unknown types.
+fn _secret(value: &EntryValue) -> Option<(SecretValue, Kind)> {
     match value {
-        EntryValue::Password(s) => Some((s.clone(), "password")),
-        EntryValue::Stream(s) => Some((s.clone(), "stream")),
-        EntryValue::Map(pairs) => Some((_map_json(pairs), "map")),
+        EntryValue::Password(s) => Some((s.clone(), Kind::Password)),
+        EntryValue::Stream(s) => Some((s.clone(), Kind::Stream)),
+        EntryValue::Map(pairs) => Some((_map_json(pairs), Kind::Map)),
         EntryValue::Unknown(_) => None,
     }
 }
@@ -104,7 +151,8 @@ fn _map_json(pairs: &[(String, SecretValue)]) -> SecretValue {
             )
         })
         .collect();
-    let json = serde_json::to_string(&sorted).unwrap_or_else(|_| "{}".to_string());
+    let json = serde_json::to_string(&sorted)
+        .expect("a map of strings to strings always serializes to JSON");
     SecretValue::new(json.into_bytes(), JSON_CONTENT_TYPE)
 }
 
@@ -118,12 +166,15 @@ fn _is_synthesized(entry: &WalletEntry, meta: &FdoMeta) -> bool {
         && a.contains_key("type")
 }
 
-/// Attributes of a native entry (`kwallet-*` plus the KWallet schema).
-fn _native_attributes(entry: &WalletEntry, kind: &str) -> Attributes {
+/// Attributes of a native entry (shim lookup attributes, `kwallet-*` and the KWallet schema).
+fn _native_attributes(entry: &WalletEntry, kind: Kind) -> Attributes {
     [
+        (ATTR_SERVER, entry.folder.as_str()),
+        (ATTR_USER, entry.key.as_str()),
+        (ATTR_SHIM_TYPE, kind.shim_name()),
         (ATTR_FOLDER, entry.folder.as_str()),
         (ATTR_KEY, entry.key.as_str()),
-        (ATTR_TYPE, kind),
+        (ATTR_TYPE, kind.kwallet_name()),
         (SCHEMA_ATTRIBUTE, KWALLET_ENTRY_SCHEMA),
     ]
     .iter()
@@ -240,8 +291,11 @@ mod tests {
     #[test]
     fn native_entries_use_fallback() {
         let (entries, items) = _fixture_items();
-        let want = |folder: &str, key: &str, kind: &str| {
+        let want = |folder: &str, key: &str, kind: &str, shim: &str| {
             _attrs(&[
+                ("server", folder),
+                ("user", key),
+                ("type", shim),
                 ("kwallet-folder", folder),
                 ("kwallet-key", key),
                 ("kwallet-type", kind),
@@ -250,16 +304,19 @@ mod tests {
         };
         let site = _find(&entries, &items, "Passwords", "site");
         assert_eq!(site.label, "Passwords/site");
-        assert_eq!(site.attributes, want("Passwords", "site", "password"));
+        assert_eq!(
+            site.attributes,
+            want("Passwords", "site", "password", "plaintext")
+        );
         assert_eq!(site.modified, 0);
         let form = _find(&entries, &items, "Maps", "form");
-        assert_eq!(form.attributes, want("Maps", "form", "map"));
+        assert_eq!(form.attributes, want("Maps", "form", "map", "map"));
         let blob = _find(&entries, &items, "Streams", "blob");
         assert_eq!(blob.label, "Streams/blob");
-        assert_eq!(blob.attributes, want("Streams", "blob", "stream"));
+        assert_eq!(blob.attributes, want("Streams", "blob", "stream", "binary"));
         assert_eq!(
-            blob.modified, 1794752450,
-            "synthesized record keeps its date"
+            blob.modified, 0,
+            "synthesized record dates are not the entry's"
         );
     }
 

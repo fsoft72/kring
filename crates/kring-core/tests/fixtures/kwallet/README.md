@@ -116,3 +116,13 @@ this fixture:
   wallet may hold such records for native entries. Synthesized records are
   not original app attributes: they have exactly the keys `server`, `user`,
   `type` with `server` = folder and `user` = key.
+
+## Notes for the migration (Task 4)
+
+- KWallet-API apps going through the kwalletd6 shim look for a collection
+  whose label equals the wallet name (default `kdewallet`,
+  `SecretServiceClient::retrieveCollection`). Migrated native entries only
+  help those apps if they land in a collection labelled `kdewallet`.
+- Items KWallet already migrated itself carry `xdg:schema=org.qt.keychain`,
+  so they plan as Create, not Duplicate, against kring's native mapping
+  (`xdg:schema=org.kde.KWallet.Entry`).
