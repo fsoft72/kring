@@ -12,7 +12,7 @@ use ssh_key::{Algorithm, EcdsaCurve, HashAlg, PrivateKey, PublicKey};
 use crate::error::{KringError, Result};
 
 /// Files larger than this are never read: real key files are a few KiB at most.
-const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
+pub(super) const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 /// Header of the OpenSSH private key format.
 const OPENSSH_HEADER: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
 /// Bytes read first from every candidate file to decide whether it is worth reading.
@@ -70,12 +70,15 @@ pub struct SshKeyInfo {
 }
 
 /// Parsed view of a private key file.
-struct PrivateProbe {
-    path: PathBuf,
-    encrypted: bool,
-    legacy: bool,
+pub(super) struct PrivateProbe {
+    /// Path of the file.
+    pub(super) path: PathBuf,
+    /// Whether the key is passphrase-protected.
+    pub(super) encrypted: bool,
+    /// True for legacy PEM / PKCS#8 keys.
+    pub(super) legacy: bool,
     /// Public part, only available for the OpenSSH format.
-    public: Option<PublicKey>,
+    pub(super) public: Option<PublicKey>,
 }
 
 /// Parsed view of a public key file.
@@ -201,9 +204,17 @@ fn probe_public(path: &Path) -> Option<PublicKey> {
 /// Cheap header check, then parse; `None` when the file is not a private key.
 fn probe_private(path: &Path) -> Option<PrivateProbe> {
     let text = read_candidate(path, |prefix| prefix.trim_start().starts_with(PEM_PREFIX))?;
+    classify_private(path, &text)
+}
+
+/// Classifies the text of `path` as an OpenSSH or legacy private key.
+///
+/// `None` when the text is neither a parseable OpenSSH private key nor a PEM
+/// `-----BEGIN ... PRIVATE KEY-----` block.
+pub(super) fn classify_private(path: &Path, text: &str) -> Option<PrivateProbe> {
     let head = text.trim_start();
     if head.starts_with(OPENSSH_HEADER) {
-        let key = PrivateKey::from_openssh(&text).ok()?;
+        let key = PrivateKey::from_openssh(text).ok()?;
         return Some(PrivateProbe {
             path: path.to_path_buf(),
             encrypted: key.is_encrypted(),

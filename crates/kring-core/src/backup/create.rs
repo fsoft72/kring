@@ -62,6 +62,34 @@ pub struct BackupInfo {
     pub pruned: Vec<PathBuf>,
 }
 
+/// One file to back up, with an explicit sensitivity flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupSource {
+    /// File to back up.
+    pub path: PathBuf,
+    /// True when the content is secret in clear (e.g. an unencrypted private
+    /// key): the stored copy is then always age-encrypted.
+    pub sensitive: bool,
+}
+
+impl BackupSource {
+    /// A file stored encrypted unless it is a binary keyring (see [`BackupManager::create`]).
+    pub fn plain(path: PathBuf) -> Self {
+        Self {
+            path,
+            sensitive: false,
+        }
+    }
+
+    /// A file whose stored copy is always age-encrypted.
+    pub fn sensitive(path: PathBuf) -> Self {
+        Self {
+            path,
+            sensitive: true,
+        }
+    }
+}
+
 /// Creates, lists and prunes backups under a root directory.
 #[derive(Clone, Debug)]
 pub struct BackupManager {
@@ -197,6 +225,10 @@ struct Header<'a> {
 impl BackupManager {
     /// Creates a backup of `files`, encrypting plaintext keyrings with `passphrase`.
     ///
+    /// A `*.keyring` file without the binary magic is plaintext and stored
+    /// age-encrypted; every other file is stored verbatim (use
+    /// [`BackupManager::create_with`] to mark other files as sensitive).
+    ///
     /// Nothing is written if a source is missing or a passphrase is needed but absent.
     /// The backup is written to a temporary directory and renamed when complete.
     /// Old backups are then pruned (see [`BackupManager::prune_into`]): the
@@ -213,6 +245,24 @@ impl BackupManager {
         Ok(info)
     }
 
+    /// Like [`BackupManager::create`], with an explicit sensitivity flag per file.
+    ///
+    /// A sensitive source is always age-encrypted with `passphrase`; any other
+    /// source follows the `.keyring` plaintext rule of [`BackupManager::create`].
+    /// A sensitive or plaintext source without a passphrase fails with
+    /// `PassphraseRequired` before anything is written. The manifest marks
+    /// every encrypted copy with `encrypted: true`.
+    pub fn create_with(
+        &self,
+        reason: &str,
+        files: &[BackupSource],
+        passphrase: Option<&SecretValue>,
+    ) -> Result<BackupInfo> {
+        let mut info = self.create_sources_unpruned(reason, files, passphrase)?;
+        self.prune_into(&[], &mut info);
+        Ok(info)
+    }
+
     /// Like [`BackupManager::create`], but never prunes old backups.
     pub(crate) fn create_unpruned(
         &self,
@@ -220,12 +270,25 @@ impl BackupManager {
         files: &[PathBuf],
         passphrase: Option<&SecretValue>,
     ) -> Result<BackupInfo> {
+        let sources: Vec<BackupSource> = files.iter().cloned().map(BackupSource::plain).collect();
+        self.create_sources_unpruned(reason, &sources, passphrase)
+    }
+
+    /// Writes one backup of `files` without pruning (shared by all `create*` methods).
+    fn create_sources_unpruned(
+        &self,
+        reason: &str,
+        files: &[BackupSource],
+        passphrase: Option<&SecretValue>,
+    ) -> Result<BackupInfo> {
         // Read everything and validate before touching the filesystem.
         let mut sources = Vec::new();
-        for path in files {
+        for source in files {
+            let path = &source.path;
             let bytes = Zeroizing::new(fs::read(path).map_err(|e| io_err(path, e))?);
             let is_keyring = path.extension().is_some_and(|e| e == KEYRING_EXT);
-            sources.push((path, is_keyring && is_plaintext_keyring(&bytes), bytes));
+            let encrypt = source.sensitive || (is_keyring && is_plaintext_keyring(&bytes));
+            sources.push((path, encrypt, bytes));
         }
         let secret = if sources.iter().any(|s| s.1) {
             let pass = passphrase.ok_or(KringError::PassphraseRequired)?;
@@ -707,6 +770,70 @@ mod tests {
             .collect();
         assert_eq!(names, ["a.keyring", "b.keyring", "default"]);
         assert!(keyring_backup_set(&src.join("missing")).unwrap().is_empty());
+    }
+
+    /// A sensitive file is age-encrypted even without the `.keyring` extension.
+    #[test]
+    fn sensitive_file_is_encrypted() {
+        let (_t, mgr, src) = setup(20);
+        let key = src.join("id_test");
+        let original = b"-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n";
+        fs::write(&key, original).unwrap();
+        let public = src.join("id_test.pub");
+        fs::write(&public, b"ssh-ed25519 AAAA test\n").unwrap();
+        let pass = SecretValue::from_text("hunter2");
+        let sources = [
+            BackupSource::sensitive(key.clone()),
+            BackupSource::plain(public.clone()),
+        ];
+        let info = mgr.create_with("t", &sources, Some(&pass)).unwrap();
+        let (k, p) = (&info.files[0], &info.files[1]);
+        assert!(k.encrypted && !p.encrypted);
+        assert_eq!(k.stored.file_name().unwrap(), "id_test.age");
+        assert_eq!(k.sha256, hex::encode(Sha256::digest(original)));
+        assert_eq!(fs::read(&p.stored).unwrap(), fs::read(&public).unwrap());
+        let enc = fs::read(&k.stored).unwrap();
+        assert!(!enc.windows(6).any(|w| w == b"secret"));
+        let dec = age::Decryptor::new(&enc[..]).unwrap();
+        let id = age_identity(SecretString::from("hunter2".to_string()));
+        let mut r = dec.decrypt(std::iter::once(&id as _)).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, original);
+        assert_eq!(mgr.list().unwrap(), vec![info]);
+    }
+
+    /// A sensitive file without a passphrase fails and writes nothing.
+    #[test]
+    fn sensitive_requires_passphrase() {
+        let (_t, mgr, src) = setup(20);
+        let key = src.join("id_test");
+        fs::write(&key, b"secret").unwrap();
+        let err = mgr
+            .create_with("t", &[BackupSource::sensitive(key)], None)
+            .unwrap_err();
+        assert!(matches!(err, KringError::PassphraseRequired));
+        assert!(!mgr.root.exists());
+    }
+
+    /// Non-sensitive sources keep the `.keyring` plaintext rule of `create`.
+    #[test]
+    fn plain_sources_keep_keyring_rule() {
+        let (_t, mgr, src) = setup(20);
+        let bin = binary_file(&src, "a.keyring");
+        let plain = src.join("b.keyring");
+        fs::write(&plain, "[keyring]\n").unwrap();
+        let other = src.join("notes");
+        fs::write(&other, "[keyring]\n").unwrap();
+        let pass = SecretValue::from_text("hunter2");
+        let sources = [
+            BackupSource::plain(bin),
+            BackupSource::plain(plain),
+            BackupSource::plain(other),
+        ];
+        let info = mgr.create_with("t", &sources, Some(&pass)).unwrap();
+        let flags: Vec<bool> = info.files.iter().map(|f| f.encrypted).collect();
+        assert_eq!(flags, [false, true, false]);
     }
 
     /// Magic detection.

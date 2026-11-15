@@ -181,7 +181,7 @@ fn verify_backup(backup: &BackupInfo, path: &Path, digest: &str) -> Result<()> {
 
 /// Fails unless the manifest lists `path` with the given sha256 and, when
 /// `require_encrypted` is set, marks it as encrypted.
-pub(super) fn verify_backup_entry(
+pub(crate) fn verify_backup_entry(
     backup: &BackupInfo,
     path: &Path,
     digest: &str,
