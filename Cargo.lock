@@ -2480,6 +2480,7 @@ version = "0.1.0"
 dependencies = [
  "age",
  "async-trait",
+ "base64",
  "hex",
  "kring-core",
  "oo7",

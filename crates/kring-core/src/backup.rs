@@ -94,7 +94,7 @@ pub fn keyring_backup_set(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Builds an I/O error carrying the path.
-fn io_err(path: &Path, e: impl std::fmt::Display) -> KringError {
+pub(crate) fn io_err(path: &Path, e: impl std::fmt::Display) -> KringError {
     KringError::Io {
         path: path.to_path_buf(),
         message: e.to_string(),
@@ -120,7 +120,7 @@ fn mkdir_private(path: &Path) -> Result<()> {
 }
 
 /// Writes a file with mode 0600, failing if it already exists.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -131,7 +131,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Encrypts `plain` with an age scrypt passphrase.
-fn encrypt_age(plain: &[u8], passphrase: &SecretString, path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn encrypt_age(plain: &[u8], passphrase: &SecretString, path: &Path) -> Result<Vec<u8>> {
     let encryptor = age::Encryptor::with_user_passphrase(passphrase.clone());
     let mut out = Vec::new();
     let mut w = encryptor
