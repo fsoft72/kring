@@ -686,6 +686,7 @@ fn consolidation_preview_then_apply_with_progress() {
     assert_eq!(summary.locked_count, 1);
     assert!(summary.set_default);
     assert!(summary.orphan_files.is_empty());
+    assert!(!summary.backup_needs_passphrase, "binary keyrings only");
 
     e.send(Command::ApplyConsolidation {
         plan_id,
@@ -791,6 +792,10 @@ fn orphan_batch_runs_after_consolidation() {
     e.fixture_keyring(TEXTUAL, "full");
     let (plan_id, summary) = e.plan_consolidation(true);
     assert_eq!(summary.orphan_files, ["orphan"]);
+    assert!(
+        summary.backup_needs_passphrase,
+        "plaintext files in the set"
+    );
     let apply = |backup: Option<&str>, orphan: Option<&str>| Command::ApplyConsolidation {
         plan_id,
         choices: vec![vec![]],
@@ -851,6 +856,10 @@ fn failed_consolidation_keeps_orphan_files() {
     e.fixture_keyring(EMPTY_TEXTUAL, "orphan");
     let (plan_id, summary) = e.plan_consolidation(true);
     assert_eq!(summary.orphan_files, ["orphan"]);
+    assert!(
+        summary.backup_needs_passphrase,
+        "plaintext files in the set"
+    );
     e.add_item(&empty, "late", &[("k", "3")], "z");
     e.send(Command::ApplyConsolidation {
         plan_id,

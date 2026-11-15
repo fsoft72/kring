@@ -118,6 +118,9 @@ impl KringApp {
                     if matches!(event, Event::Error(_)) {
                         self.copier.cancel();
                     }
+                    if matches!(event, Event::ConsolidationDone(..)) {
+                        self.consolidate_view.forget_passphrases();
+                    }
                     self.state.apply(event);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -223,14 +226,19 @@ impl KringApp {
             }
             Action::HideTransferSecret(id) => self.state.hide_transfer_secret(&id),
             Action::RevealPreviewSecret(id) => {
-                self.state.track_preview_reveal(id.clone());
-                self._send(Command::RevealSecret(id));
+                // Sending clears older requests of the item (as for a card
+                // reveal); this one is tracked afterwards.
+                self._send(Command::RevealSecret(id.clone()));
+                self.state.track_preview_reveal(id);
             }
             Action::CloseConsolidationPreview => {
                 self.state.close_consolidation_preview();
                 self._send(Command::DiscardPlan);
             }
-            Action::DismissConsolidation => self.state.last_consolidation = None,
+            Action::DismissConsolidation => {
+                self.state.last_consolidation = None;
+                self.consolidate_view.forget_passphrases();
+            }
         }
     }
 

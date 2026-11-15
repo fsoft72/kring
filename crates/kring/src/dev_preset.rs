@@ -327,7 +327,7 @@ impl DevPreset {
             .iter()
             .map(|s| default_choices(&s.conflicts))
             .collect();
-        let needs = needs_passphrases(summary, &state.files);
+        let needs = needs_passphrases(summary);
         if follow == DIALOG_CONSOLIDATE_APPLY {
             let kind = DialogKind::consolidate_passphrases(*plan_id, choices, needs, None, None);
             return vec![Action::Open(kind)];
@@ -641,6 +641,7 @@ mod tests {
                 set_default: false,
                 conflict_count: 1,
                 orphan_files: vec![],
+                backup_needs_passphrase: false,
             },
         });
         let reveal = p.take_transfer_reveal(&s);
@@ -676,6 +677,7 @@ mod tests {
             set_default: false,
             conflict_count: 0,
             orphan_files: vec!["o".into()],
+            backup_needs_passphrase: false,
         };
         for (dialog, opens) in [
             (DIALOG_CONSOLIDATE_NOW, false),

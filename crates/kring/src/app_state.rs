@@ -14,7 +14,7 @@ use kring_core::transfer::import::ImportReport;
 use kring_core::transfer::plan::TransferCounts;
 
 use crate::worker::{Command, ConflictView, ConsolidationSummary, Event};
-use crate::worker_transfer::invalidates_plan;
+use crate::worker_transfer::{MSG_ORPHANS_NOT_RETIRED, invalidates_plan};
 
 /// Maximum number of error messages kept.
 const MAX_ERRORS: usize = 20;
@@ -36,9 +36,9 @@ pub enum FileAction {
 pub fn import_summary(report: &ImportReport) -> String {
     let mut text = format!(
         "Imported {}, skipped {}, {}",
-        _count(report.created, "item"),
-        _count(report.duplicates, "duplicate"),
-        _count(report.conflicts.len(), "conflict"),
+        count_noun(report.created, "item"),
+        count_noun(report.duplicates, "duplicate"),
+        count_noun(report.conflicts.len(), "conflict"),
     );
     if report.no_secret > 0 {
         text.push_str(&format!(", {} without secret", report.no_secret));
@@ -56,7 +56,7 @@ pub fn import_summary(report: &ImportReport) -> String {
 pub fn transfer_summary(report: &TransferReport) -> String {
     let mut text = format!(
         "Transferred {}, {} already there, {} replaced, {} kept",
-        _count(report.created, "item"),
+        count_noun(report.created, "item"),
         report.duplicates,
         report.replaced,
         report.kept_target,
@@ -93,7 +93,7 @@ pub fn consolidation_status(
     match retired {
         Some(r) => format!(
             "Consolidation complete, retired {}",
-            _count(r.removed.len(), "orphan file")
+            count_noun(r.removed.len(), "orphan file")
         ),
         None => "Consolidation complete".to_string(),
     }
@@ -127,9 +127,11 @@ pub struct ApplyPassphrases {
 
 /// Prefix of the worker error for an apply of a stale plan.
 const STALE_PLAN_PREFIX: &str = "Plan is out of date";
+/// Most secret requests of previews remembered at once (oldest dropped).
+const MAX_REVEAL_REQUESTS: usize = 32;
 
-/// Formats `n noun`, adding `s` unless `n` is 1.
-fn _count(n: usize, noun: &str) -> String {
+/// Formats `n noun`, adding `s` unless `n` is 1 (e.g. `2 items`).
+pub fn count_noun(n: usize, noun: &str) -> String {
     let plural = if n == 1 { "" } else { "s" };
     format!("{n} {noun}{plural}")
 }
@@ -189,8 +191,10 @@ pub struct AppState {
     /// when it closes.
     transfer_revealed: Vec<(ItemId, SecretValue)>,
     /// Items whose secret a preview asked for and that did not arrive yet,
-    /// one entry per request; never cleared, so a late answer after the
-    /// preview closed is recognised and dropped.
+    /// one entry per request; not cleared on close, so a late answer after
+    /// the preview closed is recognised and dropped. A card request of the
+    /// same item removes its entries (a failed preview request never gets
+    /// a `Secret`), and at most [`MAX_REVEAL_REQUESTS`] are kept.
     transfer_reveal_requests: Vec<ItemId>,
     /// True from sending `ApplyTransfer` until the worker answers it.
     transfer_applying: bool,
@@ -263,7 +267,7 @@ impl AppState {
                 }
                 self.backups_stale = true;
                 if !info.pruned.is_empty() {
-                    let removed = _count(info.pruned.len(), "old backup");
+                    let removed = count_noun(info.pruned.len(), "old backup");
                     self.notices.push(format!("Removed {removed}"));
                 }
             }
@@ -358,7 +362,13 @@ impl AppState {
             Event::Error(msg) => {
                 self.consolidation_progress = None;
                 self.transfer_applying = false;
-                self.consolidation_applying = false;
+                // The consolidation apply runs to `ConsolidationDone` after
+                // a failed orphan retire; every other error seen while it is
+                // in flight ends it (the worker handles one command at a
+                // time and an apply never continues past an error).
+                if !msg.starts_with(MSG_ORPHANS_NOT_RETIRED) {
+                    self.consolidation_applying = false;
+                }
                 // Only a stale plan closes a preview; any other error keeps
                 // it open (an apply after a failure answers with a stale plan).
                 if msg.starts_with(STALE_PLAN_PREFIX) {
@@ -540,6 +550,11 @@ impl AppState {
     /// preview (or is dropped once the preview closed), never to the card.
     pub fn track_preview_reveal(&mut self, id: ItemId) {
         self.transfer_reveal_requests.push(id);
+        let excess = self
+            .transfer_reveal_requests
+            .len()
+            .saturating_sub(MAX_REVEAL_REQUESTS);
+        self.transfer_reveal_requests.drain(..excess);
     }
 
     /// Returns true when `id` is a revealable live item of an open preview
@@ -614,6 +629,10 @@ impl AppState {
                 self.import_file = Some(name.clone());
                 self.close_consolidation_preview();
             }
+            // A card asks for this secret: an older preview request of the
+            // same item (failed, so never answered) must not swallow it.
+            // Preview requests are tracked after they are sent.
+            Command::RevealSecret(id) => self.transfer_reveal_requests.retain(|r| r != id),
             other if invalidates_plan(other) && !matches!(other, Command::DiscardPlan) => {
                 self.close_consolidation_preview();
             }
@@ -1117,6 +1136,7 @@ mod tests {
             set_default: false,
             conflict_count: 0,
             orphan_files: vec![],
+            backup_needs_passphrase: false,
         };
         s.apply(Event::ConsolidationPreview {
             plan_id: 3,
@@ -1179,6 +1199,7 @@ mod tests {
             set_default: false,
             conflict_count: 0,
             orphan_files: vec![],
+            backup_needs_passphrase: false,
         }
     }
 
@@ -1427,6 +1448,72 @@ mod tests {
         assert!(s.transfer_secret(&id).is_none());
         s.apply(Event::Secret(id.clone(), SecretValue::from_text("card")));
         assert!(s.revealed.is_some(), "the ledger entry was used once");
+    }
+
+    /// A preview request answered with an error does not swallow a later
+    /// card reveal of the same item; the ledger is capped.
+    #[test]
+    fn failed_preview_reveal_does_not_swallow_card_reveal() {
+        let id = ItemId("/c/s/1".into());
+        let mut s = AppState {
+            selected_item: Some(id.clone()),
+            ..AppState::default()
+        };
+        s.apply(preview_with(1, vec![live_conflict("/c/t/1", "/c/s/1")]));
+        s.track_transfer_command(&Command::RevealSecret(id.clone()));
+        s.track_preview_reveal(id.clone());
+        s.apply(Event::Error("Locked: item is locked".into()));
+        s.close_transfer_preview();
+        s.track_transfer_command(&Command::RevealSecret(id.clone()));
+        s.apply(Event::Secret(id.clone(), SecretValue::from_text("card")));
+        assert!(s.revealed.is_some());
+        for n in 0..(MAX_REVEAL_REQUESTS + 5) {
+            s.track_preview_reveal(ItemId(format!("/c/x/{n}")));
+        }
+        assert_eq!(s.transfer_reveal_requests.len(), MAX_REVEAL_REQUESTS);
+        assert_eq!(s.transfer_reveal_requests[0].0, "/c/x/5", "oldest dropped");
+    }
+
+    /// The Apply button stays disabled through the orphan retire error that
+    /// precedes `ConsolidationDone`; other errors, a passphrase request and
+    /// the end of the apply re-enable it.
+    #[test]
+    fn consolidation_applying_until_answered() {
+        let apply = Command::ApplyConsolidation {
+            plan_id: 2,
+            choices: vec![],
+            backup_passphrase: None,
+            orphan_files_passphrase: None,
+        };
+        let mut s = AppState::default();
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 2,
+            summary: empty_summary(),
+        });
+        s.track_transfer_command(&apply);
+        s.apply(Event::ConsolidationProgress { done: 1, total: 2 });
+        s.apply(Event::Error("Orphan files not retired: busy".into()));
+        assert!(s.is_applying_consolidation(), "the apply goes on");
+        s.apply(Event::ConsolidationDone(
+            ConsolidationReport::default(),
+            None,
+        ));
+        assert!(!s.is_applying_consolidation());
+        s.apply(Event::ConsolidationPreview {
+            plan_id: 3,
+            summary: empty_summary(),
+        });
+        s.track_transfer_command(&apply);
+        s.apply(Event::ApplyPassphrasesNeeded {
+            plan_id: 3,
+            backup: true,
+            orphan_files: false,
+        });
+        assert!(!s.is_applying_consolidation());
+        s.track_transfer_command(&apply);
+        s.apply(Event::Error("Backup failed: disk full".into()));
+        assert!(!s.is_applying_consolidation());
+        assert!(s.consolidation_preview.is_some());
     }
 
     /// Builds a consolidation preview event with one step holding `conflict`.

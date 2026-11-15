@@ -32,6 +32,9 @@ const RADIO_RADIUS: f32 = 6.0;
 const CHIP_NEWER: &str = "newer";
 /// Shown instead of a secret that only the worker holds (archive items).
 const MSG_NOT_AVAILABLE: &str = "not available";
+/// Explanation above a list of conflict rows.
+pub const MSG_CONFLICTS: &str = "Same attributes with another secret. Choose the secret to keep \
+     for each item.";
 /// Shown instead of the secret of an item an earlier step creates.
 pub const MSG_PLANNED: &str = "will be created by an earlier step";
 

@@ -110,6 +110,9 @@ pub struct ConsolidationSummary {
     pub conflict_count: usize,
     /// Names of the empty plaintext orphan files to retire (when requested).
     pub orphan_files: Vec<String>,
+    /// True when the keyring backup set holds a plaintext keyring at plan
+    /// time, so the pre-apply backup will need a passphrase.
+    pub backup_needs_passphrase: bool,
 }
 
 /// Where the incoming items of a transfer plan come from.
@@ -746,6 +749,8 @@ async fn sources_unchanged<S: SecretStore>(store: &S, incoming: &[Incoming]) -> 
 }
 
 mod consolidate;
+
+pub(crate) use consolidate::MSG_ORPHANS_NOT_RETIRED;
 
 #[cfg(test)]
 mod tests;

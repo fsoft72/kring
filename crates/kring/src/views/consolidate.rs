@@ -22,7 +22,7 @@ use kring_core::transfer::consolidate::SkipReason;
 use kring_core::transfer::consolidate_apply::{ConsolidationReport, StepOutcome};
 use kring_core::transfer::plan::{Choice, TransferCounts};
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, count_noun};
 use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
 use crate::ui::widgets::{
@@ -30,7 +30,7 @@ use crate::ui::widgets::{
     primary_button, secondary_button, semibold,
 };
 use crate::views::collection::display_name;
-use crate::views::conflict_row::{RowEvent, conflict_row};
+use crate::views::conflict_row::{MSG_CONFLICTS, RowEvent, conflict_row};
 use crate::views::dialogs::DialogKind;
 use crate::views::sidebar::row_background;
 use crate::views::transfer::{default_choices, preview_header};
@@ -41,9 +41,6 @@ use crate::worker::{Command, ConsolidationSummary};
 const MSG_EXPLAIN: &str = "Moves every item of the other readable keyrings into the target \
      and deletes the keyrings left empty. Locked, login and session keyrings are never \
      touched. One backup of all keyring files is taken before anything changes.";
-/// Explanation above the conflict list.
-const MSG_CONFLICTS: &str = "Same attributes with another secret. Choose the secret to keep \
-     for each item.";
 /// Tooltip of Preview without a target.
 const MSG_NO_TARGET: &str = "Choose a target keyring";
 /// Tooltip of Consolidate while the apply runs.
@@ -155,12 +152,6 @@ impl Role {
     }
 }
 
-/// Formats `n noun`, adding `s` unless `n` is 1.
-fn _count(n: usize, noun: &str) -> String {
-    let plural = if n == 1 { "" } else { "s" };
-    format!("{n} {noun}{plural}")
-}
-
 /// Returns the name shown for collection `id` labelled `label`: the label,
 /// or the decoded last segment of its path when the label is blank (e.g.
 /// `session`).
@@ -193,15 +184,15 @@ pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<
             LineKind::Move,
             format!(
                 "Move {} from {} into {target_label}",
-                _count(items, "item"),
-                _count(summary.steps.len(), "keyring")
+                count_noun(items, "item"),
+                count_noun(summary.steps.len(), "keyring")
             ),
         )
     }];
     if !summary.delete_empty.is_empty() {
         let text = format!(
             "Delete {}",
-            _count(summary.delete_empty.len(), "empty keyring")
+            count_noun(summary.delete_empty.len(), "empty keyring")
         );
         out.push(line(LineKind::Delete, text));
     }
@@ -213,7 +204,7 @@ pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<
     if locked > 0 {
         let text = format!(
             "Skipped: {} (unlock them first to include)",
-            _count(locked, "locked keyring")
+            count_noun(locked, "locked keyring")
         );
         out.push(line(LineKind::Skipped, text));
     }
@@ -236,7 +227,7 @@ pub fn summary_lines(summary: &ConsolidationSummary, target_label: &str) -> Vec<
     if !summary.orphan_files.is_empty() {
         let text = format!(
             "Retire {}",
-            _count(summary.orphan_files.len(), "empty plaintext file")
+            count_noun(summary.orphan_files.len(), "empty plaintext file")
         );
         out.push(line(LineKind::Retire, text));
     }
@@ -273,7 +264,7 @@ pub fn outcome_rows(
             ),
             StepOutcome::Kept { source, remaining } => row(
                 OutcomeTone::Kept,
-                format!("Kept {source}: {} remain", _count(*remaining, "item")),
+                format!("Kept {source}: {} remain", count_noun(*remaining, "item")),
             ),
             StepOutcome::Deleted(label) => row(OutcomeTone::Ok, format!("Deleted {label}")),
             StepOutcome::DefaultSet => row(OutcomeTone::Ok, "Default keyring set".to_string()),
@@ -286,7 +277,10 @@ pub fn outcome_rows(
         return out;
     };
     if !retired.removed.is_empty() {
-        let text = format!("Retired {}", _count(retired.removed.len(), "orphan file"));
+        let text = format!(
+            "Retired {}",
+            count_noun(retired.removed.len(), "orphan file")
+        );
         out.push(row(OutcomeTone::Ok, text));
     }
     for (name, reason) in &retired.kept {
@@ -298,16 +292,13 @@ pub fn outcome_rows(
     out
 }
 
-/// Predicts the passphrases an apply of `summary` needs from the last file
-/// scan: the backup when a keyring file is plaintext, the orphan files
-/// backup when files are retired. The worker still asks for any it finds
-/// missing.
-pub fn needs_passphrases(
-    summary: &ConsolidationSummary,
-    files: &[KeyringFileInfo],
-) -> PassphraseNeeds {
+/// Returns the passphrases an apply of `summary` needs: the backup one as
+/// judged by the worker on the files it backs up at plan time, the orphan
+/// files one when files are retired. The worker still asks for any it finds
+/// missing at apply time.
+pub fn needs_passphrases(summary: &ConsolidationSummary) -> PassphraseNeeds {
     PassphraseNeeds {
-        backup: files.iter().any(|f| f.plaintext),
+        backup: summary.backup_needs_passphrase,
         orphan_files: !summary.orphan_files.is_empty(),
     }
 }
@@ -459,6 +450,11 @@ impl ConsolidateView {
         }
     }
 
+    /// Drops the kept passphrases (the apply ended or its result was closed).
+    pub fn forget_passphrases(&mut self) {
+        self.kept = KeptPassphrases::default();
+    }
+
     /// Returns the passphrases kept for `plan_id`: `(backup, orphan files)`.
     pub fn kept(&self, plan_id: u64) -> (Option<SecretValue>, Option<SecretValue>) {
         if self.kept.plan_id != Some(plan_id) {
@@ -520,7 +516,7 @@ fn _list_row(ui: &mut Ui, c: &CollectionInfo, role: Option<Role>) {
                 let detail = if c.locked {
                     "locked".to_string()
                 } else {
-                    _count(c.item_count, "item")
+                    count_noun(c.item_count, "item")
                 };
                 ui.label(muted_text(detail));
             });
@@ -645,7 +641,7 @@ fn _steps(ui: &mut Ui, summary: &ConsolidationSummary, view: &mut ConsolidateVie
         let text = format!(
             "{} - {}",
             collection_name(&step.source, &step.label),
-            _count(_step_items(&step.counts), "item")
+            count_noun(_step_items(&step.counts), "item")
         );
         ui.painter().text(
             egui::pos2(glyph.right() + 2.0, rect.center().y),
@@ -796,7 +792,7 @@ fn _preview_footer(
     gates: Gates,
 ) -> Option<Action> {
     let mut action = None;
-    let needs = needs_passphrases(summary, &state.files);
+    let needs = needs_passphrases(summary);
     if let Some(text) = _passphrase_note(needs) {
         muted(ui, text);
     }
@@ -1005,6 +1001,7 @@ mod tests {
             set_default: true,
             conflict_count: 1,
             orphan_files: vec!["empty_textual".into()],
+            backup_needs_passphrase: false,
         }
     }
 
@@ -1041,6 +1038,7 @@ mod tests {
             set_default: false,
             conflict_count: 0,
             orphan_files: vec![],
+            backup_needs_passphrase: false,
             ..full_summary()
         };
         assert_eq!(
@@ -1124,15 +1122,13 @@ mod tests {
         }
     }
 
-    /// The backup needs a passphrase when a plaintext file exists; the
-    /// orphan files one when files are retired.
+    /// The backup needs a passphrase when the worker said so; the orphan
+    /// files one when files are retired.
     #[test]
-    fn needs_passphrases_from_files_and_plan() {
+    fn needs_passphrases_from_plan() {
         let summary = full_summary();
-        let binary = [file("login", false, Some(3))];
-        let plain = [file("login", false, Some(3)), file("old", true, Some(0))];
         assert_eq!(
-            needs_passphrases(&summary, &binary),
+            needs_passphrases(&summary),
             PassphraseNeeds {
                 backup: false,
                 orphan_files: true
@@ -1140,11 +1136,16 @@ mod tests {
         );
         let no_orphans = ConsolidationSummary {
             orphan_files: vec![],
+            backup_needs_passphrase: true,
             ..full_summary()
         };
-        let needs = needs_passphrases(&no_orphans, &plain);
+        let needs = needs_passphrases(&no_orphans);
         assert!(needs.backup && !needs.orphan_files && needs.any());
-        assert!(!needs_passphrases(&no_orphans, &binary).any());
+        let neither = ConsolidationSummary {
+            backup_needs_passphrase: false,
+            ..no_orphans
+        };
+        assert!(!needs_passphrases(&neither).any());
     }
 
     /// Orphans are empty plaintext files the daemon does not serve.
@@ -1301,6 +1302,15 @@ mod tests {
             })
         ));
         assert!(matches!(v.kept(9), (None, None)), "other plans get nothing");
+        assert!(matches!(v.kept(1), (Some(_), Some(_))));
+        v.forget_passphrases();
+        assert!(matches!(v.kept(1), (None, None)));
+        v.remember(&Command::ApplyConsolidation {
+            plan_id: 1,
+            choices: vec![],
+            backup_passphrase: Some(SecretValue::from_text("b")),
+            orphan_files_passphrase: Some(SecretValue::from_text("o")),
+        });
         let none = v.apply_action(9, PassphraseNeeds::default());
         assert!(matches!(
             none,

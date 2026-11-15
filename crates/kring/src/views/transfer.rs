@@ -19,7 +19,7 @@ use crate::ui::widgets::{
     danger_button, field_label, muted, note, primary_button, secondary_button, semibold,
 };
 use crate::views::collection::display_name;
-use crate::views::conflict_row::{RowEvent, conflict_row};
+use crate::views::conflict_row::{MSG_CONFLICTS, RowEvent, conflict_row};
 use crate::views::dialogs::{ImportTarget, styled_modal};
 use crate::views::{Action, Gates, MSG_NO_PROVIDER};
 use crate::worker::ConflictView;
@@ -41,9 +41,6 @@ const MSG_MOVE: &str = "Moved items are removed from their keyring once they are
      the target.";
 /// Text of a preview without conflicts.
 const MSG_NO_CONFLICTS: &str = "No conflicts: existing items in the target stay as they are.";
-/// Explanation above the conflict list.
-const MSG_CONFLICTS: &str = "Same attributes with another secret. Choose the secret to keep \
-     for each item.";
 
 /// Checks `id` when unchecked, unchecks it when checked.
 pub fn selection_toggle(selection: &mut Vec<ItemId>, id: &ItemId) {

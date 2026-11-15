@@ -25,6 +25,9 @@ use crate::worker::{
 };
 use crate::worker_offline::emit_backup;
 
+/// Prefix of the error reported when the orphan files could not be retired
+/// after a consolidation; [`Event::ConsolidationDone`] still follows it.
+pub(crate) const MSG_ORPHANS_NOT_RETIRED: &str = "Orphan files not retired";
 /// Extension of keyring files.
 const KEYRING_EXTENSION: &str = "keyring";
 
@@ -116,15 +119,24 @@ where
     } else {
         Vec::new()
     };
-    let summary = summarize(&plan, orphan_files.clone());
+    let summary = summarize(
+        &plan,
+        orphan_files.clone(),
+        backup_needs_passphrase(ctx.config),
+    );
     let plan_id = plans.put(PendingPlan::Consolidation { plan, orphan_files });
     ctx.out
         .emit(Event::ConsolidationPreview { plan_id, summary });
     Ok(())
 }
 
-/// Builds the secret-free preview of a consolidation plan.
-fn summarize(plan: &ConsolidationPlan, orphan_files: Vec<String>) -> ConsolidationSummary {
+/// Builds the secret-free preview of a consolidation plan; `backup_passphrase`
+/// tells whether its backup will need a passphrase.
+fn summarize(
+    plan: &ConsolidationPlan,
+    orphan_files: Vec<String>,
+    backup_passphrase: bool,
+) -> ConsolidationSummary {
     let steps = plan
         .moves
         .iter()
@@ -154,6 +166,7 @@ fn summarize(plan: &ConsolidationPlan, orphan_files: Vec<String>) -> Consolidati
         set_default: plan.set_default,
         conflict_count: plan.conflict_count,
         orphan_files,
+        backup_needs_passphrase: backup_passphrase,
     }
 }
 
@@ -298,7 +311,7 @@ where
     let live = match ctx.store.list_collections().await {
         Ok(live) => live,
         Err(e) => {
-            ctx.out.error(format!("Orphan files not retired: {e}"));
+            ctx.out.error(format!("{MSG_ORPHANS_NOT_RETIRED}: {e}"));
             return None;
         }
     };
@@ -317,7 +330,7 @@ where
             Some(report)
         }
         Err(e) => {
-            ctx.out.error(format!("Orphan files not retired: {e}"));
+            ctx.out.error(format!("{MSG_ORPHANS_NOT_RETIRED}: {e}"));
             None
         }
     }
