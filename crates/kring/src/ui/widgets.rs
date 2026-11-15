@@ -53,6 +53,15 @@ pub fn field_label(ui: &mut Ui, text: &str) {
     );
 }
 
+/// Returns the width [`chip`] takes for `text`.
+pub fn chip_width(ui: &Ui, text: &str) -> f32 {
+    let font = egui::FontId::new(CHIP_FONT_SIZE, theme::semibold());
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_uppercase(), font, Color32::WHITE);
+    galley.size().x + 2.0 * CHIP_PADDING.x
+}
+
 /// Small uppercase chip: `color` text on INPUT_FILL_BLUE.
 pub fn chip(ui: &mut Ui, text: &str, color: Color32) {
     let font = egui::FontId::new(CHIP_FONT_SIZE, theme::semibold());

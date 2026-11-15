@@ -748,7 +748,7 @@ fn unlock_many_tries_every_keyring() {
         Event::UnlockManyDone { unlocked, failed } => {
             assert_eq!(unlocked, 2);
             assert_eq!(failed.len(), 1);
-            assert_eq!(failed[0].0, "Dk · Dk_2");
+            assert_eq!(failed[0].0, ids[1]);
             assert!(failed[0].1.contains("invalid password"), "{failed:?}");
             let text = format!("{failed:?}");
             assert!(!text.contains(MANY_PW) && !text.contains("other-pw"));

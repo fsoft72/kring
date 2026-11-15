@@ -6,7 +6,9 @@ use kring_core::model::CollectionInfo;
 use crate::app_state::AppState;
 use crate::ui::glyphs::{self, Ico};
 use crate::ui::theme;
-use crate::ui::widgets::{chip, muted, muted_text, primary_button, search_box, semibold};
+use crate::ui::widgets::{
+    chip, chip_width, muted, muted_text, primary_button, search_box, semibold,
+};
 use crate::views::collection::{display_names, is_default};
 use crate::views::dialogs::DialogKind;
 use crate::views::{Action, Gates};
@@ -55,25 +57,33 @@ fn _row(ui: &mut Ui, c: &CollectionInfo, name: &str, selected: bool) -> bool {
     let inner = rect.shrink2(egui::vec2(ROW_PADDING, 0.0));
     let builder = UiBuilder::new()
         .max_rect(inner)
-        .layout(Layout::left_to_right(Align::Center));
+        .layout(Layout::right_to_left(Align::Center));
     ui.scope_builder(builder, |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        let name = RichText::new(name)
-            .family(theme::medium())
-            .size(14.0)
-            .color(theme::TEXT);
-        ui.add(egui::Label::new(name).truncate().selectable(false));
-        if is_default(c) {
-            chip(ui, "default", theme::SECONDARY);
+        ui.label(muted_text(c.item_count.to_string()));
+        if c.locked {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::hover());
+            glyphs::paint(ui.painter(), r, Ico::Lock, theme::LABEL);
         }
-        if c.is_login {
-            chip(ui, "login", theme::SECONDARY);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(muted_text(c.item_count.to_string()));
-            if c.locked {
-                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), Sense::hover());
-                glyphs::paint(ui.painter(), r, Ico::Lock, theme::LABEL);
+        // The name is truncated in the room left by the count, the lock and
+        // its chips, which follow it.
+        let chips: Vec<&str> = [(is_default(c), "default"), (c.is_login, "login")]
+            .into_iter()
+            .filter_map(|(on, text)| on.then_some(text))
+            .collect();
+        let spacing = ui.spacing().item_spacing.x;
+        let reserved: f32 = chips.iter().map(|t| chip_width(ui, t) + spacing).sum();
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            let name = RichText::new(name)
+                .family(theme::medium())
+                .size(14.0)
+                .color(theme::TEXT);
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - reserved).max(0.0));
+                ui.add(egui::Label::new(name).truncate().selectable(false));
+            });
+            for text in chips {
+                chip(ui, text, theme::SECONDARY);
             }
         });
     });

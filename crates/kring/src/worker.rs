@@ -28,7 +28,6 @@ use kring_core::transfer::import::ImportReport;
 use kring_core::transfer::plan::{Choice, TransferCounts};
 use kring_core::{KringError, MasterPasswordStore, SecretStore};
 
-use crate::views::collection::{collection_key, display_names};
 use crate::worker_gpg;
 use crate::worker_offline;
 use crate::worker_ssh;
@@ -337,11 +336,11 @@ pub enum Event {
         orphan_files: bool,
     },
     /// A [`Command::UnlockMany`] finished: `unlocked` keyrings were
-    /// unlocked, `failed` holds `(shown name, error message)` of the others
-    /// (no secrets). Followed by [`Event::Collections`].
+    /// unlocked, `failed` holds `(collection, error message)` of the others
+    /// (no secrets; the UI names them). Followed by [`Event::Collections`].
     UnlockManyDone {
         unlocked: usize,
-        failed: Vec<(String, String)>,
+        failed: Vec<(CollectionId, String)>,
     },
     /// Keyring files found in the keyrings directory.
     Files(Vec<KeyringFileInfo>),
@@ -1131,8 +1130,7 @@ where
 }
 
 /// Tries `password` on every collection of `collections`, then emits
-/// [`Event::UnlockManyDone`] (failures named as the UI shows them, see
-/// [`display_names`]) and the refreshed collections.
+/// [`Event::UnlockManyDone`] and the refreshed collections.
 async fn unlock_many<S, N>(
     out: &Emitter<N>,
     store: &S,
@@ -1142,22 +1140,12 @@ async fn unlock_many<S, N>(
     S: SecretStore + MasterPasswordStore,
     N: Fn(),
 {
-    // Names only: a listing failure falls back to the object path name and
-    // is reported by the refresh below.
-    let names = store
-        .list_collections()
-        .await
-        .map(|list| display_names(&list))
-        .unwrap_or_default();
     let mut unlocked = 0;
     let mut failed = Vec::new();
     for id in collections {
         match store.unlock_with_password(id, password).await {
             Ok(()) => unlocked += 1,
-            Err(e) => {
-                let name = names.get(id).cloned().unwrap_or_else(|| collection_key(id));
-                failed.push((name, e.to_string()));
-            }
+            Err(e) => failed.push((id.clone(), e.to_string())),
         }
     }
     out.emit(Event::UnlockManyDone { unlocked, failed });

@@ -540,7 +540,20 @@ fn shown(state: &AppState, c: &CollectionInfo) -> String {
         .unwrap_or_else(|| display_name(c))
 }
 
-/// Renders one keyring row of the list (shown as `name`) with its role chip.
+/// Returns the collections in natural order of their shown `names` (see
+/// [`locked_list::natural_cmp`]).
+pub fn list_order<'a>(
+    collections: &'a [CollectionInfo],
+    names: &HashMap<CollectionId, String>,
+) -> Vec<&'a CollectionInfo> {
+    let name = |c: &CollectionInfo| names.get(&c.id).map_or("", String::as_str);
+    let mut out: Vec<&CollectionInfo> = collections.iter().collect();
+    out.sort_by(|a, b| locked_list::natural_cmp(name(a), name(b)));
+    out
+}
+
+/// Renders one keyring row of the list (shown as `name`) with its role
+/// chip; the chip keeps its room on the right and the name is truncated.
 fn _list_row(ui: &mut Ui, c: &CollectionInfo, name: &str, role: Option<Role>) {
     let size = egui::vec2(ui.available_width(), ROW_HEIGHT);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
@@ -549,9 +562,14 @@ fn _list_row(ui: &mut Ui, c: &CollectionInfo, name: &str, role: Option<Role>) {
     ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(inner)
-            .layout(Layout::left_to_right(Align::Center)),
+            .layout(Layout::right_to_left(Align::Center)),
         |ui| {
-            ui.vertical(|ui| {
+            if let Some(role) = role {
+                let (text, color) = role.chip();
+                chip(ui, text, color);
+                ui.add_space(4.0);
+            }
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.add_space(4.0);
                 ui.add(egui::Label::new(semibold(name, 14.0)).truncate());
                 let detail = if c.locked {
@@ -560,13 +578,6 @@ fn _list_row(ui: &mut Ui, c: &CollectionInfo, name: &str, role: Option<Role>) {
                     count_noun(c.item_count, "item")
                 };
                 ui.label(muted_text(detail));
-            });
-            let Some(role) = role else {
-                return;
-            };
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (text, color) = role.chip();
-                chip(ui, text, color);
             });
         },
     );
@@ -583,7 +594,7 @@ pub fn list(ui: &mut Ui, state: &AppState, view: &ConsolidateView) -> Option<Act
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             let names = display_names(&state.collections);
-            for c in &state.collections {
+            for c in list_order(&state.collections, &names) {
                 let role = keyring_role(summary, view.target.as_ref(), c);
                 let name = names.get(&c.id).map_or("", String::as_str);
                 _list_row(ui, c, name, role);
@@ -1372,6 +1383,23 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The keyring list is in natural order of the shown names.
+    #[test]
+    fn list_in_natural_order() {
+        let cols = [
+            col("/c/k10", "Default keyring", true),
+            col(LOGIN_COLLECTION_PATH, "Login", false),
+            col("/c/k9", "Default keyring", true),
+            col("/c/work", "work", false),
+        ];
+        let names = display_names(&cols);
+        let order: Vec<&str> = list_order(&cols, &names)
+            .iter()
+            .map(|c| c.id.0.as_str())
+            .collect();
+        assert_eq!(order, ["/c/k9", "/c/k10", LOGIN_COLLECTION_PATH, "/c/work"]);
     }
 
     /// Keyrings are named from the disambiguated names, else from their label.

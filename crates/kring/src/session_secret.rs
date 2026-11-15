@@ -419,7 +419,7 @@ mod tests {
     fn unlock_many_candidate_needs_one_unlock() {
         let none = Event::UnlockManyDone {
             unlocked: 0,
-            failed: vec![("A".into(), "invalid password".into())],
+            failed: vec![(CollectionId("/c/a".into()), "invalid password".into())],
         };
         let mut s = SessionSecret::default();
         s.remember_if_correct(SecretValue::from_text("bad"), 3);
@@ -427,7 +427,7 @@ mod tests {
         assert!(!s.is_remembered());
         let some = Event::UnlockManyDone {
             unlocked: 1,
-            failed: vec![("A".into(), "invalid password".into())],
+            failed: vec![(CollectionId("/c/a".into()), "invalid password".into())],
         };
         s.remember_if_correct(SecretValue::from_text("good"), 4);
         feed(&mut s, 4, &[some, Event::CommandFinished(4)]);

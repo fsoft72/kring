@@ -17,6 +17,7 @@ use kring_core::transfer::plan::TransferCounts;
 
 use crate::operation::{self, Operation};
 use crate::session_secret::SessionSecret;
+use crate::views::collection::{collection_key, display_names};
 use crate::worker::{
     AgentStatus, Command, ConflictView, ConsolidationSummary, Event, OfflineItemView, WalletInfo,
 };
@@ -306,6 +307,9 @@ pub struct AppState {
     repreview_after: Option<u64>,
     /// The consolidation preview must be asked again (see [`Self::take_repreview`]).
     repreview_due: bool,
+    /// The unlock of `repreview_after` reported an error (nothing changed:
+    /// no re-preview).
+    repreview_failed: bool,
     /// Number of the command the worker is handling: every command before it
     /// sent [`Event::CommandFinished`] (events before the first one, such as
     /// the startup ones, count for command 0).
@@ -329,7 +333,7 @@ impl AppState {
                 self.running = id + 1;
                 if self.repreview_after == Some(id) {
                     self.repreview_after = None;
-                    self.repreview_due = true;
+                    self.repreview_due = !std::mem::take(&mut self.repreview_failed);
                 }
                 if self.wallet_create.as_ref().is_some_and(|(_, c)| *c == id) {
                     self.wallet_create = None;
@@ -402,8 +406,16 @@ impl AppState {
                 self.pending_passphrase = Some(*cmd);
             }
             Event::UnlockManyDone { unlocked, failed } => {
-                let text = unlock_many_summary(unlocked, &failed);
-                match (unlocked, failed.is_empty()) {
+                let names = display_names(&self.collections);
+                let named: Vec<(String, String)> = failed
+                    .into_iter()
+                    .map(|(id, error)| {
+                        let name = names.get(&id).cloned();
+                        (name.unwrap_or_else(|| collection_key(&id)), error)
+                    })
+                    .collect();
+                let text = unlock_many_summary(unlocked, &named);
+                match (unlocked, named.is_empty()) {
                     (0, _) => self.errors.push(text),
                     (_, true) => self.status = text,
                     (_, false) => self.notices.push(text),
@@ -545,6 +557,9 @@ impl AppState {
                 self.status = msg;
             }
             Event::Error(msg) => {
+                if self.repreview_after == Some(self.running) {
+                    self.repreview_failed = true;
+                }
                 self.consolidation_progress = None;
                 self.transfer_applying = false;
                 // The consolidation apply runs to `ConsolidationDone` after
@@ -1026,7 +1041,7 @@ impl AppState {
     /// Records a sent command (number `id`) for the consolidation preview:
     /// the preview asked, or an unlock sent while the Consolidate area shows
     /// a preview flow, whose end asks that preview again (the unlock
-    /// discarded the plan).
+    /// discarded the plan) unless its command reported an error.
     pub fn track_consolidation_command(&mut self, cmd: &Command, id: u64) {
         match cmd {
             Command::PlanConsolidation {
@@ -1037,6 +1052,7 @@ impl AppState {
                 if self.consolidation_shown && self.consolidation_request.is_some() =>
             {
                 self.repreview_after = Some(id);
+                self.repreview_failed = false;
             }
             _ => {}
         }
@@ -1047,6 +1063,7 @@ impl AppState {
         self.consolidation_request = None;
         self.repreview_after = None;
         self.repreview_due = false;
+        self.repreview_failed = false;
     }
 
     /// Returns (once) the consolidation preview to ask again after an
@@ -2611,6 +2628,31 @@ mod tests {
     #[test]
     fn unlock_many_done_toasts() {
         let mut s = AppState::default();
+        // Failed keyrings are named as the list shows them.
+        s.apply(Event::Collections(vec![
+            col("/c/A", "Dk", &[]),
+            col("/c/B", "Dk", &[]),
+        ]));
+        s.apply(Event::UnlockManyDone {
+            unlocked: 1,
+            failed: vec![(CollectionId("/c/B".into()), "x".into())],
+        });
+        assert_eq!(
+            s.drain_notices(),
+            ["Unlocked 1 of 2 keyrings, 1 failed: Dk · B (x)"]
+        );
+        // An unlisted keyring falls back to its object path name.
+        s.apply(Event::UnlockManyDone {
+            unlocked: 0,
+            failed: vec![(CollectionId("/c/gone".into()), "x".into())],
+        });
+        assert_eq!(
+            s.drain_messages(),
+            (
+                None,
+                vec!["Unlocked 0 of 1 keyring, 1 failed: gone (x)".to_string()]
+            )
+        );
         s.apply(Event::UnlockManyDone {
             unlocked: 2,
             failed: vec![],
@@ -2619,26 +2661,7 @@ mod tests {
             s.drain_messages(),
             (Some("Unlocked 2 of 2 keyrings".to_string()), vec![])
         );
-        s.apply(Event::UnlockManyDone {
-            unlocked: 1,
-            failed: failures(&["A"], "x"),
-        });
-        assert_eq!(
-            s.drain_notices(),
-            ["Unlocked 1 of 2 keyrings, 1 failed: A (x)"]
-        );
         assert_eq!(s.drain_messages(), (None, vec![]));
-        s.apply(Event::UnlockManyDone {
-            unlocked: 0,
-            failed: failures(&["A"], "x"),
-        });
-        assert_eq!(
-            s.drain_messages(),
-            (
-                None,
-                vec!["Unlocked 0 of 1 keyring, 1 failed: A (x)".to_string()]
-            )
-        );
         assert!(s.drain_notices().is_empty());
     }
 
@@ -2681,6 +2704,31 @@ mod tests {
         s.track_consolidation_command(&single, 2);
         s.apply(Event::CommandFinished(2));
         assert!(s.take_repreview().is_some(), "a single unlock too");
+    }
+
+    /// A failed unlock (an error in its command window) changed nothing:
+    /// no re-preview; an error of another command does not count.
+    #[test]
+    fn failed_unlock_skips_repreview() {
+        let unlock = Command::Unlock {
+            collection: CollectionId("/c/a".into()),
+            password: SecretValue::from_text("pw"),
+        };
+        let mut s = AppState::default();
+        s.set_consolidation_shown(true);
+        s.track_consolidation_command(&plan("/c/login"), 0);
+        s.apply(Event::CommandFinished(0));
+        s.track_consolidation_command(&unlock, 1);
+        s.apply(Event::Error("invalid password".into()));
+        s.apply(Event::CommandFinished(1));
+        assert!(s.take_repreview().is_none(), "failed unlock");
+        // Command 2 is still running when unlock 3 is sent.
+        s.track_consolidation_command(&unlock, 3);
+        s.apply(Event::Error("error of command 2".into()));
+        s.apply(Event::CommandFinished(2));
+        s.apply(Event::Done("Collection unlocked".into()));
+        s.apply(Event::CommandFinished(3));
+        assert!(s.take_repreview().is_some(), "clean unlock");
     }
 
     /// No re-preview outside the Consolidate area, without a preview asked,
