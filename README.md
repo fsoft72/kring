@@ -4,6 +4,8 @@ kring is a standalone Linux app (Rust + egui) to manage Secret Service keyrings
 (gnome-keyring and compatible providers). It links no Qt, GTK, GNOME or KDE
 libraries.
 
+![kring main window: keyrings list and an unlocked keyring with its items](assets/kring.png)
+
 ## Features
 
 - **Secret Service management**: list, create, rename, unlock and delete keyrings; change the master password; browse, search, create, edit and delete items; copy secrets with a 30 s clipboard auto-clear.
