@@ -27,3 +27,4 @@
 - Added the tolerant textual keyring parser (`keyring_file::textual`): recovers multi-line `secret=` values that GLib and oo7 reject, reports `ParseWarning`s and a `daemon_readable` flag.
 - Added `keyring_file::scan` (`detect_format`, `scan_dir`, `KeyringFileInfo`) and synthetic textual keyring fixtures under `crates/kring-core/tests/fixtures/keyrings/`.
 - Textual parser fix round: only the first physical line of a value is GLib-unescaped (continuation lines verbatim), values built in `Zeroizing`, `KeyringFileInfo.error` and `plaintext` for any non-binary file, more edge and no-panic tests.
+- Added binary v0 keyring reader (`keyring_file::binary::read_binary`, oo7 `load_from_v0`, in memory only) with wrong-password and not-binary errors, and the `make_binary_fixture` example (private session only) that generated `binary_two_items.keyring`.

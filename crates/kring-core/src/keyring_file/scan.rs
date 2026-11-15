@@ -192,10 +192,11 @@ mod tests {
                 )
             })
             .collect();
-        use KeyringFormat::{Textual, Unknown};
+        use KeyringFormat::{BinaryV0, Textual, Unknown};
         assert_eq!(
             summary,
             vec![
+                ("binary_two_items", BinaryV0, None, None, false),
                 ("empty_textual", Textual, Some(0), Some(true), true),
                 ("garbage", Unknown, None, None, true),
                 ("textual_binary_secret", Textual, Some(1), Some(true), true),
@@ -209,10 +210,10 @@ mod tests {
                 ("textual_two_items", Textual, Some(2), Some(true), true),
             ]
         );
-        assert_eq!(infos[3].display_name.as_deref(), Some("Multiline"));
-        assert!(infos[0].size > 0);
-        assert!(infos[1].error.is_some());
-        assert!(infos[0].error.is_none());
+        assert_eq!(infos[4].display_name.as_deref(), Some("Multiline"));
+        assert!(infos[1].size > 0);
+        assert!(infos[2].error.is_some());
+        assert!(infos[1].error.is_none());
     }
 
     /// A missing directory is an empty list; non-keyring files are skipped.
