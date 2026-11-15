@@ -115,6 +115,13 @@ pub enum Command {
         name: String,
         backup_passphrase: SecretValue,
     },
+    /// Delete a keyring file the daemon does not serve, optionally after a
+    /// backup (the passphrase encrypts the backup of a plaintext file).
+    DeleteFile {
+        name: String,
+        backup: bool,
+        backup_passphrase: Option<SecretValue>,
+    },
     /// List the backups.
     ListBackups,
     /// Restore files (by original path) of a listed backup into the keyrings directory.
@@ -325,6 +332,11 @@ pub(crate) fn passphrase_echo(cmd: &Command) -> Event {
         },
         Command::DeleteCollection { collection, .. } => Command::DeleteCollection {
             collection,
+            backup_passphrase: None,
+        },
+        Command::DeleteFile { name, backup, .. } => Command::DeleteFile {
+            name,
+            backup,
             backup_passphrase: None,
         },
         Command::RestoreBackup { dir, files, .. } => Command::RestoreBackup {
@@ -801,6 +813,7 @@ where
         | Command::OpenFile { .. }
         | Command::ImportFile { .. }
         | Command::RetireFile { .. }
+        | Command::DeleteFile { .. }
         | Command::ListBackups
         | Command::RestoreBackup { .. }
         | Command::ExportCollection { .. }

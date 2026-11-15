@@ -672,3 +672,5 @@ fn import_without_provider_reports_plain_message() {
         other => panic!("expected Error, got {other:?}"),
     }
 }
+
+mod delete;

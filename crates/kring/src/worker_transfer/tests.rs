@@ -569,8 +569,8 @@ fn changed_target_refused() {
     assert_eq!(e.backup_count(), 0);
 }
 
-/// Plan 1 and Plan 2 mutations (DeleteItem, RetireFile, RestoreBackup) also
-/// make the pending plan stale.
+/// Plan 1 and Plan 2 mutations (DeleteItem, RetireFile, DeleteFile,
+/// RestoreBackup) also make the pending plan stale.
 #[test]
 fn stale_plan_after_plan_1_and_2_mutations() {
     let e = gnome();
@@ -599,6 +599,18 @@ fn stale_plan_after_plan_1_and_2_mutations() {
     });
     e.until(|ev| matches!(ev, Event::Files(_)));
     assert!(!e.keyring("loose").exists());
+    e.apply(plan_id, vec![], None);
+    assert_eq!(e.expect_error(), MSG_STALE_PLAN);
+
+    e.fixture_keyring(EMPTY_TEXTUAL, "gone");
+    let (plan_id, _) = e.plan(&[&item], &e.main, TransferMode::Copy);
+    e.send(Command::DeleteFile {
+        name: "gone".into(),
+        backup: false,
+        backup_passphrase: None,
+    });
+    e.until(|ev| matches!(ev, Event::Files(_)));
+    assert!(!e.keyring("gone").exists());
     e.apply(plan_id, vec![], None);
     assert_eq!(e.expect_error(), MSG_STALE_PLAN);
 

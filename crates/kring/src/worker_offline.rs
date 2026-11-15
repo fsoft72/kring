@@ -14,7 +14,8 @@ use kring_core::backup::{BackupFile, BackupInfo, RESTART_HINT, restore};
 use kring_core::keyring_file::binary::read_binary;
 use kring_core::keyring_file::textual::{OfflineItem, ParseWarning, parse_textual};
 use kring_core::keyring_file::{
-    KeyringFileInfo, KeyringFormat, RetireMode, retire_file, retire_mode, scan_dir,
+    DeleteBackup, KeyringFileInfo, KeyringFormat, RetireMode, delete_file, retire_file,
+    retire_mode, scan_dir,
 };
 use kring_core::model::{CollectionId, SecretValue};
 use kring_core::provider::ProviderInfo;
@@ -46,6 +47,7 @@ pub(crate) fn is_offline(cmd: &Command) -> bool {
         Command::ScanFiles
             | Command::OpenFile { .. }
             | Command::RetireFile { .. }
+            | Command::DeleteFile { .. }
             | Command::ListBackups
             | Command::RestoreBackup { .. }
             | Command::ExportCollection { .. }
@@ -104,6 +106,17 @@ where
             name,
             backup_passphrase,
         } => retire(out, store, provider, config, name, backup_passphrase).await,
+        Command::DeleteFile {
+            name,
+            backup,
+            backup_passphrase,
+        } => {
+            let backup = match backup {
+                true => DeleteBackup::With(backup_passphrase.clone()),
+                false => DeleteBackup::Without,
+            };
+            delete(out, store, config, name, backup, cmd).await
+        }
         Command::ListBackups => {
             out.emit(Event::Backups(config.backups.list()?));
             Ok(())
@@ -246,6 +259,52 @@ where
     )?;
     emit_backup(out, backup);
     out.emit(Event::Done(MSG_RETIRED.into()));
+    emit_files(out, config)
+}
+
+/// Deletes keyring file `name` (any format) that the daemon does not serve.
+///
+/// The live check uses the store's collections; if a store exists but cannot
+/// list them the delete is aborted. A plaintext file to back up without a
+/// passphrase emits [`Event::PassphraseNeeded`] with the echo of `original`.
+async fn delete<S, N>(
+    out: &Emitter<N>,
+    store: Option<&S>,
+    config: &WorkerConfig,
+    name: &str,
+    backup: DeleteBackup,
+    original: &Command,
+) -> Result<()>
+where
+    S: SecretStore,
+    N: Fn(),
+{
+    let info = resolve_file(config, name)?;
+    // Without a daemon no collection is live, so no file is loaded by it.
+    let live = match store {
+        Some(store) => store.list_collections().await?,
+        None => Vec::new(),
+    };
+    let report = match delete_file(&config.backups, &info, &config.keyrings_dir, &live, backup) {
+        Ok(report) => report,
+        Err(KringError::PassphraseRequired) => {
+            out.emit(passphrase_echo(original));
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let done = match &report.backup {
+        Some(b) => format!(
+            "File {} deleted, backup in {}",
+            report.removed,
+            b.dir.display()
+        ),
+        None => format!("File {} deleted", report.removed),
+    };
+    if let Some(backup) = report.backup {
+        emit_backup(out, backup);
+    }
+    out.emit(Event::Done(done));
     emit_files(out, config)
 }
 
